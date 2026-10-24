@@ -18,6 +18,9 @@ import {
   getInstallationSecretKey,
   signApprovalPayload,
   verifyApprovalSignature,
+  hashFileChanges,
+  signTestCommand,
+  verifyTestCommandSignature,
 } from './utils/security.js';
 import {
   Project,
@@ -287,11 +290,13 @@ export class CoreManager {
       const name = path.basename(rootPath);
       const detectedTest = testCommand || this.detectTestCommand(rootPath);
 
+      // Correction 1: Do NOT auto-sign detected commands. Keep unconfirmed until explicit user confirmation via API.
       project = {
         id: deterministicId,
         name,
         rootPath,
         testCommand: detectedTest,
+        testCommandSignature: undefined,
         createdAt: new Date().toISOString(),
       };
       this.db.upsertProject(project);
@@ -301,8 +306,11 @@ export class CoreManager {
         this.db.migrateDeterministicProjectIds();
         project = this.db.getProjectByPath(rootPath) || { ...project, id: deterministicId };
       }
+      // Correction 1: Do NOT auto-sign if changed here, and do NOT auto-sign if signature is missing.
+      // Signatures must ONLY be issued via updateProjectSettings (which is protected by X-Autopsy-Token).
       if (testCommand && project.testCommand !== testCommand) {
         project.testCommand = testCommand;
+        project.testCommandSignature = undefined;
         this.db.upsertProject(project);
         this.emitChange('project_updated', project);
       }
@@ -1041,6 +1049,35 @@ export class CoreManager {
 
     // 3. Create isolated worktree with dependency safety check
     const testCmd = project.testCommand || this.detectTestCommand(project.rootPath);
+
+    // 0-D Check: Verify cryptographic signature of project testCommand against tampering and unconfirmed commands
+    if (!project.testCommandSignature) {
+      throw new Error(
+        `[TEST_COMMAND_UNCONFIRMED]: 테스트 명령("${testCmd}")이 사용자에 의해 확정(서명)되지 않았습니다. 앱 대시보드에서 테스트 명령을 먼저 확정해 주세요.`
+      );
+    }
+    const isCmdValid = verifyTestCommandSignature(
+      project.id,
+      project.testCommand || testCmd,
+      project.testCommandSignature
+    );
+    if (!isCmdValid) {
+      this.recordAgentEvent(
+        project.rootPath,
+        'NOTE',
+        `[보안 경고] 테스트 명령 변조 감지`,
+        `프로젝트 "${project.name}"의 테스트 명령("${project.testCommand}")이 승인된 전자서명과 일치하지 않습니다. 검증 실행을 즉시 차단합니다.`,
+        null,
+        'security-gate'
+      );
+      this.emitChange('tamper_detected', {
+        projectId: project.id,
+        reason: `테스트 명령 위변조 감지: "${project.testCommand}"`,
+      });
+      throw new Error(
+        `[SECURITY_TAMPER_DETECTED]: 프로젝트의 테스트 명령("${project.testCommand}")이 위변조되었습니다. 승인 서명 검증에 실패하여 격리 검증 실행이 거부되었습니다.`
+      );
+    }
     const { sandboxDir } = this.worktreeRunner.createWorktree(
       project.rootPath,
       proposalId,
@@ -1130,6 +1167,7 @@ export class CoreManager {
       approvalBlockReason: approvalBlockReason || undefined,
       stages: executionResult.stages,
       threeLevelHealth: executionResult.threeLevelHealth,
+      verifiedWithCommand: testCmd,
       approvalFingerprintJson: null,
       approvedAt: null,
       appliedAt: null,
@@ -1301,7 +1339,13 @@ export class CoreManager {
     settings: { verificationMode?: VerificationMode; preferredHost?: HostEnvironment; testCommand?: string }
   ): Project {
     const project = this.ensureProject(repoPath);
-    this.db.updateProjectSettings(project.id, settings);
+    const testCommandSignature = settings.testCommand
+      ? signTestCommand(project.id, settings.testCommand)
+      : undefined;
+    this.db.updateProjectSettings(project.id, {
+      ...settings,
+      testCommandSignature,
+    });
     const updated = this.db.getProject(project.id)!;
     this.emitChange('project_settings_updated', updated);
     return updated;
@@ -1342,7 +1386,13 @@ export class CoreManager {
       targetFileHashes[f] = this.gitEngine.getFileSha256(absPath);
     }
 
-    const patchHash = crypto.createHash('sha256').update(proposal.patchDiff).digest('hex');
+    // 0-C: Hash the exact fileChanges to be applied (filtered by approvedFiles)
+    let effectiveChanges: FileChange[] = JSON.parse(proposal.fileChangesJson);
+    if (selectedFiles && selectedFiles.length > 0) {
+      const wanted = new Set(selectedFiles.map((f) => f.replace(/\\/g, '/')));
+      effectiveChanges = effectiveChanges.filter((c) => wanted.has(c.filePath.replace(/\\/g, '/')));
+    }
+    const patchHash = hashFileChanges(effectiveChanges);
     const baseHeadSha = this.gitEngine.getHeadSha(project.rootPath);
     const signature = signApprovalPayload(proposalId, patchHash, baseHeadSha);
 
@@ -1369,7 +1419,7 @@ export class CoreManager {
   }
 
   /**
-   * Records a security tampering event, marks proposal as REJECTED, and emits notifications.
+   * Records a security tampering event, marks proposal as TAMPERED, and emits notifications.
    */
   public recordTamperIncident(repoPath: string, proposalId: string, reason: string): void {
     const project = this.ensureProject(repoPath);
@@ -1377,12 +1427,12 @@ export class CoreManager {
       project.rootPath,
       'NOTE',
       `[보안 경고] 승인 게이트 변조 감지`,
-      `수정안 ID: ${proposalId}\n사유: ${reason}\n무단 승인 조작 또는 서명 위조가 감지되어 상태를 REJECTED로 되돌리고 적용을 즉시 차단했습니다.`,
+      `수정안 ID: ${proposalId}\n사유: ${reason}\n무단 승인 조작 또는 서명 위조가 감지되어 상태를 TAMPERED로 변경하고 적용을 즉시 차단했습니다.`,
       null,
       'security-gate'
     );
     try {
-      this.db.updateProposalApproval(proposalId, 'REJECTED');
+      this.db.updateProposalApproval(proposalId, 'TAMPERED');
     } catch {}
     this.emitChange('tamper_detected', { proposalId, reason, projectId: project.id });
     try {
@@ -1439,16 +1489,25 @@ export class CoreManager {
       );
     }
 
-    // Patch Drift Check: verify current proposal.patchDiff matches approved patchHash
-    const currentPatchHash = crypto.createHash('sha256').update(proposal.patchDiff).digest('hex');
-    if (currentPatchHash !== fp.patchHash) {
+    // 0-C Check: Compute hash of actual fileChanges to be applied right now
+    let fileChanges: FileChange[] = JSON.parse(proposal.fileChangesJson);
+    if (selectedFiles && selectedFiles.length > 0) {
+      const wanted = new Set(selectedFiles.map((f) => f.replace(/\\/g, '/')));
+      fileChanges = fileChanges.filter((c) => wanted.has(c.filePath.replace(/\\/g, '/')));
+      if (fileChanges.length === 0) {
+        throw new Error('선택한 파일이 수정안에 포함되어 있지 않습니다.');
+      }
+    }
+
+    const currentFileChangesHash = hashFileChanges(fileChanges);
+    if (currentFileChangesHash !== fp.patchHash) {
       this.recordTamperIncident(
         project.rootPath,
         proposalId,
-        `승인된 패치 내용(해시: ${fp.patchHash.slice(0, 8)})과 현재 제안 코드(해시: ${currentPatchHash.slice(0, 8)})가 일치하지 않습니다 (패치 사후 변조).`
+        `승인된 수정 내용(해시: ${fp.patchHash.slice(0, 8)})과 현재 적용 대상 내용(해시: ${currentFileChangesHash.slice(0, 8)})이 일치하지 않습니다 (fileChangesJson 사후 변조).`
       );
       throw new Error(
-        `[SECURITY_TAMPER_DETECTED]: 승인 이후 패치 내용 변조(Patch Drift)가 감지되었습니다. 승인 당시와 다른 코드가 적용되는 것을 차단했습니다.`
+        `[SECURITY_TAMPER_DETECTED]: 승인 이후 패치 코드 변조(Patch Drift)가 감지되었습니다. 승인 당시와 다른 코드가 적용되는 것을 차단했습니다.`
       );
     }
 

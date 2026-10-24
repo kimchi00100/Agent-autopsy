@@ -3,6 +3,7 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as crypto from 'node:crypto';
 import { CoreManager } from '../core-manager.js';
+import { resolveDataDir } from '../utils/paths.js';
 
 export class ApiServer {
   private server: http.Server | null = null;
@@ -89,20 +90,6 @@ export class ApiServer {
             return;
           }
 
-          // 3. Optional Authentication Token enforcement for general endpoints
-          const requiredToken = process.env.AUTOPSY_AUTH_TOKEN;
-          const reqUrl = new URL(req.url || '/', 'http://127.0.0.1');
-          const isExempt = reqUrl.pathname === '/api/health' || reqUrl.pathname === '/api/internal/notify';
-
-          if (requiredToken && !isExempt) {
-            const clientToken = (req.headers['x-autopsy-token'] as string) || reqUrl.searchParams.get('token');
-            if (clientToken !== requiredToken) {
-              res.writeHead(401, { 'Content-Type': 'application/json' });
-              res.end(JSON.stringify({ error: 'Unauthorized: Invalid or missing X-Autopsy-Token' }));
-              return;
-            }
-          }
-
           try {
             await this.handleRequest(req, res);
           } catch (error: any) {
@@ -128,9 +115,7 @@ export class ApiServer {
 
           // Save runtime metadata so desktop UI and MCP clients can discover assigned dynamic port
           try {
-            const dataDir =
-              process.env.AUTOPSY_DATA_DIR ||
-              path.resolve(process.env.APPDATA || process.env.HOME || '.', 'AgentAutopsy');
+            const dataDir = resolveDataDir();
             fs.mkdirSync(dataDir, { recursive: true });
             const runtimeInfo = this.coreManager.getRuntimeInfo(port);
             fs.writeFileSync(path.join(dataDir, 'runtime.json'), JSON.stringify(runtimeInfo, null, 2), 'utf8');
@@ -374,6 +359,11 @@ export class ApiServer {
     // POST /api/projects/:projectId/settings
     const settingsMatch = pathname.match(/^\/api\/projects\/([^\/]+)\/settings$/);
     if (req.method === 'POST' && settingsMatch) {
+      if (!this.verifySessionToken(req)) {
+        res.writeHead(401, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Unauthorized: Valid X-Autopsy-Token is required to update project settings.' }));
+        return;
+      }
       const projectId = settingsMatch[1];
       const body = await this.parseJsonBody(req);
       const project = db.getProject(projectId);
@@ -524,6 +514,11 @@ export class ApiServer {
     // POST /api/checkpoints/:checkpointId/rollback
     const rollbackMatch = pathname.match(/^\/api\/checkpoints\/([^\/]+)\/rollback$/);
     if (req.method === 'POST' && rollbackMatch) {
+      if (!this.verifySessionToken(req)) {
+        res.writeHead(401, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Unauthorized: Valid X-Autopsy-Token is required to rollback checkpoints.' }));
+        return;
+      }
       const checkpointId = rollbackMatch[1];
       const body = await this.parseJsonBody(req);
       const repoPath = body.repoPath || process.cwd();
@@ -535,6 +530,11 @@ export class ApiServer {
 
     // POST /api/directives
     if (req.method === 'POST' && pathname === '/api/directives') {
+      if (!this.verifySessionToken(req)) {
+        res.writeHead(401, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Unauthorized: Valid X-Autopsy-Token is required to submit user directives.' }));
+        return;
+      }
       const body = await this.parseJsonBody(req);
       let repoPath = body.repoPath;
       if (!repoPath && body.projectId) {
@@ -577,6 +577,11 @@ export class ApiServer {
     // POST /api/incidents/:incidentId/confirm-intent
     const confirmIntentMatch = pathname.match(/^\/api\/incidents\/([^\/]+)\/confirm-intent$/);
     if (req.method === 'POST' && confirmIntentMatch) {
+      if (!this.verifySessionToken(req)) {
+        res.writeHead(401, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Unauthorized: Valid X-Autopsy-Token is required to confirm intent.' }));
+        return;
+      }
       const incidentId = confirmIntentMatch[1];
       const body = await this.parseJsonBody(req);
       const inc = db.getIncident(incidentId);

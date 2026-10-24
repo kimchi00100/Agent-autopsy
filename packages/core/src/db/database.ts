@@ -91,6 +91,7 @@ export class AutopsyDatabase {
         name TEXT NOT NULL,
         root_path TEXT UNIQUE NOT NULL,
         test_command TEXT,
+        test_command_signature TEXT,
         verification_mode TEXT DEFAULT 'AUTO',
         preferred_host TEXT DEFAULT 'antigravity',
         created_at TEXT NOT NULL
@@ -142,6 +143,7 @@ export class AutopsyDatabase {
         approval_fingerprint_json TEXT,
         approved_at TEXT,
         applied_at TEXT,
+        verified_with_command TEXT,
         created_at TEXT NOT NULL,
         FOREIGN KEY (incident_id) REFERENCES incidents(id) ON DELETE CASCADE
       );
@@ -251,6 +253,8 @@ export class AutopsyDatabase {
       `ALTER TABLE repair_proposals ADD COLUMN approval_block_reason TEXT;`,
       `ALTER TABLE repair_proposals ADD COLUMN stages_json TEXT;`,
       `ALTER TABLE repair_proposals ADD COLUMN three_level_health_json TEXT;`,
+      `ALTER TABLE projects ADD COLUMN test_command_signature TEXT;`,
+      `ALTER TABLE repair_proposals ADD COLUMN verified_with_command TEXT;`,
     ];
 
     for (const sql of migrations) {
@@ -341,12 +345,13 @@ export class AutopsyDatabase {
       const canonicalId = generateDeterministicProjectId(project.rootPath);
       const projectId = project.id || canonicalId;
       const stmt = this.db.prepare(`
-        INSERT INTO projects (id, name, root_path, test_command, verification_mode, preferred_host, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO projects (id, name, root_path, test_command, test_command_signature, verification_mode, preferred_host, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(root_path) DO UPDATE SET
           id = excluded.id,
           name = excluded.name,
           test_command = COALESCE(excluded.test_command, projects.test_command),
+          test_command_signature = COALESCE(excluded.test_command_signature, projects.test_command_signature),
           verification_mode = COALESCE(excluded.verification_mode, projects.verification_mode),
           preferred_host = COALESCE(excluded.preferred_host, projects.preferred_host);
       `);
@@ -355,6 +360,7 @@ export class AutopsyDatabase {
         project.name,
         project.rootPath,
         project.testCommand || null,
+        project.testCommandSignature || null,
         project.verificationMode || 'AUTO',
         project.preferredHost || 'antigravity',
         project.createdAt
@@ -369,6 +375,7 @@ export class AutopsyDatabase {
       name: row.name,
       rootPath: row.root_path,
       testCommand: row.test_command || undefined,
+      testCommandSignature: row.test_command_signature || undefined,
       verificationMode: (row.verification_mode || 'AUTO') as VerificationMode,
       preferredHost: (row.preferred_host || 'antigravity') as HostEnvironment,
       createdAt: row.created_at,
@@ -384,6 +391,7 @@ export class AutopsyDatabase {
       name: row.name,
       rootPath: row.root_path,
       testCommand: row.test_command || undefined,
+      testCommandSignature: row.test_command_signature || undefined,
       verificationMode: (row.verification_mode || 'AUTO') as VerificationMode,
       preferredHost: (row.preferred_host || 'antigravity') as HostEnvironment,
       createdAt: row.created_at,
@@ -409,6 +417,7 @@ export class AutopsyDatabase {
       name: row.name,
       rootPath: row.root_path,
       testCommand: row.test_command || undefined,
+      testCommandSignature: row.test_command_signature || undefined,
       verificationMode: (row.verification_mode || 'AUTO') as VerificationMode,
       preferredHost: (row.preferred_host || 'antigravity') as HostEnvironment,
       createdAt: row.created_at,
@@ -417,17 +426,29 @@ export class AutopsyDatabase {
 
   public updateProjectSettings(
     id: string,
-    settings: { verificationMode?: VerificationMode; preferredHost?: HostEnvironment; testCommand?: string }
+    settings: {
+      verificationMode?: VerificationMode;
+      preferredHost?: HostEnvironment;
+      testCommand?: string;
+      testCommandSignature?: string;
+    }
   ): void {
     this.runInImmediateTransaction(() => {
       const stmt = this.db.prepare(`
         UPDATE projects
         SET verification_mode = COALESCE(?, verification_mode),
             preferred_host = COALESCE(?, preferred_host),
-            test_command = COALESCE(?, test_command)
+            test_command = COALESCE(?, test_command),
+            test_command_signature = COALESCE(?, test_command_signature)
         WHERE id = ?
       `);
-      stmt.run(settings.verificationMode || null, settings.preferredHost || null, settings.testCommand || null, id);
+      stmt.run(
+        settings.verificationMode || null,
+        settings.preferredHost || null,
+        settings.testCommand || null,
+        settings.testCommandSignature || null,
+        id
+      );
     });
   }
 
@@ -748,9 +769,9 @@ export class AutopsyDatabase {
           file_changes_json, verification_status, verification_log, approval_status,
           approval_fingerprint_json, approved_at, applied_at,
           patch_hash, risk_level, orchestration_review_json, approval_readiness, approval_block_reason,
-          stages_json, three_level_health_json,
+          stages_json, three_level_health_json, verified_with_command,
           created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `);
       stmt.run(
         proposal.id,
@@ -772,6 +793,7 @@ export class AutopsyDatabase {
         proposal.approvalBlockReason || null,
         proposal.stages ? JSON.stringify(proposal.stages) : null,
         proposal.threeLevelHealth ? JSON.stringify(proposal.threeLevelHealth) : null,
+        proposal.verifiedWithCommand || null,
         proposal.createdAt
       );
     });
@@ -801,6 +823,7 @@ export class AutopsyDatabase {
       appliedAt: row.applied_at,
       stages: row.stages_json ? JSON.parse(row.stages_json) : undefined,
       threeLevelHealth: row.three_level_health_json ? JSON.parse(row.three_level_health_json) : undefined,
+      verifiedWithCommand: row.verified_with_command || undefined,
       createdAt: row.created_at,
     };
   }
@@ -903,6 +926,7 @@ export class AutopsyDatabase {
       appliedAt: row.applied_at,
       stages: row.stages_json ? JSON.parse(row.stages_json) : undefined,
       threeLevelHealth: row.three_level_health_json ? JSON.parse(row.three_level_health_json) : undefined,
+      verifiedWithCommand: row.verified_with_command || undefined,
       createdAt: row.created_at,
     }));
   }
@@ -936,6 +960,7 @@ export class AutopsyDatabase {
       appliedAt: row.applied_at,
       stages: row.stages_json ? JSON.parse(row.stages_json) : undefined,
       threeLevelHealth: row.three_level_health_json ? JSON.parse(row.three_level_health_json) : undefined,
+      verifiedWithCommand: row.verified_with_command || undefined,
       createdAt: row.created_at,
     }));
   }

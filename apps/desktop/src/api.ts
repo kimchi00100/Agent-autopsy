@@ -227,7 +227,7 @@ export interface Proposal {
   touchedFiles: string[];
   verificationStatus: 'PENDING' | 'VERIFIED_PASS' | 'VERIFIED_FAIL';
   verificationLog: string;
-  approvalStatus: 'AWAITING_USER' | 'APPROVED' | 'REJECTED' | 'APPLIED';
+  approvalStatus: 'AWAITING_USER' | 'APPROVED' | 'REJECTED' | 'APPLIED' | 'TAMPERED';
   approvalReadiness?: ApprovalReadiness;
   approvalBlockReason?: string;
   orchestrationReview?: OrchestrationReview;
@@ -236,6 +236,7 @@ export interface Proposal {
   appliedAt: string | null;
   stages?: StageResult[];
   threeLevelHealth?: ThreeLevelHealth;
+  verifiedWithCommand?: string;
 }
 
 export interface Overview {

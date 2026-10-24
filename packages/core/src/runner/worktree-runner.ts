@@ -291,6 +291,9 @@ export class WorktreeRunner {
     const stages: StageResult[] = [];
     const overallStartTime = Date.now();
 
+    // 0-E Checkpoint: Capture initial state of heavy dependency folders in original repo before validation
+    const beforeHeavySnapshot = this.captureHeavyDirsSnapshot(options.repoPath);
+
     // --- STAGE 1: CODE_CHECK (문법/정적 구문 검사) ---
     let codeCheckCmd = '';
     const jsFiles = touchedFiles.filter((f) => /\.(js|cjs|mjs)$/i.test(f) && fs.existsSync(path.resolve(worktreePath, f)));
@@ -479,6 +482,36 @@ export class WorktreeRunner {
       },
     };
 
+    // 0-E Check: Ensure connected host heavy dependency directories (node_modules, etc.) were not mutated during test execution
+    const dirChanges = this.detectHeavyDirsChange(options.repoPath, beforeHeavySnapshot);
+    if (dirChanges.length > 0) {
+      const taintWarning = `[원본 의존성 폴더 변경 감지]: 격리 검증 중 원본 의존성 폴더(${dirChanges.join(', ')})가 변경되었습니다. 호스트 환경 오염 방지를 위해 검증이 실패로 처리됩니다.`;
+      stages.push({
+        stage: 'FULL_REGRESSION_CHECK',
+        command: options.fullTestCommand,
+        status: 'FAIL',
+        output: taintWarning,
+        exitCode: 1,
+        durationMs: 0,
+      });
+
+      threeLevelHealth.functional = 'FAIL';
+      threeLevelHealth.requirement = 'FAIL';
+      if (threeLevelHealth.details) {
+        threeLevelHealth.details.functionalSummary = '원본 의존성 폴더 변경 감지';
+        threeLevelHealth.details.requirementSummary = taintWarning;
+      }
+
+      return {
+        success: false,
+        output: this.formatPipelineReport(stages) + `\n\n❌ ${taintWarning}`,
+        exitCode: 1,
+        durationMs: Date.now() - overallStartTime,
+        stages,
+        threeLevelHealth,
+      };
+    }
+
     return {
       success: !isRegressionFail,
       output: this.formatPipelineReport(stages),
@@ -487,6 +520,78 @@ export class WorktreeRunner {
       stages,
       threeLevelHealth,
     };
+  }
+
+  /**
+   * Captures the top-level entries and mtimeMs of heavy dependency directories in the host repo.
+   */
+  public captureHeavyDirsSnapshot(repoPath: string): Record<string, Record<string, number>> {
+    const snapshot: Record<string, Record<string, number>> = {};
+    for (const heavyDir of HEAVY_DIR_NAMES) {
+      const src = path.join(repoPath, heavyDir);
+      if (fs.existsSync(src)) {
+        snapshot[heavyDir] = {};
+        try {
+          const entries = fs.readdirSync(src);
+          for (const entry of entries) {
+            try {
+              const stat = fs.statSync(path.join(src, entry));
+              snapshot[heavyDir][entry] = stat.mtimeMs;
+            } catch {}
+          }
+        } catch {}
+      }
+    }
+    return snapshot;
+  }
+
+  /**
+   * Detects if any heavy dependency directories in the host repo were modified during validation.
+   */
+  public detectHeavyDirsChange(
+    repoPath: string,
+    before: Record<string, Record<string, number>>
+  ): string[] {
+    const changes: string[] = [];
+    for (const heavyDir of HEAVY_DIR_NAMES) {
+      const src = path.join(repoPath, heavyDir);
+      const beforeDir = before[heavyDir];
+      const existsNow = fs.existsSync(src);
+
+      if (!beforeDir && existsNow) {
+        changes.push(`${heavyDir} 폴더 생성`);
+        continue;
+      }
+      if (beforeDir && !existsNow) {
+        changes.push(`${heavyDir} 폴더 삭제`);
+        continue;
+      }
+      if (!beforeDir && !existsNow) continue;
+
+      try {
+        const currentEntries = new Set(fs.readdirSync(src));
+        const beforeEntries = new Set(Object.keys(beforeDir!));
+
+        for (const entry of currentEntries) {
+          if (!beforeEntries.has(entry)) {
+            changes.push(`${heavyDir}/${entry} 파일 추가`);
+          } else {
+            try {
+              const stat = fs.statSync(path.join(src, entry));
+              if (Math.abs(stat.mtimeMs - (beforeDir![entry] || 0)) > 50) {
+                changes.push(`${heavyDir}/${entry} 내용 수정`);
+              }
+            } catch {}
+          }
+        }
+        for (const entry of beforeEntries) {
+          if (!currentEntries.has(entry)) {
+            changes.push(`${heavyDir}/${entry} 파일 삭제`);
+          }
+        }
+      } catch {}
+    }
+    return changes;
   }
 
   private formatPipelineReport(stages: StageResult[]): string {

@@ -4,7 +4,7 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as http from 'node:http';
 import * as url from 'node:url';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawn, ChildProcess } from 'node:child_process';
 import { CoreManager } from '../src/core-manager.js';
 import { ApiServer } from '../src/server/api-server.js';
 import { analyzeIncident } from '../src/analysis/analyzer.js';
@@ -68,6 +68,8 @@ describe('Agent Autopsy Core Engine Integration Tests', () => {
     core = new CoreManager({
       customDbPath: dbPath,
     });
+    // User confirms legitimate test command with cryptographic signature
+    core.updateProjectSettings(repoPath, { testCommand: 'node test.js' });
   });
 
   after(async () => {
@@ -823,7 +825,7 @@ describe('Agent Autopsy Core Engine Integration Tests', () => {
     await apiServer.stop();
   });
 
-  test('25. Phase 3: Tamper Detection - Direct DB Bypass is Rejected & Logged', async () => {
+  test('25. Phase 3: Tamper Detection - Direct DB Bypass is Rejected & Marked TAMPERED', async () => {
     const inc = core.collectIncidentBundle(repoPath, '변조 탐지 테스트', 'AssertionError: test');
     const { proposal } = await core.proposeAndVerifyRepair(repoPath, inc.id, 'fix division', [
       {
@@ -856,9 +858,9 @@ describe('Agent Autopsy Core Engine Integration Tests', () => {
       'Applying repair with null fingerprint must throw SECURITY_TAMPER_DETECTED'
     );
 
-    // Verify DB state reverted to REJECTED
+    // Verify DB state set to TAMPERED
     const updated = db.getRepairProposal(proposal.id);
-    assert.strictEqual(updated?.approvalStatus, 'REJECTED', 'Proposal status must be reverted to REJECTED');
+    assert.strictEqual(updated?.approvalStatus, 'TAMPERED', 'Proposal status must be marked as TAMPERED');
 
     // Verify tamper event logged in agent_events
     const events = db.listAgentEvents(core.ensureProject(repoPath).id);
@@ -866,7 +868,7 @@ describe('Agent Autopsy Core Engine Integration Tests', () => {
     assert.ok(tamperEv, 'Tamper incident must be recorded in agent events timeline');
   });
 
-  test('26. Phase 3: Patch Drift Detection - Post-Approval Modification is Blocked', async () => {
+  test('26. Phase 3: Patch Drift Detection - fileChangesJson Modification is Blocked', async () => {
     const inc = core.collectIncidentBundle(repoPath, '패치 드리프트 테스트', 'AssertionError: drift');
     const { proposal } = await core.proposeAndVerifyRepair(repoPath, inc.id, 'fix division', [
       {
@@ -883,13 +885,24 @@ describe('Agent Autopsy Core Engine Integration Tests', () => {
     // Legally approve the proposal
     core.approveProposal(proposal.id);
 
-    // Rogue attacker modifies the patch code in DB after approval
+    // Rogue attacker modifies the actual applied code in file_changes_json in DB after approval
     const db = core.getDatabase();
+    const maliciousChanges = JSON.stringify([
+      {
+        filePath: 'calculator.js',
+        replacements: [
+          {
+            search: '  return a / b;',
+            replace: '  // BACKDOOR INJECTED\n  return 9999;',
+          },
+        ],
+      },
+    ]);
     (db as any).db.prepare(`
       UPDATE repair_proposals
-      SET patch_diff = '--- malicious_drift_diff ---'
+      SET file_changes_json = ?
       WHERE id = ?
-    `).run(proposal.id);
+    `).run(maliciousChanges, proposal.id);
 
     // Attempt to apply repair - MUST detect drift and reject
     assert.throws(
@@ -899,63 +912,364 @@ describe('Agent Autopsy Core Engine Integration Tests', () => {
       (err: any) => {
         return err.message.includes('[SECURITY_TAMPER_DETECTED]');
       },
-      'Applying repair after patch drift must throw SECURITY_TAMPER_DETECTED'
+      'Applying repair after fileChangesJson drift must throw SECURITY_TAMPER_DETECTED'
     );
 
     const updated = db.getRepairProposal(proposal.id);
-    assert.strictEqual(updated?.approvalStatus, 'REJECTED', 'Proposal status must be reverted to REJECTED upon drift');
+    assert.strictEqual(updated?.approvalStatus, 'TAMPERED', 'Proposal status must be marked as TAMPERED upon drift');
   });
 
-  test('27. Phase 4: Multi-Process Integration Test & Zero-Leakage Health Check', async () => {
+  test('27. Phase 4: Multi-Process Real MCP & Server Integration Test', async () => {
+    const monorepoRoot = fs.existsSync(path.resolve(process.cwd(), 'packages/mcp-server'))
+      ? process.cwd()
+      : path.resolve(process.cwd(), '../..');
+    const mcpDistScript = path.resolve(monorepoRoot, 'packages/mcp-server/dist/index.js');
+    const srvDistScript = path.resolve(monorepoRoot, 'packages/core/dist/src/bin/server-cli.js');
+
+    // Helper: Execute tool call on actual MCP server subprocess over stdio
+    const callMcp = (env: NodeJS.ProcessEnv, toolName: string, args: any): Promise<{ text: string; isError?: boolean }> => {
+      return new Promise((resolve, reject) => {
+        const cp = spawn('node', [mcpDistScript], {
+          env: { ...process.env, ...env },
+          stdio: ['pipe', 'pipe', 'pipe'],
+        });
+
+        let stdoutBuf = '';
+        let hasInitialized = false;
+
+        cp.stdout.on('data', (chunk) => {
+          stdoutBuf += chunk.toString();
+          const lines = stdoutBuf.split('\n');
+          stdoutBuf = lines.pop() || '';
+
+          for (const line of lines) {
+            if (!line.trim()) continue;
+            try {
+              const msg = JSON.parse(line);
+              if (msg.id === 1 && !hasInitialized) {
+                hasInitialized = true;
+                cp.stdin.write(JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' }) + '\n');
+                cp.stdin.write(
+                  JSON.stringify({
+                    jsonrpc: '2.0',
+                    id: 2,
+                    method: 'tools/call',
+                    params: { name: toolName, arguments: args },
+                  }) + '\n'
+                );
+              } else if (msg.id === 2) {
+                const text = msg.result?.content?.[0]?.text || '';
+                cp.kill();
+                resolve({ text, isError: msg.result?.isError });
+                return;
+              }
+            } catch {}
+          }
+        });
+
+        cp.on('error', reject);
+        cp.on('exit', (code) => {
+          if (!hasInitialized && code !== 0 && code !== null) {
+            reject(new Error(`MCP process exited with code ${code}`));
+          }
+        });
+
+        cp.stdin.write(
+          JSON.stringify({
+            jsonrpc: '2.0',
+            id: 1,
+            method: 'initialize',
+            params: {
+              protocolVersion: '2024-11-05',
+              capabilities: {},
+              clientInfo: { name: 'test-harness', version: '1.0' },
+            },
+          }) + '\n'
+        );
+      });
+    };
+
+    // Helper: Spawn server-cli subprocess and wait for AUTOPSY_PORT
+    const startServerCli = (env: NodeJS.ProcessEnv, port: number): Promise<{ child: ChildProcess; actualPort: number }> => {
+      return new Promise((resolve, reject) => {
+        const cp = spawn('node', [srvDistScript], {
+          env: { ...process.env, ...env, PORT: String(port) },
+          stdio: ['pipe', 'pipe', 'pipe'],
+        });
+
+        let resolved = false;
+        cp.stdout.on('data', (chunk) => {
+          const text = chunk.toString();
+          const match = text.match(/AUTOPSY_PORT=(\d+)/);
+          if (match && !resolved) {
+            resolved = true;
+            resolve({ child: cp, actualPort: Number(match[1]) });
+          }
+        });
+
+        cp.on('error', reject);
+        cp.on('exit', (code) => {
+          if (!resolved) reject(new Error(`Server exited prematurely with code ${code}`));
+        });
+
+        setTimeout(() => {
+          if (!resolved) {
+            cp.kill();
+            reject(new Error('Server-cli start timeout'));
+          }
+        }, 10000);
+      });
+    };
+
+    // --- Part 1: Shared Data Directory via AUTOPSY_DATA_DIR ---
+    const tempSharedDataDir = path.join(testRoot, 'shared_data_autopsy_env');
+    fs.mkdirSync(tempSharedDataDir, { recursive: true });
+
+    // 1. Invoke actual MCP server subprocess to create incident
+    const mcpResA = await callMcp(
+      { AUTOPSY_DATA_DIR: tempSharedDataDir },
+      'collect_incident_bundle',
+      {
+        repoPath,
+        title: '실제 MCP 서브프로세스 사건 A',
+        errorOutput: 'TypeError: real mcp process test',
+      }
+    );
+    assert.strictEqual(mcpResA.isError, undefined);
+    const parsedA = JSON.parse(mcpResA.text);
+    assert.strictEqual(parsedA.success, true);
+    const mcpIncIdA = parsedA.incident.id;
+    assert.ok(mcpIncIdA.startsWith('inc_'));
+
+    // 2. Spawn actual backend server-cli with the exact same AUTOPSY_DATA_DIR
+    const srvA = await startServerCli({ AUTOPSY_DATA_DIR: tempSharedDataDir }, 3882);
+
+    try {
+      // 3. Verify /api/health does NOT leak authToken
+      const healthA = await new Promise<{ status: number; body: any }>((resolve, reject) => {
+        http.get(`http://127.0.0.1:${srvA.actualPort}/api/health`, (res) => {
+          let b = '';
+          res.on('data', (c) => (b += c));
+          res.on('end', () => resolve({ status: res.statusCode || 500, body: JSON.parse(b) }));
+        }).on('error', reject);
+      });
+      assert.strictEqual(healthA.status, 200);
+      assert.strictEqual(healthA.body.service, 'agent-autopsy');
+      assert.strictEqual(healthA.body.authToken, undefined, 'Health endpoint MUST NOT leak authToken');
+
+      // 4. Query incidents from HTTP server API to verify cross-process shared DB visibility
+      const projectId = generateDeterministicProjectId(repoPath);
+      const incResA = await new Promise<{ status: number; body: any }>((resolve, reject) => {
+        http.get(`http://127.0.0.1:${srvA.actualPort}/api/incidents?projectId=${projectId}`, (res) => {
+          let b = '';
+          res.on('data', (c) => (b += c));
+          res.on('end', () => resolve({ status: res.statusCode || 500, body: JSON.parse(b) }));
+        }).on('error', reject);
+      });
+      assert.strictEqual(incResA.status, 200);
+      const foundA = incResA.body.incidents.find((i: any) => i.id === mcpIncIdA);
+      assert.ok(foundA, 'Incident created by real MCP server must be queryable via real server-cli HTTP API');
+    } finally {
+      srvA.child.kill();
+    }
+
+    // --- Part 2: Without AUTOPSY_DATA_DIR, verify default APPDATA fallback ---
+    const tempAppDataDir = path.join(testRoot, 'fake_user_appdata');
+    fs.mkdirSync(tempAppDataDir, { recursive: true });
+
+    // 1. Invoke actual MCP server subprocess with APPDATA only
+    const mcpResB = await callMcp(
+      { APPDATA: tempAppDataDir, AUTOPSY_DATA_DIR: '' },
+      'collect_incident_bundle',
+      {
+        repoPath,
+        title: 'APPDATA 기본 경로 사건 B',
+        errorOutput: 'TypeError: appdata fallback test',
+      }
+    );
+    assert.strictEqual(mcpResB.isError, undefined);
+    const parsedB = JSON.parse(mcpResB.text);
+    const mcpIncIdB = parsedB.incident.id;
+
+    // Verify DB file was created under %APPDATA%/AgentAutopsy/autopsy.db
+    const expectedDbFile = path.join(tempAppDataDir, 'AgentAutopsy', 'autopsy.db');
+    assert.ok(fs.existsSync(expectedDbFile), 'DB must be created in %APPDATA%/AgentAutopsy/autopsy.db when AUTOPSY_DATA_DIR is unset');
+
+    // 2. Spawn backend server-cli with APPDATA only
+    const srvB = await startServerCli({ APPDATA: tempAppDataDir, AUTOPSY_DATA_DIR: '' }, 3883);
+    try {
+      const projectId = generateDeterministicProjectId(repoPath);
+      const incResB = await new Promise<{ status: number; body: any }>((resolve, reject) => {
+        http.get(`http://127.0.0.1:${srvB.actualPort}/api/incidents?projectId=${projectId}`, (res) => {
+          let b = '';
+          res.on('data', (c) => (b += c));
+          res.on('end', () => resolve({ status: res.statusCode || 500, body: JSON.parse(b) }));
+        }).on('error', reject);
+      });
+      assert.strictEqual(incResB.status, 200);
+      const foundB = incResB.body.incidents.find((i: any) => i.id === mcpIncIdB);
+      assert.ok(foundB, 'Incident must be shared across processes via default %APPDATA%/AgentAutopsy directory');
+    } finally {
+      srvB.child.kill();
+    }
+  });
+
+  test('28. 0-D Check: Test Command Tamper Detection Blocks Verification & Does Not Auto-Sign', async () => {
+    const inc = core.collectIncidentBundle(repoPath, '테스트 명령 변조 방어', 'AssertionError: cmd');
+    const project = core.ensureProject(repoPath);
+    const db = core.getDatabase();
+
+    // 1. Rogue agent directly tampers test_command to 'exit 0' and wipes test_command_signature to NULL in DB
+    (db as any).db.prepare(`
+      UPDATE projects
+      SET test_command = 'exit 0', test_command_signature = NULL
+      WHERE id = ?
+    `).run(project.id);
+
+    // 2. Call ensureProject() - MUST NOT automatically re-issue signature!
+    const reloaded = core.ensureProject(repoPath);
+    assert.strictEqual(
+      reloaded.testCommandSignature,
+      undefined,
+      'ensureProject MUST NOT automatically re-issue signature for unconfirmed or altered command'
+    );
+
+    const rowBefore = (db as any).db
+      .prepare('SELECT test_command, test_command_signature FROM projects WHERE id = ?')
+      .get(project.id);
+    assert.strictEqual(rowBefore.test_command_signature, null, 'Signature in DB must remain NULL');
+
+    // 3. Call proposeAndVerifyRepair() - MUST NOT execute verification and MUST throw error
+    await assert.rejects(
+      async () => {
+        await core.proposeAndVerifyRepair(repoPath, inc.id, 'fake bypass fix', [
+          {
+            filePath: 'calculator.js',
+            replacements: [{ search: 'return a / b;', replace: 'return 0;' }],
+          },
+        ]);
+      },
+      (err: any) => {
+        return err.message.includes('[TEST_COMMAND_UNCONFIRMED]') || err.message.includes('[SECURITY_TAMPER_DETECTED]');
+      },
+      'Unsigned / tampered test command must be rejected without executing verification'
+    );
+
+    // 4. Verify signature in DB is STILL NULL (no stealth signing occurred)
+    const rowAfter = (db as any).db
+      .prepare('SELECT test_command, test_command_signature FROM projects WHERE id = ?')
+      .get(project.id);
+    assert.strictEqual(rowAfter.test_command_signature, null, 'Signature in DB must still be NULL');
+
+    // 5. Restore legitimate test command with proper signature via user settings API
+    core.updateProjectSettings(repoPath, { testCommand: 'node test.js' });
+    const restored = db.getProject(project.id);
+    assert.ok(restored?.testCommandSignature, 'User decision API must issue cryptographic signature');
+  });
+
+  test('29. 0-E Check: Connected Dependency Directory Mutation Fails Verification', async () => {
+    const inc = core.collectIncidentBundle(repoPath, '의존성 폴더 오염 감지 테스트', 'AssertionError: heavy');
+    const project = core.ensureProject(repoPath);
+
+    // Create a dummy node_modules directory in repoPath
+    const nodeModulesDir = path.join(repoPath, 'node_modules');
+    const fakeDepDir = path.join(nodeModulesDir, 'sample_dep');
+    fs.mkdirSync(fakeDepDir, { recursive: true });
+    fs.writeFileSync(path.join(fakeDepDir, 'index.js'), 'module.exports = {};\n');
+
+    // Introduce a malicious test script that pollutes node_modules during execution
+    const maliciousTestScript = path.join(repoPath, 'pollute_test.js');
+    fs.writeFileSync(
+      maliciousTestScript,
+      `const fs = require('fs');\nconst path = require('path');\nfs.writeFileSync(path.join(__dirname, 'node_modules', 'sample_dep', 'taint.txt'), 'polluted!');\nconsole.log('POLLUTION_DONE');\n`
+    );
+
+    core.updateProjectSettings(repoPath, { testCommand: 'node pollute_test.js' });
+
+    const { executionResult } = await core.proposeAndVerifyRepair(repoPath, inc.id, 'fix with pollution', [
+      {
+        filePath: 'calculator.js',
+        replacements: [{ search: 'return a / b;', replace: 'return 1;' }],
+      },
+    ]);
+
+    // MUST NOT pass validation because connected heavy directory was mutated
+    assert.strictEqual(executionResult.success, false, 'Validation must fail when host dependency directory is mutated');
+    assert.ok(
+      executionResult.output.includes('원본 의존성 폴더 변경 감지'),
+      'Output report must explicitly indicate 원본 의존성 폴더 변경 감지'
+    );
+
+    // Clean up
+    fs.rmSync(nodeModulesDir, { recursive: true, force: true });
+    if (fs.existsSync(maliciousTestScript)) fs.unlinkSync(maliciousTestScript);
+    core.updateProjectSettings(repoPath, { testCommand: 'node test.js' });
+  });
+
+  test('30. 0-B Check: User Decision APIs Require Valid Session Token', async () => {
     const apiServer = new ApiServer(core);
-    const port = await apiServer.start(3880);
+    const port = await apiServer.start(3881);
+    const token = apiServer.getSessionToken();
+    const projectId = core.ensureProject(repoPath).id;
 
-    // 1. Verify /api/health does NOT leak authToken
-    const health = await new Promise<{ status: number; body: any }>((resolve, reject) => {
-      http.get(`http://127.0.0.1:${port}/api/health`, (res) => {
+    const makePost = (endpoint: string, headers: Record<string, string>, body: any) => {
+      return new Promise<{ status: number; body: any }>((resolve, reject) => {
+        const payload = JSON.stringify(body);
+        const req = http.request(
+          {
+            hostname: '127.0.0.1',
+            port,
+            path: endpoint,
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'Content-Length': Buffer.byteLength(payload),
+              ...headers,
+            },
+          },
+          (res) => {
+            let b = '';
+            res.on('data', (c) => (b += c));
+            res.on('end', () => {
+              try {
+                resolve({ status: res.statusCode || 500, body: JSON.parse(b) });
+              } catch {
+                resolve({ status: res.statusCode || 500, body: b });
+              }
+            });
+          }
+        );
+        req.on('error', reject);
+        req.write(payload);
+        req.end();
+      });
+    };
+
+    // 1. Settings without token -> 401
+    const unauthSettings = await makePost(`/api/projects/${projectId}/settings`, {}, { verificationMode: 'MAIN_ONLY' });
+    assert.strictEqual(unauthSettings.status, 401, 'Settings update without token must return 401');
+
+    // 2. Settings with token -> 200
+    const authSettings = await makePost(
+      `/api/projects/${projectId}/settings`,
+      { 'X-Autopsy-Token': token },
+      { verificationMode: 'MAIN_ONLY' }
+    );
+    assert.strictEqual(authSettings.status, 200, 'Settings update with valid token must succeed (200 OK)');
+
+    // 3. Rollback without token -> 401
+    const unauthRollback = await makePost(`/api/checkpoints/cp_fake/rollback`, {}, { repoPath });
+    assert.strictEqual(unauthRollback.status, 401, 'Rollback without token must return 401');
+
+    // 4. Query APIs without token -> 200 OK
+    const projectsRes = await new Promise<{ status: number; body: any }>((resolve, reject) => {
+      http.get(`http://127.0.0.1:${port}/api/projects`, (res) => {
         let b = '';
         res.on('data', (c) => (b += c));
         res.on('end', () => resolve({ status: res.statusCode || 500, body: JSON.parse(b) }));
       }).on('error', reject);
     });
-
-    assert.strictEqual(health.status, 200);
-    assert.strictEqual(health.body.service, 'agent-autopsy');
-    assert.strictEqual(health.body.authToken, undefined, 'Health endpoint MUST NOT leak authToken');
-
-    // 2. Subprocess integration: spawn a node script that writes to the shared DB using CoreManager
-    const coreDistUrl = new URL('../src/index.js', import.meta.url).href;
-    const subScript = `
-      import { CoreManager } from '${coreDistUrl}';
-      const cm = new CoreManager({ customDbPath: '${dbPath.replace(/\\/g, '/')}' });
-      const inc = cm.collectIncidentBundle('${repoPath.replace(/\\/g, '/')}', '서브프로세스 사건 기록', 'TypeError: cross process');
-      console.log('CREATED_INCIDENT:' + inc.id);
-      await cm.shutdown();
-      process.exit(0);
-    `;
-    const subOut = execFileSync('node', ['--input-type=module', '-e', subScript], {
-      env: { ...process.env, AUTOPSY_DATA_DIR: resolveDataDir() },
-      encoding: 'utf8',
-    });
-
-    const match = subOut.match(/CREATED_INCIDENT:(inc_[a-zA-Z0-9_]+)/);
-    assert.ok(match, 'Subprocess must output created incident ID');
-    const childIncId = match[1];
-
-    // 3. Query through apiServer HTTP endpoint to verify cross-process visibility
-    const projectId = generateDeterministicProjectId(repoPath);
-    const incRes = await new Promise<{ status: number; body: any }>((resolve, reject) => {
-      http.get(`http://127.0.0.1:${port}/api/incidents?projectId=${projectId}`, (res) => {
-        let b = '';
-        res.on('data', (c) => (b += c));
-        res.on('end', () => resolve({ status: res.statusCode || 500, body: JSON.parse(b) }));
-      }).on('error', reject);
-    });
-
-    assert.strictEqual(incRes.status, 200);
-    const found = incRes.body.incidents.find((i: any) => i.id === childIncId);
-    assert.ok(found, 'Incident created by child process must be visible via ApiServer HTTP API');
-    assert.strictEqual(found.projectId, projectId, 'Child incident must bind to deterministic projectId');
+    assert.strictEqual(projectsRes.status, 200, 'Query API (/api/projects) must succeed without token');
 
     await apiServer.stop();
   });

@@ -4,6 +4,20 @@ const http = require('node:http');
 const fs = require('node:fs');
 const crypto = require('node:crypto');
 
+// Single Instance Lock: Prevent multiple Electron app windows from launching concurrently
+const gotTheLock = app.requestSingleInstanceLock();
+if (!gotTheLock) {
+  console.log('[Agent Autopsy] Another desktop instance is already running. Quitting.');
+  app.quit();
+} else {
+  app.on('second-instance', () => {
+    if (mainWindow) {
+      if (mainWindow.isMinimized()) mainWindow.restore();
+      mainWindow.focus();
+    }
+  });
+}
+
 let mainWindow = null;
 let serverProcess = null;
 
@@ -118,36 +132,21 @@ async function ensureBackendServer() {
     const srvDir = path.resolve(defaultHealth.dataDir || '').toLowerCase();
     const myDir = path.resolve(dataDir).toLowerCase();
     if (srvDir === myDir) {
-      console.log('[Agent Autopsy] Existing compatible backend server detected on port', DEFAULT_PORT);
-      currentPort = DEFAULT_PORT;
-      backendStatus = { state: 'READY', port: DEFAULT_PORT, host: '127.0.0.1', error: null, recoveryGuide: null };
+      // Security Gate: Foreign running backend has unknown session token -> Do not reuse!
+      const errMsg = `포트 ${DEFAULT_PORT}에서 다른 백엔드가 이미 실행 중입니다.`;
+      console.warn(`[Agent Autopsy] ${errMsg} (PID: ${defaultHealth.pid || '알 수 없음'}). Cannot reuse due to session token security mismatch.`);
+      backendStatus = {
+        state: 'ERROR',
+        port: DEFAULT_PORT,
+        host: '127.0.0.1',
+        error: errMsg,
+        recoveryGuide: `이미 실행 중인 다른 Agent Autopsy 백엔드 프로세스(PID: ${defaultHealth.pid || '?'})를 종료한 뒤 앱을 다시 시작해 주세요. (보안 세션 토큰 불일치 방지)`,
+      };
       broadcastBackendStatus();
       return;
     } else {
       console.warn(`[Agent Autopsy] Server on port ${DEFAULT_PORT} is using different dataDir ("${defaultHealth.dataDir}" vs "${dataDir}"). Will spawn isolated backend on dynamic port.`);
     }
-  }
-
-  // Check runtime.json for prior dynamic port
-  const runtimeJsonPath = path.join(dataDir, 'runtime.json');
-  if (fs.existsSync(runtimeJsonPath)) {
-    try {
-      const savedInfo = JSON.parse(fs.readFileSync(runtimeJsonPath, 'utf8'));
-      if (savedInfo.port && savedInfo.port !== DEFAULT_PORT) {
-        const savedHealth = await checkHealth(savedInfo.port);
-        if (savedHealth) {
-          const srvDir = path.resolve(savedHealth.dataDir || '').toLowerCase();
-          const myDir = path.resolve(dataDir).toLowerCase();
-          if (srvDir === myDir) {
-            console.log('[Agent Autopsy] Existing backend server detected on dynamic port', savedInfo.port);
-            currentPort = savedInfo.port;
-            backendStatus = { state: 'READY', port: currentPort, host: '127.0.0.1', error: null, recoveryGuide: null };
-            broadcastBackendStatus();
-            return;
-          }
-        }
-      }
-    } catch {}
   }
 
   // 2. Spawn backend server process using Electron's built-in Node runtime

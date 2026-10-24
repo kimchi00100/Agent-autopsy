@@ -188,7 +188,7 @@ export default function Repair({
 
   const verified = proposal?.verificationStatus === 'VERIFIED_PASS';
   const verifyFailed = proposal?.verificationStatus === 'VERIFIED_FAIL';
-  const finished = proposal?.approvalStatus === 'APPLIED' || proposal?.approvalStatus === 'REJECTED';
+  const finished = proposal?.approvalStatus === 'APPLIED' || proposal?.approvalStatus === 'REJECTED' || proposal?.approvalStatus === 'TAMPERED';
   const firstErrLine = (t: string) => t.split(/\r?\n/).map((l) => l.trim()).find((l) => l) ?? '';
 
   return (
@@ -273,6 +273,28 @@ export default function Repair({
                 Patch Hash: {proposal.patchHash ? proposal.patchHash.slice(0, 10) : 'none'}
               </span>
             </div>
+
+            {/* 0-D: Verified With Command display */}
+            <div className="mb-3 flex items-center gap-2 rounded-lg border border-slate-200 bg-slate-50/80 px-3 py-1.5 text-xs text-slate-700">
+              <span className="font-semibold text-slate-600">검증 명령:</span>
+              <span>이 수정안은 <code className="rounded border border-slate-300 bg-white px-1.5 py-0.5 font-mono text-[11px] font-bold text-indigo-700">{proposal.verifiedWithCommand || 'npm test'}</code> (으)로 검증됨</span>
+            </div>
+
+            {/* 0-C: Tampered alert banner */}
+            {proposal.approvalStatus === 'TAMPERED' && (
+              <div className="mb-3 rounded-lg border border-red-300 bg-red-50 p-4 text-xs text-red-900 shadow-sm">
+                <div className="flex items-start gap-2.5">
+                  <ShieldAlert className="h-5 w-5 text-red-600 shrink-0 mt-0.5" />
+                  <div>
+                    <div className="font-bold text-sm text-red-800">🚨 [보안 경고: 변조 감지] 수정안 적용이 차단되었습니다</div>
+                    <div className="mt-1 leading-relaxed text-red-700">
+                      데이터베이스 직접 조작, 승인 서명 불일치, 또는 승인 사후 코드 변경(Patch Drift)이 감지되었습니다.
+                      저장소 무단 오염을 방지하기 위해 이 수정안은 적용이 영구 차단되었습니다.
+                    </div>
+                  </div>
+                </div>
+              </div>
+            )}
 
             {/* Block reason alert banner */}
             {proposal.approvalReadiness === 'BLOCKED_AWAITING_REVIEW' && (
@@ -597,6 +619,11 @@ export default function Repair({
             <div className="text-xs text-slate-600">
               {proposal.approvalStatus === 'APPLIED' && '이미 적용된 수정안입니다.'}
               {proposal.approvalStatus === 'REJECTED' && '거절된 수정안입니다.'}
+              {proposal.approvalStatus === 'TAMPERED' && (
+                <span className="font-semibold text-red-600">
+                  🚨 변조가 감지되어 적용이 영구 차단된 수정안입니다.
+                </span>
+              )}
               {!finished && verifyFailed && '격리 검증에 실패한 수정안은 적용할 수 없습니다.'}
               {!finished && !verifyFailed && proposal.approvalReadiness === 'BLOCKED_AWAITING_REVIEW' && !forceAck && (
                 <span className="text-rose-600 font-medium">

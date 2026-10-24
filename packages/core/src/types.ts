@@ -57,6 +57,7 @@ export interface Project {
   name: string;
   rootPath: string;
   testCommand?: string;
+  testCommandSignature?: string;
   verificationMode?: VerificationMode;
   preferredHost?: HostEnvironment;
   createdAt: string;
@@ -232,7 +233,7 @@ export interface FileChange {
 }
 
 export type VerificationStatus = 'PENDING' | 'VERIFIED_PASS' | 'VERIFIED_FAIL';
-export type ApprovalStatus = 'AWAITING_USER' | 'APPROVED' | 'REJECTED' | 'APPLIED';
+export type ApprovalStatus = 'AWAITING_USER' | 'APPROVED' | 'REJECTED' | 'APPLIED' | 'TAMPERED';
 
 export interface ApprovalFingerprint {
   patchHash: string;
@@ -265,6 +266,7 @@ export interface RepairProposal {
   createdAt: string;
   stages?: StageResult[];
   threeLevelHealth?: ThreeLevelHealth;
+  verifiedWithCommand?: string;
 }
 
 export type EvidenceStrength = 'HIGH' | 'MEDIUM' | 'LOW' | 'UNKNOWN';

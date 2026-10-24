@@ -92,6 +92,8 @@ export class AutopsyDatabase {
         root_path TEXT UNIQUE NOT NULL,
         test_command TEXT,
         test_command_signature TEXT,
+        proposed_test_command TEXT,
+        proposed_test_command_reason TEXT,
         verification_mode TEXT DEFAULT 'AUTO',
         preferred_host TEXT DEFAULT 'antigravity',
         last_quarantine_fingerprint TEXT,
@@ -127,6 +129,7 @@ export class AutopsyDatabase {
         severity TEXT DEFAULT 'HIGH',
         agent_name TEXT DEFAULT 'agent',
         session_id TEXT,
+        test_execution_note TEXT,
         created_at TEXT NOT NULL,
         FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE,
         FOREIGN KEY (base_checkpoint_id) REFERENCES checkpoints(id) ON DELETE SET NULL
@@ -259,6 +262,9 @@ export class AutopsyDatabase {
       `ALTER TABLE repair_proposals ADD COLUMN verified_with_command TEXT;`,
       `ALTER TABLE projects ADD COLUMN last_quarantine_fingerprint TEXT;`,
       `ALTER TABLE projects ADD COLUMN last_quarantine_ref TEXT;`,
+      `ALTER TABLE projects ADD COLUMN proposed_test_command TEXT;`,
+      `ALTER TABLE projects ADD COLUMN proposed_test_command_reason TEXT;`,
+      `ALTER TABLE incidents ADD COLUMN test_execution_note TEXT;`,
     ];
 
     for (const sql of migrations) {
@@ -349,13 +355,19 @@ export class AutopsyDatabase {
       const canonicalId = generateDeterministicProjectId(project.rootPath);
       const projectId = project.id || canonicalId;
       const stmt = this.db.prepare(`
-        INSERT INTO projects (id, name, root_path, test_command, test_command_signature, verification_mode, preferred_host, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO projects (
+          id, name, root_path, test_command, test_command_signature,
+          proposed_test_command, proposed_test_command_reason,
+          verification_mode, preferred_host, created_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(root_path) DO UPDATE SET
           id = excluded.id,
           name = excluded.name,
           test_command = COALESCE(excluded.test_command, projects.test_command),
           test_command_signature = COALESCE(excluded.test_command_signature, projects.test_command_signature),
+          proposed_test_command = COALESCE(excluded.proposed_test_command, projects.proposed_test_command),
+          proposed_test_command_reason = COALESCE(excluded.proposed_test_command_reason, projects.proposed_test_command_reason),
           verification_mode = COALESCE(excluded.verification_mode, projects.verification_mode),
           preferred_host = COALESCE(excluded.preferred_host, projects.preferred_host);
       `);
@@ -365,10 +377,45 @@ export class AutopsyDatabase {
         project.rootPath,
         project.testCommand || null,
         project.testCommandSignature || null,
+        project.proposedTestCommand || null,
+        project.proposedTestCommandReason || null,
         project.verificationMode || 'AUTO',
         project.preferredHost || 'antigravity',
         project.createdAt
       );
+    });
+  }
+
+  public updateProjectProposedTestCommand(
+    id: string,
+    command: string | null,
+    reason: string | null
+  ): void {
+    this.runInImmediateTransaction(() => {
+      this.db
+        .prepare(`
+          UPDATE projects
+          SET proposed_test_command = ?, proposed_test_command_reason = ?
+          WHERE id = ?
+        `)
+        .run(command, reason, id);
+    });
+  }
+
+  public updateProjectConfirmedTestCommand(
+    id: string,
+    command: string,
+    signature: string
+  ): void {
+    this.runInImmediateTransaction(() => {
+      this.db
+        .prepare(`
+          UPDATE projects
+          SET test_command = ?, test_command_signature = ?,
+              proposed_test_command = NULL, proposed_test_command_reason = NULL
+          WHERE id = ?
+        `)
+        .run(command, signature, id);
     });
   }
 
@@ -380,6 +427,8 @@ export class AutopsyDatabase {
       rootPath: row.root_path,
       testCommand: row.test_command || undefined,
       testCommandSignature: row.test_command_signature || undefined,
+      proposedTestCommand: row.proposed_test_command || undefined,
+      proposedTestCommandReason: row.proposed_test_command_reason || undefined,
       verificationMode: (row.verification_mode || 'AUTO') as VerificationMode,
       preferredHost: (row.preferred_host || 'antigravity') as HostEnvironment,
       lastQuarantineFingerprint: row.last_quarantine_fingerprint || undefined,
@@ -398,6 +447,8 @@ export class AutopsyDatabase {
       rootPath: row.root_path,
       testCommand: row.test_command || undefined,
       testCommandSignature: row.test_command_signature || undefined,
+      proposedTestCommand: row.proposed_test_command || undefined,
+      proposedTestCommandReason: row.proposed_test_command_reason || undefined,
       verificationMode: (row.verification_mode || 'AUTO') as VerificationMode,
       preferredHost: (row.preferred_host || 'antigravity') as HostEnvironment,
       lastQuarantineFingerprint: row.last_quarantine_fingerprint || undefined,
@@ -426,6 +477,8 @@ export class AutopsyDatabase {
       rootPath: row.root_path,
       testCommand: row.test_command || undefined,
       testCommandSignature: row.test_command_signature || undefined,
+      proposedTestCommand: row.proposed_test_command || undefined,
+      proposedTestCommandReason: row.proposed_test_command_reason || undefined,
       verificationMode: (row.verification_mode || 'AUTO') as VerificationMode,
       preferredHost: (row.preferred_host || 'antigravity') as HostEnvironment,
       lastQuarantineFingerprint: row.last_quarantine_fingerprint || undefined,
@@ -465,7 +518,9 @@ export class AutopsyDatabase {
         SET verification_mode = COALESCE(?, verification_mode),
             preferred_host = COALESCE(?, preferred_host),
             test_command = COALESCE(?, test_command),
-            test_command_signature = COALESCE(?, test_command_signature)
+            test_command_signature = COALESCE(?, test_command_signature),
+            proposed_test_command = CASE WHEN ? IS NOT NULL THEN NULL ELSE proposed_test_command END,
+            proposed_test_command_reason = CASE WHEN ? IS NOT NULL THEN NULL ELSE proposed_test_command_reason END
         WHERE id = ?
       `);
       stmt.run(
@@ -473,6 +528,8 @@ export class AutopsyDatabase {
         settings.preferredHost || null,
         settings.testCommand || null,
         settings.testCommandSignature || null,
+        settings.testCommand || null,
+        settings.testCommand || null,
         id
       );
     });
@@ -588,10 +645,10 @@ export class AutopsyDatabase {
           status, severity, agent_name, session_id,
           expected_behavior, observed_behavior, broken_step, execution_trace_json, three_level_health_json,
           reproduction_condition, verification_method, verification_type, user_confirmed_intent, user_confirmation_summary, cause_verdict,
-          risk_level, risk_signals_json, orchestration_decision_json,
+          risk_level, risk_signals_json, orchestration_decision_json, test_execution_note,
           created_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `);
       stmt.run(
         incident.id,
@@ -618,6 +675,7 @@ export class AutopsyDatabase {
         incident.riskLevel || null,
         incident.riskSignals ? JSON.stringify(incident.riskSignals) : null,
         incident.orchestrationDecision ? JSON.stringify(incident.orchestrationDecision) : null,
+        incident.testExecutionNote || null,
         incident.createdAt
       );
     });
@@ -652,6 +710,7 @@ export class AutopsyDatabase {
       orchestrationDecision: row.orchestration_decision_json ? JSON.parse(row.orchestration_decision_json) : undefined,
       executionTrace: row.execution_trace_json ? JSON.parse(row.execution_trace_json) : undefined,
       threeLevelHealth: row.three_level_health_json ? JSON.parse(row.three_level_health_json) : undefined,
+      testExecutionNote: row.test_execution_note || undefined,
       createdAt: row.created_at,
     };
   }
@@ -733,6 +792,7 @@ export class AutopsyDatabase {
       orchestrationDecision: row.orchestration_decision_json ? JSON.parse(row.orchestration_decision_json) : undefined,
       executionTrace: row.execution_trace_json ? JSON.parse(row.execution_trace_json) : undefined,
       threeLevelHealth: row.three_level_health_json ? JSON.parse(row.three_level_health_json) : undefined,
+      testExecutionNote: row.test_execution_note || undefined,
       createdAt: row.created_at,
     }));
   }

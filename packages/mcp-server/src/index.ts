@@ -215,7 +215,7 @@ server.tool(
 
       const targetPath = resolvePath(repoPath);
       const effectiveAgent = agentName || 'mcp-agent';
-      const incident = coreManager.collectIncidentBundle(
+      const incident = await coreManager.collectIncidentBundle(
         targetPath,
         title,
         errorOutput,
@@ -253,6 +253,7 @@ server.tool(
                   riskLevel: incident.riskLevel,
                   riskSignals: incident.riskSignals,
                   orchestrationDecision: incident.orchestrationDecision,
+                  testExecutionNote: incident.testExecutionNote,
                   diffSummaryLength: incident.diffSummary.length,
                   diffSummary: incident.diffSummary.slice(0, 3000), // Preview
                   errorOutput: incident.errorOutput,
@@ -271,6 +272,53 @@ server.tool(
       return {
         isError: true,
         content: [{ type: 'text', text: `Failed to collect incident bundle: ${error.message}` }],
+      };
+    }
+  }
+);
+
+/**
+ * Tool 3.5: propose_test_command
+ * Proposes a project test command with reason for user confirmation in Agent Autopsy Desktop.
+ */
+server.tool(
+  'propose_test_command',
+  'AI 에이전트가 프로젝트에 적합한 테스트 명령을 제안합니다. 제안된 명령은 앱 대시보드에 확인 대기 상태로 등록되며, 사용자가 앱에서 확인해야 확정 및 서명됩니다.',
+  {
+    command: z.string().describe('제안할 테스트 실행 명령 (예: "pytest tests/", "python -m unittest discover -s tests", "npm test" 등)'),
+    reason: z.string().describe('이 테스트 명령을 제안하는 사유'),
+    repoPath: z.string().optional().describe('프로젝트 루트 경로 (기본값: 현재 디렉터리)'),
+  },
+  async ({ command, reason, repoPath }) => {
+    try {
+      const targetPath = resolvePath(repoPath);
+      const res = coreManager.proposeTestCommand(targetPath, command, reason);
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify(
+              {
+                success: true,
+                message: `테스트 명령 "${command}"이(가) 제안되었습니다. 사용자가 앱 대시보드에서 확정할 때까지 대기합니다.`,
+                project: {
+                  id: res.project.id,
+                  name: res.project.name,
+                  proposedTestCommand: res.project.proposedTestCommand,
+                  proposedTestCommandReason: res.project.proposedTestCommandReason,
+                },
+                next_action: res.next_action,
+              },
+              null,
+              2
+            ),
+          },
+        ],
+      };
+    } catch (err: any) {
+      return {
+        isError: true,
+        content: [{ type: 'text', text: `Failed to propose test command: ${err.message}` }],
       };
     }
   }
@@ -352,6 +400,30 @@ server.tool(
         ],
       };
     } catch (error: any) {
+      if (error.code === 'BLOCKED_TEST_COMMAND_UNCONFIRMED' || error.message?.includes('BLOCKED_TEST_COMMAND_UNCONFIRMED')) {
+        return {
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify(
+                {
+                  success: false,
+                  status: 'BLOCKED_TEST_COMMAND_UNCONFIRMED',
+                  message: error.message,
+                  next_action: error.next_action || {
+                    actor: 'USER',
+                    action: 'CONFIRM_TEST_COMMAND_IN_APP',
+                    agent_should: '사용자에게 앱 대시보드에서 테스트 명령을 확인(확정)해 달라고 요청하거나 propose_test_command 도구로 명령을 제안하세요.',
+                    forbidden: ['원본 파일 직접 수정', 'DB 직접 수정', '검증 생략'],
+                  },
+                },
+                null,
+                2
+              ),
+            },
+          ],
+        };
+      }
       return {
         isError: true,
         content: [{ type: 'text', text: `Failed to propose and verify repair: ${error.message}` }],

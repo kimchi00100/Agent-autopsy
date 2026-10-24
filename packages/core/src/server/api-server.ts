@@ -382,6 +382,34 @@ export class ApiServer {
       return;
     }
 
+    // POST /api/projects/:projectId/confirm-test-command
+    const confirmCmdMatch = pathname.match(/^\/api\/projects\/([^\/]+)\/confirm-test-command$/);
+    if (req.method === 'POST' && confirmCmdMatch) {
+      if (!this.verifySessionToken(req)) {
+        res.writeHead(401, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Unauthorized: Valid X-Autopsy-Token is required to confirm test command.' }));
+        return;
+      }
+      const projectId = confirmCmdMatch[1];
+      const project = db.getProject(projectId);
+      if (!project) {
+        res.writeHead(404, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: `Project "${projectId}" not found.` }));
+        return;
+      }
+      const body = await this.parseJsonBody(req);
+      const commandToConfirm = body?.testCommand || project.proposedTestCommand || project.testCommand;
+      if (!commandToConfirm) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: '확정할 테스트 명령이 지정되지 않았습니다.' }));
+        return;
+      }
+      const updated = this.coreManager.confirmTestCommand(project.rootPath, commandToConfirm);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ success: true, project: updated }));
+      return;
+    }
+
     // GET /api/projects/:projectId/commands
     const cmdMatch = pathname.match(/^\/api\/projects\/([^\/]+)\/commands$/);
     if (req.method === 'GET' && cmdMatch) {

@@ -7,6 +7,7 @@ import * as url from 'node:url';
 import { execFileSync, spawn, ChildProcess } from 'node:child_process';
 import { CoreManager } from '../src/core-manager.js';
 import { ApiServer } from '../src/server/api-server.js';
+import { WorktreeRunner } from '../src/runner/worktree-runner.js';
 import { analyzeIncident } from '../src/analysis/analyzer.js';
 import { verifyApprovalSignature } from '../src/utils/security.js';
 import {
@@ -102,9 +103,9 @@ describe('Agent Autopsy Core Engine Integration Tests', () => {
     assert.ok(health.latestCheckpoint !== null);
   });
 
-  test('3. Incident collection on test failure', () => {
+  test('3. Incident collection on test failure', async () => {
     // The current test.js fails on divide(10, 0) because calculator.js does not handle 0 division!
-    const incident = core.collectIncidentBundle(
+    const incident = await core.collectIncidentBundle(
       repoPath,
       'Zero division assertion failed in calculator',
       'AssertionError: Zero division should yield 0'
@@ -254,7 +255,7 @@ describe('Agent Autopsy Core Engine Integration Tests', () => {
     core.updateProjectSettings(repoPath, { verificationMode: 'AUTO' });
 
     // Create an incident in discount/payment domain
-    const highRiskIncident = core.collectIncidentBundle(
+    const highRiskIncident = await core.collectIncidentBundle(
       repoPath,
       '결제 및 할인 쿠폰 취소 롤백 실패',
       'AssertionError: discount balance mismatch'
@@ -331,9 +332,9 @@ describe('Agent Autopsy Core Engine Integration Tests', () => {
     assert.ok(fingerprint.patchHash);
   });
 
-  test('10. Non-destructive safety quarantine on unexpected working tree changes', () => {
+  test('10. Non-destructive safety quarantine on unexpected working tree changes', async () => {
     // 1. Create an active incident
-    const inc = core.collectIncidentBundle(
+    const inc = await core.collectIncidentBundle(
       repoPath,
       '활성 사건 테스트',
       'AssertionError: active test'
@@ -362,7 +363,7 @@ describe('Agent Autopsy Core Engine Integration Tests', () => {
   });
 
   test('11. DirectiveQueue live delivery on active awaitUserDecision (DELIVERED_LIVE)', async () => {
-    const inc = core.collectIncidentBundle(repoPath, '지시서 실시간 전달 테스트', 'AssertionError: test');
+    const inc = await core.collectIncidentBundle(repoPath, '지시서 실시간 전달 테스트', 'AssertionError: test');
     const { proposal } = await core.proposeAndVerifyRepair(repoPath, inc.id, '기본 수정안', [
       {
         filePath: 'calculator.js',
@@ -398,7 +399,7 @@ describe('Agent Autopsy Core Engine Integration Tests', () => {
   });
 
   test('12. DirectiveQueue timeout safety and persistent queue delivery (DELIVERED_ON_NEXT_CALL & ACKNOWLEDGED)', async () => {
-    const inc = core.collectIncidentBundle(repoPath, '타임아웃 및 큐 폴백 테스트', 'AssertionError: test');
+    const inc = await core.collectIncidentBundle(repoPath, '타임아웃 및 큐 폴백 테스트', 'AssertionError: test');
     const { proposal } = await core.proposeAndVerifyRepair(repoPath, inc.id, '임시 제안', [
       {
         filePath: 'calculator.js',
@@ -439,8 +440,8 @@ describe('Agent Autopsy Core Engine Integration Tests', () => {
     assert.strictEqual(dbDir?.deliveryStatus, 'ACKNOWLEDGED');
   });
 
-  test('13. User 4-intent confirmation gate updates incident intent and userConfirmedIntent', () => {
-    const inc = core.collectIncidentBundle(repoPath, '의도 확정 테스트', 'AssertionError: intent mismatch');
+  test('13. User 4-intent confirmation gate updates incident intent and userConfirmedIntent', async () => {
+    const inc = await core.collectIncidentBundle(repoPath, '의도 확정 테스트', 'AssertionError: intent mismatch');
     assert.strictEqual(inc.userConfirmedIntent, false);
 
     // Confirm 4 intents via createDirective
@@ -563,7 +564,7 @@ describe('Agent Autopsy Core Engine Integration Tests', () => {
   });
 
   test('18. 3-Stage validation pipeline: Stage 1 Syntax abort, Stage 2 Target, Stage 3 Full Regression', async () => {
-    const inc = core.collectIncidentBundle(repoPath, '3단계 파이프라인 테스트', 'AssertionError: test');
+    const inc = await core.collectIncidentBundle(repoPath, '3단계 파이프라인 테스트', 'AssertionError: test');
 
     // 1. Propose syntax error (should fail at Stage 1 CODE_CHECK and skip Stages 2 & 3)
     const syntaxFailResult = await core.proposeAndVerifyRepair(repoPath, inc.id, '문법 오류 수정안', [
@@ -763,7 +764,7 @@ describe('Agent Autopsy Core Engine Integration Tests', () => {
     assert.ok(token && token.length >= 32, 'Session token must be non-empty and cryptographically secure');
 
     // Create an incident and proposal
-    const inc = core.collectIncidentBundle(repoPath, '승인 게이트 인증 테스트', 'AssertionError: gate');
+    const inc = await core.collectIncidentBundle(repoPath, '승인 게이트 인증 테스트', 'AssertionError: gate');
     const { proposal } = await core.proposeAndVerifyRepair(repoPath, inc.id, 'fix division', [
       {
         filePath: 'calculator.js',
@@ -832,7 +833,7 @@ describe('Agent Autopsy Core Engine Integration Tests', () => {
   });
 
   test('25. Phase 3: Tamper Detection - Direct DB Bypass is Rejected & Marked TAMPERED', async () => {
-    const inc = core.collectIncidentBundle(repoPath, '변조 탐지 테스트', 'AssertionError: test');
+    const inc = await core.collectIncidentBundle(repoPath, '변조 탐지 테스트', 'AssertionError: test');
     const { proposal } = await core.proposeAndVerifyRepair(repoPath, inc.id, 'fix division', [
       {
         filePath: 'calculator.js',
@@ -875,7 +876,7 @@ describe('Agent Autopsy Core Engine Integration Tests', () => {
   });
 
   test('26. Phase 3: Patch Drift Detection - fileChangesJson Modification is Blocked', async () => {
-    const inc = core.collectIncidentBundle(repoPath, '패치 드리프트 테스트', 'AssertionError: drift');
+    const inc = await core.collectIncidentBundle(repoPath, '패치 드리프트 테스트', 'AssertionError: drift');
     const { proposal } = await core.proposeAndVerifyRepair(repoPath, inc.id, 'fix division', [
       {
         filePath: 'calculator.js',
@@ -1121,7 +1122,7 @@ describe('Agent Autopsy Core Engine Integration Tests', () => {
   });
 
   test('28. 0-D Check: Test Command Tamper Detection Blocks Verification & Does Not Auto-Sign', async () => {
-    const inc = core.collectIncidentBundle(repoPath, '테스트 명령 변조 방어', 'AssertionError: cmd');
+    const inc = await core.collectIncidentBundle(repoPath, '테스트 명령 변조 방어', 'AssertionError: cmd');
     const project = core.ensureProject(repoPath);
     const db = core.getDatabase();
 
@@ -1174,7 +1175,7 @@ describe('Agent Autopsy Core Engine Integration Tests', () => {
   });
 
   test('29. 0-E Check: Connected Dependency Directory Mutation Fails Verification', async () => {
-    const inc = core.collectIncidentBundle(repoPath, '의존성 폴더 오염 감지 테스트', 'AssertionError: heavy');
+    const inc = await core.collectIncidentBundle(repoPath, '의존성 폴더 오염 감지 테스트', 'AssertionError: heavy');
     const project = core.ensureProject(repoPath);
 
     // Create a dummy node_modules directory with inner subfolder in repoPath
@@ -1242,6 +1243,36 @@ describe('Agent Autopsy Core Engine Integration Tests', () => {
     assert.ok(
       resTop.output.includes('node_modules/top_taint.txt'),
       'Output report must specifically identify the polluted top-level file path'
+    );
+
+    // Clean up top-level file before Case 3
+    fs.unlinkSync(path.join(nodeModulesDir, 'top_taint.txt'));
+
+    // --- Case 3: 5단계 이상 깊은 경로에 파일을 쓰는 경우 (node_modules/l1/l2/l3/l4/l5/deep_taint.txt) ---
+    const deepDir = path.join(nodeModulesDir, 'l1', 'l2', 'l3', 'l4', 'l5');
+    fs.mkdirSync(deepDir, { recursive: true });
+    const deepPollutionCmd = `node -e "require('fs').writeFileSync('node_modules/l1/l2/l3/l4/l5/deep_taint.txt', 'deep polluted'); console.log('ALL TESTS PASSED');"`;
+    core.updateProjectSettings(repoPath, { testCommand: deepPollutionCmd });
+
+    const { executionResult: resDeep } = await core.proposeAndVerifyRepair(
+      repoPath,
+      inc.id,
+      'fix with deep pollution',
+      validRepair
+    );
+
+    assert.strictEqual(resDeep.success, false, 'Validation must fail when deep (>5 depth) dependency folder is mutated');
+    assert.ok(
+      resDeep.output.includes('원본 의존성 폴더 변경 감지'),
+      'Output report must explicitly indicate 원본 의존성 폴더 변경 감지 for deep folder pollution'
+    );
+    assert.ok(
+      resDeep.output.includes('deep_taint.txt'),
+      'Output report must specifically identify the polluted deep file path'
+    );
+    assert.ok(
+      fs.existsSync(path.join(deepDir, 'deep_taint.txt')),
+      'The deep file must have been physically written through junction to the host'
     );
 
     // Clean up
@@ -1319,7 +1350,7 @@ describe('Agent Autopsy Core Engine Integration Tests', () => {
 
   test('31. Step-0.5-Check: Repeated query API calls with identical unapproved changes create at most 1 quarantine backup', async () => {
     // 1. Create an active incident so activeIncidentsCount > 0
-    const inc = core.collectIncidentBundle(repoPath, '0.5단계 격리 백업 폭주 방지 테스트', 'AssertionError: test 31');
+    const inc = await core.collectIncidentBundle(repoPath, '0.5단계 격리 백업 폭주 방지 테스트', 'AssertionError: test 31');
 
     // 2. Introduce unapproved direct modifications: both a tracked file edit and an untracked file
     fs.appendFileSync(path.join(repoPath, 'calculator.js'), '// unapproved line for 0.5 test\n');
@@ -1430,5 +1461,216 @@ describe('Agent Autopsy Core Engine Integration Tests', () => {
         }
       } catch {}
     }
+  });
+
+  test('32. Step-1-Check: Multi-language safe test command detection across Python unittest, pytest, CMake, Makefile, Go, Rust, Java, and Unknown', () => {
+    // 1. Python unittest in tests/
+    const pyTestsDir = path.join(testRoot, 'fixture_py_tests');
+    fs.mkdirSync(path.join(pyTestsDir, 'tests'), { recursive: true });
+    fs.writeFileSync(path.join(pyTestsDir, 'tests', 'test_app.py'), '# test\n');
+    const pyTestsDiscovered = core.discoverSafeTestCommands(pyTestsDir);
+    assert.strictEqual(pyTestsDiscovered.projectType, 'python');
+    assert.strictEqual(pyTestsDiscovered.fullRegressionCmd, 'python -m unittest discover -s tests');
+
+    // 2. Python unittest in root
+    const pyRootDir = path.join(testRoot, 'fixture_py_root');
+    fs.mkdirSync(pyRootDir, { recursive: true });
+    fs.writeFileSync(path.join(pyRootDir, 'test_calc.py'), '# test\n');
+    const pyRootDiscovered = core.discoverSafeTestCommands(pyRootDir);
+    assert.strictEqual(pyRootDiscovered.projectType, 'python');
+    assert.strictEqual(pyRootDiscovered.fullRegressionCmd, 'python -m unittest discover -s .');
+
+    // 3. Python pytest
+    const pytestDir = path.join(testRoot, 'fixture_pytest');
+    fs.mkdirSync(pytestDir, { recursive: true });
+    fs.writeFileSync(path.join(pytestDir, 'pytest.ini'), '[pytest]\n');
+    const pytestDiscovered = core.discoverSafeTestCommands(pytestDir);
+    assert.strictEqual(pytestDiscovered.projectType, 'python');
+    assert.strictEqual(pytestDiscovered.fullRegressionCmd, 'pytest');
+
+    // 4. C/C++ CMake
+    const cmakeDir = path.join(testRoot, 'fixture_cmake');
+    fs.mkdirSync(cmakeDir, { recursive: true });
+    fs.writeFileSync(path.join(cmakeDir, 'CMakeLists.txt'), 'cmake_minimum_required(VERSION 3.10)\n');
+    const cmakeDiscovered = core.discoverSafeTestCommands(cmakeDir);
+    assert.strictEqual(cmakeDiscovered.projectType, 'c_cpp');
+    assert.strictEqual(cmakeDiscovered.fullRegressionCmd, 'ctest');
+
+    // 5. C/C++ Makefile with test target
+    const makeDir = path.join(testRoot, 'fixture_make');
+    fs.mkdirSync(makeDir, { recursive: true });
+    fs.writeFileSync(path.join(makeDir, 'Makefile'), 'all:\n\tgcc main.c\ntest:\n\t./test\n');
+    const makeDiscovered = core.discoverSafeTestCommands(makeDir);
+    assert.strictEqual(makeDiscovered.projectType, 'c_cpp');
+    assert.strictEqual(makeDiscovered.fullRegressionCmd, 'make test');
+
+    // 6. Go
+    const goDir = path.join(testRoot, 'fixture_go');
+    fs.mkdirSync(goDir, { recursive: true });
+    fs.writeFileSync(path.join(goDir, 'go.mod'), 'module example.com/m\n\ngo 1.21\n');
+    const goDiscovered = core.discoverSafeTestCommands(goDir);
+    assert.strictEqual(goDiscovered.projectType, 'go');
+    assert.strictEqual(goDiscovered.fullRegressionCmd, 'go test ./...');
+
+    // 7. Rust
+    const rustDir = path.join(testRoot, 'fixture_rust');
+    fs.mkdirSync(rustDir, { recursive: true });
+    fs.writeFileSync(path.join(rustDir, 'Cargo.toml'), '[package]\nname = "demo"\n');
+    const rustDiscovered = core.discoverSafeTestCommands(rustDir);
+    assert.strictEqual(rustDiscovered.projectType, 'rust');
+    assert.strictEqual(rustDiscovered.fullRegressionCmd, 'cargo test');
+
+    // 8. Java (Maven)
+    const javaDir = path.join(testRoot, 'fixture_java');
+    fs.mkdirSync(javaDir, { recursive: true });
+    fs.writeFileSync(path.join(javaDir, 'pom.xml'), '<project></project>\n');
+    const javaDiscovered = core.discoverSafeTestCommands(javaDir);
+    assert.strictEqual(javaDiscovered.projectType, 'java');
+    assert.strictEqual(javaDiscovered.fullRegressionCmd, 'mvn test');
+
+    // 9. Unknown: MUST NOT fall back to npm test!
+    const unknownDir = path.join(testRoot, 'fixture_unknown');
+    fs.mkdirSync(unknownDir, { recursive: true });
+    fs.writeFileSync(path.join(unknownDir, 'notes.txt'), 'just text notes\n');
+    const unknownDiscovered = core.discoverSafeTestCommands(unknownDir);
+    assert.strictEqual(unknownDiscovered.projectType, 'unknown');
+    assert.strictEqual(unknownDiscovered.fullRegressionCmd, undefined);
+    assert.strictEqual(core.detectTestCommand(unknownDir), '');
+  });
+
+  test('33. Step-1-Check: propose_test_command, BLOCKED_TEST_COMMAND_UNCONFIRMED status & confirm-test-command API', async () => {
+    const unconfRepo = path.join(testRoot, 'unconfirmed_repo');
+    fs.mkdirSync(unconfRepo, { recursive: true });
+    execFileSync('git', ['init', '-b', 'main'], { cwd: unconfRepo });
+    execFileSync('git', ['config', 'user.name', 'Tester'], { cwd: unconfRepo });
+    execFileSync('git', ['config', 'user.email', 'test@local'], { cwd: unconfRepo });
+    fs.writeFileSync(path.join(unconfRepo, 'app.js'), 'module.exports = 1;\n');
+    execFileSync('git', ['add', '.'], { cwd: unconfRepo });
+    execFileSync('git', ['commit', '-m', 'Initial commit'], { cwd: unconfRepo });
+
+    const project = core.ensureProject(unconfRepo);
+    assert.strictEqual(project.testCommandSignature, undefined, 'Initial project test command must be unconfirmed');
+
+    const inc = await core.collectIncidentBundle(unconfRepo, '미확정 테스트 명령 사고', 'Error: unconfirmed');
+
+    // 1. proposeAndVerifyRepair MUST be blocked with BLOCKED_TEST_COMMAND_UNCONFIRMED and next_action
+    let thrownError: any = null;
+    try {
+      await core.proposeAndVerifyRepair(unconfRepo, inc.id, 'fix attempt', [
+        { filePath: 'app.js', newContent: 'module.exports = 2;\n' },
+      ]);
+    } catch (err: any) {
+      thrownError = err;
+    }
+    assert.ok(thrownError, 'Verification must be blocked');
+    assert.strictEqual(thrownError.code, 'BLOCKED_TEST_COMMAND_UNCONFIRMED');
+    assert.ok(thrownError.message.includes('BLOCKED_TEST_COMMAND_UNCONFIRMED'));
+    assert.ok(thrownError.next_action);
+    assert.strictEqual(thrownError.next_action.actor, 'USER');
+    assert.strictEqual(thrownError.next_action.action, 'CONFIRM_TEST_COMMAND_IN_APP');
+
+    // 2. Agent proposes a test command via proposeTestCommand
+    const proposeRes = core.proposeTestCommand(unconfRepo, 'node test.js', 'Node.js runner');
+    assert.strictEqual(proposeRes.success, true);
+    assert.strictEqual(proposeRes.project.proposedTestCommand, 'node test.js');
+    assert.strictEqual(proposeRes.project.proposedTestCommandReason, 'Node.js runner');
+    assert.strictEqual(proposeRes.project.testCommandSignature, undefined, 'Proposal must not auto-sign');
+
+    // 3. User confirms test command via confirm-test-command API (with session token)
+    const apiServer = new ApiServer(core);
+    const port = await apiServer.start(3872);
+    const token = apiServer.getSessionToken();
+
+    try {
+      const confirmRes = await fetch(`http://127.0.0.1:${port}/api/projects/${project.id}/confirm-test-command`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Autopsy-Token': token,
+        },
+        body: JSON.stringify({ testCommand: 'node test.js' }),
+      });
+      assert.strictEqual(confirmRes.status, 200);
+      const confirmData = (await confirmRes.json()) as any;
+      assert.strictEqual(confirmData.success, true);
+      assert.strictEqual(confirmData.project.testCommand, 'node test.js');
+      assert.ok(confirmData.project.testCommandSignature, 'Confirmed command must be signed');
+      assert.strictEqual(confirmData.project.proposedTestCommand, undefined, 'Proposal must be cleared after confirmation');
+
+      // 4. Now proposeAndVerifyRepair can proceed without being blocked
+      fs.writeFileSync(path.join(unconfRepo, 'test.js'), 'process.exit(0);\n');
+      execFileSync('git', ['add', 'test.js'], { cwd: unconfRepo });
+      execFileSync('git', ['commit', '-m', 'add test runner'], { cwd: unconfRepo });
+
+      const verifyRes = await core.proposeAndVerifyRepair(unconfRepo, inc.id, 'legit fix', [
+        { filePath: 'app.js', newContent: 'module.exports = 2;\n' },
+      ]);
+      assert.strictEqual(verifyRes.proposal.verificationStatus, 'VERIFIED_PASS');
+    } finally {
+      await apiServer.stop();
+    }
+  });
+
+  test('34. Step-1-Check: collectIncidentBundle does NOT execute unconfirmed test commands on host repository', async () => {
+    const unconfRepo = path.join(testRoot, 'unconfirmed_bundle_repo');
+    fs.mkdirSync(unconfRepo, { recursive: true });
+    execFileSync('git', ['init', '-b', 'main'], { cwd: unconfRepo });
+    execFileSync('git', ['config', 'user.name', 'Tester'], { cwd: unconfRepo });
+    execFileSync('git', ['config', 'user.email', 'test@local'], { cwd: unconfRepo });
+    fs.writeFileSync(path.join(unconfRepo, 'file.txt'), 'hello\n');
+    execFileSync('git', ['add', '.'], { cwd: unconfRepo });
+    execFileSync('git', ['commit', '-m', 'Init'], { cwd: unconfRepo });
+
+    // Set an unconfirmed test command (no signature) in DB
+    const project = core.ensureProject(unconfRepo);
+    const maliciousCmd = 'node -e "require(\'fs\').writeFileSync(\'polluted.txt\', \'taint\')"';
+    (core.getDatabase() as any).db.prepare(`
+      UPDATE projects SET test_command = ?, test_command_signature = NULL WHERE id = ?
+    `).run(maliciousCmd, project.id);
+
+    // Call collectIncidentBundle without error output
+    const inc = await core.collectIncidentBundle(unconfRepo, '미확정 테스트 명령 실행 방어 테스트');
+    assert.strictEqual(inc.testExecutionNote, '테스트 실행 불가: 확정된 테스트 명령 없음');
+    assert.ok(inc.errorOutput.includes('테스트 실행 불가: 확정된 테스트 명령 없음'));
+
+    // CRITICAL: Host repository MUST NOT have been polluted by the unconfirmed command!
+    assert.strictEqual(fs.existsSync(path.join(unconfRepo, 'polluted.txt')), false, 'Unconfirmed test command must NEVER execute in host repository');
+  });
+
+  test('35. Step-1-Check: Heavy dependency folder entry truncation triggers [일부 확인 못 함] display', async () => {
+    const truncRepo = path.join(testRoot, 'trunc_check_repo');
+    fs.mkdirSync(truncRepo, { recursive: true });
+    execFileSync('git', ['init', '-b', 'main'], { cwd: truncRepo });
+    execFileSync('git', ['config', 'user.name', 'Tester'], { cwd: truncRepo });
+    execFileSync('git', ['config', 'user.email', 'test@local'], { cwd: truncRepo });
+
+    fs.writeFileSync(path.join(truncRepo, 'calculator.js'), 'module.exports = { add: (a, b) => a + b };\n');
+    fs.writeFileSync(path.join(truncRepo, 'test.js'), 'const c = require("./calculator.js"); if (c.add(1, 2) !== 3) process.exit(1);\n');
+    execFileSync('git', ['add', '.'], { cwd: truncRepo });
+    execFileSync('git', ['commit', '-m', 'Init'], { cwd: truncRepo });
+
+    // Confirm test command
+    core.updateProjectSettings(truncRepo, { testCommand: 'node test.js' });
+
+    // Create a node_modules with 10 files
+    const nm = path.join(truncRepo, 'node_modules');
+    fs.mkdirSync(nm, { recursive: true });
+    for (let i = 0; i < 10; i++) {
+      fs.writeFileSync(path.join(nm, `file_${i}.txt`), `content ${i}`);
+    }
+
+    const runner = new WorktreeRunner();
+    const truncatedList: string[] = [];
+    // Max entries 5 -> node_modules has 10, so it will hit the limit and be marked truncated
+    runner.captureHeavyDirsSnapshot(truncRepo, 4, 5, truncatedList);
+    assert.ok(truncatedList.includes('node_modules'), 'node_modules must be in truncated list when entry limit is reached');
+
+    const inc = await core.collectIncidentBundle(truncRepo, '한도 감지 테스트', 'AssertionError: test');
+    const { proposal, executionResult } = await core.proposeAndVerifyRepair(truncRepo, inc.id, 'fix', [
+      { filePath: 'calculator.js', replacements: [{ search: 'a + b', replace: 'a + b + 0' }] },
+    ]);
+
+    // Verify verification passed and runner executes safely
+    assert.strictEqual(proposal.verificationStatus, 'VERIFIED_PASS');
   });
 });

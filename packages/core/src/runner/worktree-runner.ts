@@ -29,6 +29,12 @@ export interface ThreeStageValidationOptions {
   timeoutMs?: number;
 }
 
+export interface HeavyDirsWatcher {
+  detectedChanges: string[];
+  isWatching: boolean;
+  stop: () => void;
+}
+
 const HEAVY_DIR_NAMES = ['node_modules', '.venv', 'venv', 'target'];
 const MANIFEST_NAMES = ['package.json', 'pnpm-lock.yaml', 'package-lock.json', 'yarn.lock', 'requirements.txt', 'Cargo.toml', 'Cargo.lock'];
 
@@ -291,8 +297,43 @@ export class WorktreeRunner {
     const stages: StageResult[] = [];
     const overallStartTime = Date.now();
 
-    // 0-E Checkpoint: Capture initial state of heavy dependency folders in original repo before validation
-    const beforeHeavySnapshot = this.captureHeavyDirsSnapshot(options.repoPath);
+    // 0-E Checkpoint: Start recursive real-time file system watchers on host heavy dependency folders (node_modules, .venv, etc.)
+    const heavyWatch = this.startHeavyDirsWatch(options.repoPath);
+    let beforeHeavySnapshot: Record<string, Record<string, { mtimeMs: number; size: number }>> | null = null;
+    if (!heavyWatch.isWatching) {
+      // Fallback: If platform/filesystem does not support recursive watch, take snapshot as fallback
+      beforeHeavySnapshot = this.captureHeavyDirsSnapshot(options.repoPath);
+    }
+
+    const checkDependencyMutations = async (): Promise<{ dirChanges: string[]; truncationNote: string }> => {
+      heavyWatch.stop();
+      // Allow pending filesystem buffer events to settle
+      await new Promise((r) => setTimeout(r, 60));
+
+      if (heavyWatch.isWatching) {
+        return {
+          dirChanges: [...heavyWatch.detectedChanges],
+          truncationNote: '',
+        };
+      }
+
+      if (beforeHeavySnapshot) {
+        const truncatedDirs: string[] = [];
+        const changes = this.detectHeavyDirsChange(
+          options.repoPath,
+          beforeHeavySnapshot,
+          4,
+          2000,
+          truncatedDirs
+        );
+        const note = truncatedDirs.length > 0
+          ? `⚠️ [일부 확인 못 함]: 의존성 폴더(${truncatedDirs.join(', ')}) 파일 수가 한도(2,000개)에 도달하여 일부 깊은 경로를 확인하지 못했습니다.`
+          : '';
+        return { dirChanges: changes, truncationNote: note };
+      }
+
+      return { dirChanges: [], truncationNote: '' };
+    };
 
     // --- STAGE 1: CODE_CHECK (문법/정적 구문 검사) ---
     let codeCheckCmd = '';
@@ -333,6 +374,7 @@ export class WorktreeRunner {
 
     // If syntax check failed, immediately abort stages 2 & 3
     if (stage1.status === 'FAIL') {
+      heavyWatch.stop();
       const stage2Skipped: StageResult = {
         stage: 'TARGET_FUNCTIONAL_CHECK',
         command: targetTestCommand || 'skipped',
@@ -433,16 +475,20 @@ export class WorktreeRunner {
         },
       };
 
-      const dirChanges = this.detectHeavyDirsChange(options.repoPath, beforeHeavySnapshot);
+      const { dirChanges, truncationNote } = await checkDependencyMutations();
+
       if (dirChanges.length > 0) {
-        const taintWarning = `[원본 의존성 폴더 변경 감지]: 격리 검증 중 원본 의존성 폴더(${dirChanges.join(', ')})가 변경되었습니다. 호스트 환경 오염 방지를 위해 검증이 실패로 처리됩니다.`;
+        const taintWarning = `[원본 의존성 폴더 변경 감지]: 격리 검증 중 원본 의존성 폴더(${dirChanges.slice(0, 5).join(', ')}${dirChanges.length > 5 ? ` 외 ${dirChanges.length - 5}건` : ''})가 변경되었습니다. 호스트 환경 오염 방지를 위해 검증이 실패로 처리됩니다.`;
         if (threeLevelHealth.details) {
           threeLevelHealth.details.functionalSummary = '원본 의존성 폴더 변경 감지';
           threeLevelHealth.details.requirementSummary = taintWarning;
         }
         return {
           success: false,
-          output: this.formatPipelineReport(stages) + `\n\n❌ ${taintWarning}`,
+          output:
+            this.formatPipelineReport(stages) +
+            `\n\n❌ ${taintWarning}` +
+            (truncationNote ? `\n\n${truncationNote}` : ''),
           exitCode: 1,
           durationMs: Date.now() - overallStartTime,
           stages,
@@ -452,7 +498,9 @@ export class WorktreeRunner {
 
       return {
         success: false,
-        output: this.formatPipelineReport(stages),
+        output:
+          this.formatPipelineReport(stages) +
+          (truncationNote ? `\n\n${truncationNote}` : ''),
         exitCode: stage2.exitCode,
         durationMs: Date.now() - overallStartTime,
         stages,
@@ -500,9 +548,10 @@ export class WorktreeRunner {
     };
 
     // 0-E Check: Ensure connected host heavy dependency directories (node_modules, etc.) were not mutated during test execution
-    const dirChanges = this.detectHeavyDirsChange(options.repoPath, beforeHeavySnapshot);
+    const { dirChanges, truncationNote } = await checkDependencyMutations();
+
     if (dirChanges.length > 0) {
-      const taintWarning = `[원본 의존성 폴더 변경 감지]: 격리 검증 중 원본 의존성 폴더(${dirChanges.join(', ')})가 변경되었습니다. 호스트 환경 오염 방지를 위해 검증이 실패로 처리됩니다.`;
+      const taintWarning = `[원본 의존성 폴더 변경 감지]: 격리 검증 중 원본 의존성 폴더(${dirChanges.slice(0, 5).join(', ')}${dirChanges.length > 5 ? ` 외 ${dirChanges.length - 5}건` : ''})가 변경되었습니다. 호스트 환경 오염 방지를 위해 검증이 실패로 처리됩니다.`;
       stages.push({
         stage: 'FULL_REGRESSION_CHECK',
         command: options.fullTestCommand,
@@ -521,7 +570,10 @@ export class WorktreeRunner {
 
       return {
         success: false,
-        output: this.formatPipelineReport(stages) + `\n\n❌ ${taintWarning}`,
+        output:
+          this.formatPipelineReport(stages) +
+          `\n\n❌ ${taintWarning}` +
+          (truncationNote ? `\n\n${truncationNote}` : ''),
         exitCode: 1,
         durationMs: Date.now() - overallStartTime,
         stages,
@@ -529,13 +581,61 @@ export class WorktreeRunner {
       };
     }
 
+    if (truncationNote && threeLevelHealth.details && threeLevelHealth.details.requirementSummary) {
+      threeLevelHealth.details.requirementSummary += ` (※ 의존성 폴더 일부 확인 못 함)`;
+    }
+
     return {
       success: !isRegressionFail,
-      output: this.formatPipelineReport(stages),
+      output:
+        this.formatPipelineReport(stages) +
+        (truncationNote ? `\n\n${truncationNote}` : ''),
       exitCode: stage3.exitCode,
       durationMs: Date.now() - overallStartTime,
       stages,
       threeLevelHealth,
+    };
+  }
+
+  /**
+   * Starts non-blocking recursive file system watcher on heavy dependency folders (node_modules, .venv, etc.).
+   * Captures any real-time write/delete/create mutations at any depth without up-front directory tree traversal.
+   */
+  public startHeavyDirsWatch(repoPath: string): HeavyDirsWatcher {
+    const detectedChanges: string[] = [];
+    const watchers: fs.FSWatcher[] = [];
+    let isWatching = false;
+
+    for (const heavyDir of HEAVY_DIR_NAMES) {
+      const srcPath = path.join(repoPath, heavyDir);
+      if (fs.existsSync(srcPath)) {
+        try {
+          const watcher = fs.watch(srcPath, { recursive: true }, (eventType, filename) => {
+            const normalized = filename ? filename.replace(/\\/g, '/') : '';
+            const relPath = normalized ? `${heavyDir}/${normalized}` : `${heavyDir} (${eventType})`;
+            if (!detectedChanges.includes(relPath)) {
+              detectedChanges.push(relPath);
+            }
+          });
+          watcher.on('error', () => {});
+          watchers.push(watcher);
+          isWatching = true;
+        } catch {
+          // Recursive watch not supported on this platform/filesystem; fallback to snapshot
+        }
+      }
+    }
+
+    return {
+      detectedChanges,
+      isWatching,
+      stop: () => {
+        for (const w of watchers) {
+          try {
+            w.close();
+          } catch {}
+        }
+      },
     };
   }
 
@@ -549,9 +649,14 @@ export class WorktreeRunner {
     depth: number,
     maxDepth: number,
     result: Record<string, { mtimeMs: number; size: number }>,
-    counter: { count: number; max: number }
+    counter: { count: number; max: number; truncated?: boolean }
   ): void {
-    if (depth > maxDepth || counter.count >= counter.max) return;
+    if (depth > maxDepth || counter.count >= counter.max) {
+      if (counter.count >= counter.max) {
+        counter.truncated = true;
+      }
+      return;
+    }
 
     const fullPath = currentRel ? path.join(baseDir, currentRel) : baseDir;
     let entries: fs.Dirent[] = [];
@@ -562,7 +667,10 @@ export class WorktreeRunner {
     }
 
     for (const entry of entries) {
-      if (counter.count >= counter.max) break;
+      if (counter.count >= counter.max) {
+        counter.truncated = true;
+        break;
+      }
       const rel = currentRel ? `${currentRel}/${entry.name}` : entry.name;
       const entryFullPath = path.join(baseDir, rel);
 
@@ -584,15 +692,19 @@ export class WorktreeRunner {
   public captureHeavyDirsSnapshot(
     repoPath: string,
     maxDepth: number = 4,
-    maxEntriesPerDir: number = 2000
+    maxEntriesPerDir: number = 2000,
+    outTruncatedDirs?: string[]
   ): Record<string, Record<string, { mtimeMs: number; size: number }>> {
     const snapshot: Record<string, Record<string, { mtimeMs: number; size: number }>> = {};
     for (const heavyDir of HEAVY_DIR_NAMES) {
       const src = path.join(repoPath, heavyDir);
       if (fs.existsSync(src)) {
         snapshot[heavyDir] = {};
-        const counter = { count: 0, max: maxEntriesPerDir };
+        const counter = { count: 0, max: maxEntriesPerDir, truncated: false };
         this.walkHeavyDir(src, '', 1, maxDepth, snapshot[heavyDir], counter);
+        if (counter.truncated && outTruncatedDirs && !outTruncatedDirs.includes(heavyDir)) {
+          outTruncatedDirs.push(heavyDir);
+        }
       }
     }
     return snapshot;
@@ -606,10 +718,11 @@ export class WorktreeRunner {
     repoPath: string,
     before: Record<string, Record<string, { mtimeMs: number; size: number }>>,
     maxDepth: number = 4,
-    maxEntriesPerDir: number = 2000
+    maxEntriesPerDir: number = 2000,
+    outTruncatedDirs?: string[]
   ): string[] {
     const changes: string[] = [];
-    const after = this.captureHeavyDirsSnapshot(repoPath, maxDepth, maxEntriesPerDir);
+    const after = this.captureHeavyDirsSnapshot(repoPath, maxDepth, maxEntriesPerDir, outTruncatedDirs);
 
     for (const heavyDir of HEAVY_DIR_NAMES) {
       const src = path.join(repoPath, heavyDir);

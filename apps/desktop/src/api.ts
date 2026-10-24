@@ -88,6 +88,9 @@ export interface Project {
   name: string;
   rootPath: string;
   testCommand?: string;
+  testCommandSignature?: string;
+  proposedTestCommand?: string;
+  proposedTestCommandReason?: string;
   verificationMode?: VerificationMode;
   preferredHost?: HostEnvironment;
 }
@@ -133,7 +136,7 @@ export interface StageResult {
 }
 
 export interface DiscoveredCommands {
-  projectType: 'node' | 'python' | 'rust' | 'unknown';
+  projectType: 'node' | 'python' | 'rust' | 'c_cpp' | 'go' | 'java' | 'unknown';
   codeCheckCmd?: string;
   targetTestCmd?: string;
   fullRegressionCmd?: string;
@@ -387,7 +390,7 @@ export interface DiagnosticItem {
 }
 
 export interface DiscoveredCommands {
-  projectType: 'node' | 'python' | 'rust' | 'unknown';
+  projectType: 'node' | 'python' | 'rust' | 'c_cpp' | 'go' | 'java' | 'unknown';
   codeCheckCmd?: string;
   targetTestCmd?: string;
   fullRegressionCmd?: string;
@@ -583,6 +586,11 @@ export const api = {
     request<{ success: boolean; diagnostics: ProjectDiagnostics }>(`/api/projects/${projectId}/diagnose`, post({})),
   onboardProject: (projectId: string) =>
     request<{ success: boolean; result: OnboardingResult }>(`/api/projects/${projectId}/onboard`, post({})),
+  confirmTestCommand: (projectId: string, testCommand?: string) =>
+    request<{ success: boolean; project: Project }>(
+      `/api/projects/${projectId}/confirm-test-command`,
+      post({ testCommand })
+    ),
   discoverCommands: (projectId: string) =>
     request<{ success: boolean; commands: DiscoveredCommands }>(`/api/projects/${projectId}/commands`),
   subscribeStream: (onEvent: (event: any) => void): (() => void) => {

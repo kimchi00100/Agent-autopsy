@@ -170,11 +170,35 @@ export class CoreManager {
    */
   public discoverSafeTestCommands(repoPath: string): DiscoveredCommands {
     let rootPath = repoPath;
-    if (
-      !fs.existsSync(path.join(repoPath, 'package.json')) &&
-      !fs.existsSync(path.join(repoPath, 'Cargo.toml')) &&
-      !fs.existsSync(path.join(repoPath, 'pyproject.toml'))
-    ) {
+    const knownManifests = [
+      'package.json',
+      'Cargo.toml',
+      'pyproject.toml',
+      'pytest.ini',
+      'requirements.txt',
+      'setup.py',
+      'setup.cfg',
+      'conftest.py',
+      'CMakeLists.txt',
+      'Makefile',
+      'makefile',
+      'GNUmakefile',
+      'go.mod',
+      'pom.xml',
+      'build.gradle',
+      'build.gradle.kts',
+    ];
+    const hasLocalIndicators = () => {
+      if (knownManifests.some((m) => fs.existsSync(path.join(repoPath, m)))) return true;
+      if (fs.existsSync(path.join(repoPath, 'tests')) || fs.existsSync(path.join(repoPath, 'test'))) return true;
+      try {
+        const files = fs.readdirSync(repoPath);
+        if (files.some((f) => /\.(py|js|ts|go|rs|java|c|cpp|h|hpp|txt|md)$/i.test(f))) return true;
+      } catch {}
+      return false;
+    };
+
+    if (!hasLocalIndicators()) {
       try {
         rootPath = this.gitEngine.getRepoRoot(repoPath);
       } catch {
@@ -184,7 +208,7 @@ export class CoreManager {
     const warnings: string[] = [];
     const availableScripts: Record<string, string> = {};
     let isCommandSafe = true;
-    let projectType: 'node' | 'python' | 'rust' | 'unknown' = 'unknown';
+    let projectType: 'node' | 'python' | 'rust' | 'c_cpp' | 'go' | 'java' | 'unknown' = 'unknown';
     let fullRegressionCmd: string | undefined;
     let codeCheckCmd: string | undefined;
     let targetTestCmd: string | undefined;
@@ -239,25 +263,143 @@ export class CoreManager {
           } catch {}
         }
       }
-    } else if (
-      fs.existsSync(path.join(rootPath, 'pytest.ini')) ||
-      fs.existsSync(path.join(rootPath, 'pyproject.toml')) ||
-      fs.existsSync(path.join(rootPath, 'requirements.txt')) ||
-      fs.existsSync(path.join(rootPath, 'setup.py'))
-    ) {
-      // 2. Python detection
-      projectType = 'python';
-      fullRegressionCmd = 'pytest -q';
-      codeCheckCmd = 'python -m py_compile';
-    } else if (fs.existsSync(path.join(rootPath, 'Cargo.toml'))) {
-      // 3. Rust detection
-      projectType = 'rust';
-      fullRegressionCmd = 'cargo test';
-      codeCheckCmd = 'cargo check';
-    }
+    } else {
+      // Check Python detection
+      const pyprojectPath = path.join(rootPath, 'pyproject.toml');
+      const pytestIniPath = path.join(rootPath, 'pytest.ini');
+      const setupCfgPath = path.join(rootPath, 'setup.cfg');
+      const conftestPath = path.join(rootPath, 'conftest.py');
+      const requirementsPath = path.join(rootPath, 'requirements.txt');
+      const setupPyPath = path.join(rootPath, 'setup.py');
 
-    if (!fullRegressionCmd) {
-      fullRegressionCmd = isWindows ? 'npm.cmd test' : 'npm test';
+      let hasPyprojectPytest = false;
+      if (fs.existsSync(pyprojectPath)) {
+        try {
+          const content = fs.readFileSync(pyprojectPath, 'utf8');
+          if (content.includes('[tool.pytest')) {
+            hasPyprojectPytest = true;
+          }
+        } catch {}
+      }
+
+      let hasSetupCfgPytest = false;
+      if (fs.existsSync(setupCfgPath)) {
+        try {
+          const content = fs.readFileSync(setupCfgPath, 'utf8');
+          if (content.includes('[tool:pytest')) {
+            hasSetupCfgPytest = true;
+          }
+        } catch {}
+      }
+
+      const hasExplicitPytestConfig =
+        fs.existsSync(pytestIniPath) ||
+        fs.existsSync(conftestPath) ||
+        hasPyprojectPytest ||
+        hasSetupCfgPytest;
+
+      // Check for python test files in tests/ or root
+      let hasTestsFolder = false;
+      let hasTestFilesInTests = false;
+      for (const tDir of ['tests', 'test']) {
+        const p = path.join(rootPath, tDir);
+        if (fs.existsSync(p)) {
+          try {
+            const files = fs.readdirSync(p);
+            if (files.some((f) => /^test.*\.py$/i.test(f) || /.*_test\.py$/i.test(f))) {
+              hasTestsFolder = true;
+              hasTestFilesInTests = true;
+              targetTestCmd = `python -m unittest ${tDir}/${files.find((f) => /^test.*\.py$/i.test(f) || /.*_test\.py$/i.test(f))}`;
+              break;
+            }
+          } catch {}
+        }
+      }
+
+      let hasRootTestFiles = false;
+      try {
+        const rootFiles = fs.readdirSync(rootPath);
+        const rootPyTest = rootFiles.find((f) => /^test.*\.py$/i.test(f) || /.*_test\.py$/i.test(f));
+        if (rootPyTest) {
+          hasRootTestFiles = true;
+          if (!targetTestCmd) {
+            targetTestCmd = `python -m unittest ${rootPyTest}`;
+          }
+        }
+      } catch {}
+
+      const isPythonProject =
+        hasExplicitPytestConfig ||
+        hasTestFilesInTests ||
+        hasRootTestFiles ||
+        fs.existsSync(pyprojectPath) ||
+        fs.existsSync(requirementsPath) ||
+        fs.existsSync(setupPyPath);
+
+      if (isPythonProject) {
+        projectType = 'python';
+        codeCheckCmd = 'python -m py_compile';
+
+        if (hasExplicitPytestConfig) {
+          fullRegressionCmd = 'pytest';
+        } else if (hasTestFilesInTests) {
+          fullRegressionCmd = 'python -m unittest discover -s tests';
+        } else if (hasRootTestFiles) {
+          fullRegressionCmd = 'python -m unittest discover -s .';
+        } else {
+          fullRegressionCmd = 'python -m unittest discover -s .';
+        }
+      } else if (fs.existsSync(path.join(rootPath, 'CMakeLists.txt'))) {
+        // C/C++ (CMake)
+        projectType = 'c_cpp';
+        fullRegressionCmd = 'ctest';
+        codeCheckCmd = 'cmake --build .';
+      } else {
+        // C/C++ (Makefile with test target)
+        const makefileCandidates = ['Makefile', 'makefile', 'GNUmakefile'];
+        let foundMakeWithTest = false;
+        for (const m of makefileCandidates) {
+          const mPath = path.join(rootPath, m);
+          if (fs.existsSync(mPath)) {
+            try {
+              const content = fs.readFileSync(mPath, 'utf8');
+              if (/^(test|check)\s*:/m.test(content)) {
+                projectType = 'c_cpp';
+                fullRegressionCmd = 'make test';
+                foundMakeWithTest = true;
+                break;
+              }
+            } catch {}
+          }
+        }
+
+        if (!foundMakeWithTest) {
+          if (fs.existsSync(path.join(rootPath, 'go.mod'))) {
+            // Go
+            projectType = 'go';
+            fullRegressionCmd = 'go test ./...';
+            codeCheckCmd = 'go vet ./...';
+          } else if (fs.existsSync(path.join(rootPath, 'Cargo.toml'))) {
+            // Rust
+            projectType = 'rust';
+            fullRegressionCmd = 'cargo test';
+            codeCheckCmd = 'cargo check';
+          } else if (fs.existsSync(path.join(rootPath, 'pom.xml'))) {
+            // Java (Maven)
+            projectType = 'java';
+            fullRegressionCmd = 'mvn test';
+            codeCheckCmd = 'mvn test-compile';
+          } else if (
+            fs.existsSync(path.join(rootPath, 'build.gradle')) ||
+            fs.existsSync(path.join(rootPath, 'build.gradle.kts'))
+          ) {
+            // Java (Gradle)
+            projectType = 'java';
+            fullRegressionCmd = 'gradle test';
+            codeCheckCmd = 'gradle compileJava';
+          }
+        }
+      }
     }
 
     return {
@@ -273,10 +415,11 @@ export class CoreManager {
 
   /**
    * Automatically detects the test command if not configured in DB.
+   * If undetected, returns an empty string (NEVER falls back to npm test).
    */
   public detectTestCommand(repoPath: string): string {
     const discovered = this.discoverSafeTestCommands(repoPath);
-    return discovered.fullRegressionCmd || (process.platform === 'win32' ? 'npm.cmd test' : 'npm test');
+    return discovered.fullRegressionCmd || '';
   }
 
   /**
@@ -289,7 +432,7 @@ export class CoreManager {
 
     if (!project) {
       const name = path.basename(rootPath);
-      const detectedTest = testCommand || this.detectTestCommand(rootPath);
+      const detectedTest = testCommand || this.detectTestCommand(rootPath) || undefined;
 
       // Correction 1: Do NOT auto-sign detected commands. Keep unconfirmed until explicit user confirmation via API.
       project = {
@@ -862,7 +1005,7 @@ export class CoreManager {
   /**
    * 3. collect_incident_bundle: Package error logs, diff, and context into an incident bundle.
    */
-  public collectIncidentBundle(
+  public async collectIncidentBundle(
     repoPath: string,
     titleOrOptions:
       | string
@@ -895,7 +1038,7 @@ export class CoreManager {
     verificationType?: any,
     userConfirmedIntent?: boolean,
     userConfirmationSummary?: string
-  ): Incident {
+  ): Promise<Incident> {
     let title: string;
     if (typeof titleOrOptions === 'object' && titleOrOptions !== null) {
       title = titleOrOptions.title;
@@ -935,10 +1078,51 @@ export class CoreManager {
     }
 
     let finalErrorOutput = errorOutput || '';
-    if (!finalErrorOutput && project.testCommand) {
-      const testResult = this.worktreeRunner.runTestSync(project.rootPath, project.testCommand);
-      if (!testResult.success) {
-        finalErrorOutput = testResult.output;
+    let testExecutionNote: string | undefined;
+
+    if (!finalErrorOutput) {
+      const isSigned =
+        Boolean(project.testCommand) &&
+        Boolean(project.testCommandSignature) &&
+        verifyTestCommandSignature(project.id, project.testCommand!, project.testCommandSignature!);
+
+      if (!isSigned) {
+        testExecutionNote = '테스트 실행 불가: 확정된 테스트 명령 없음';
+      } else {
+        // Run test command in an isolated worktree asynchronously
+        const sandboxId = `inc_bundle_${Date.now().toString(36)}_${Math.random().toString(36).substring(2, 6)}`;
+        let sandboxDir: string | undefined;
+        try {
+          const wt = this.worktreeRunner.createWorktree(
+            project.rootPath,
+            sandboxId,
+            'HEAD',
+            [],
+            project.testCommand!
+          );
+          sandboxDir = wt.sandboxDir;
+          const testRes = await this.worktreeRunner.runCommand(
+            sandboxDir,
+            project.testCommand!,
+            30000
+          );
+          if (!testRes.success) {
+            if (
+              testRes.exitCode === 127 ||
+              /is not recognized as an internal or external command|command not found/i.test(testRes.output)
+            ) {
+              testExecutionNote = '테스트 실행 불가: 명령 실행 실패';
+            } else {
+              finalErrorOutput = testRes.output;
+            }
+          }
+        } catch (err: any) {
+          testExecutionNote = `테스트 실행 불가: ${err.message}`;
+        } finally {
+          if (sandboxDir) {
+            this.worktreeRunner.cleanupWorktree(project.rootPath, sandboxDir);
+          }
+        }
       }
     }
 
@@ -977,7 +1161,7 @@ export class CoreManager {
       projectId: project.id,
       baseCheckpointId: latestCheckpoint ? latestCheckpoint.id : null,
       title,
-      errorOutput: finalErrorOutput || '오류 출력이 기록되지 않았습니다.',
+      errorOutput: finalErrorOutput || testExecutionNote || '오류 출력이 기록되지 않았습니다.',
       diffSummary: diffSummary || '변경된 Git diff가 감지되지 않았습니다.',
       status: 'OPEN',
       severity,
@@ -997,6 +1181,7 @@ export class CoreManager {
       riskLevel: decision.riskLevel,
       riskSignals: decision.riskSignals,
       orchestrationDecision: decision,
+      testExecutionNote,
       createdAt: new Date().toISOString(),
     };
 
@@ -1168,9 +1353,17 @@ export class CoreManager {
 
     // 0-D Check: Verify cryptographic signature of project testCommand against tampering and unconfirmed commands
     if (!project.testCommandSignature) {
-      throw new Error(
-        `[TEST_COMMAND_UNCONFIRMED]: 테스트 명령("${testCmd}")이 사용자에 의해 확정(서명)되지 않았습니다. 앱 대시보드에서 테스트 명령을 먼저 확정해 주세요.`
+      const err: any = new Error(
+        `[BLOCKED_TEST_COMMAND_UNCONFIRMED] [TEST_COMMAND_UNCONFIRMED]: 테스트 명령("${testCmd || '미정'}")이 사용자에 의해 확정(서명)되지 않았습니다. 앱 대시보드에서 테스트 명령을 먼저 확정해 주세요.`
       );
+      err.code = 'BLOCKED_TEST_COMMAND_UNCONFIRMED';
+      err.next_action = {
+        actor: 'USER',
+        action: 'CONFIRM_TEST_COMMAND_IN_APP',
+        agent_should: '사용자에게 앱 대시보드(프로젝트 설정)에서 테스트 명령을 확인(확정)해 달라고 요청하거나 propose_test_command 도구로 적절한 명령을 제안하세요.',
+        forbidden: ['원본 파일 직접 수정', 'DB 직접 수정', '검증 생략'],
+      };
+      throw err;
     }
     const isCmdValid = verifyTestCommandSignature(
       project.id,
@@ -1462,6 +1655,69 @@ export class CoreManager {
       ...settings,
       testCommandSignature,
     });
+    const updated = this.db.getProject(project.id)!;
+    this.emitChange('project_settings_updated', updated);
+    return updated;
+  }
+
+  /**
+   * Agent proposes a test command with rationale.
+   * Registered in DB as pending user confirmation in Desktop App.
+   */
+  public proposeTestCommand(
+    repoPath: string,
+    command: string,
+    reason: string
+  ): {
+    success: boolean;
+    project: Project;
+    next_action: {
+      actor: string;
+      action: string;
+      agent_should: string;
+      forbidden: string[];
+    };
+  } {
+    const project = this.ensureProject(repoPath);
+    this.db.updateProjectProposedTestCommand(project.id, command, reason);
+    this.recordAgentEvent(
+      project.rootPath,
+      'NOTE',
+      `테스트 명령 제안: ${command}`,
+      `에이전트가 검증용 테스트 명령을 제안했습니다. (사유: ${reason}). 사용자가 앱 대시보드에서 확정할 때까지 대기합니다.`,
+      null,
+      'agent'
+    );
+    const updated = this.db.getProject(project.id)!;
+    this.emitChange('project_updated', updated);
+    return {
+      success: true,
+      project: updated,
+      next_action: {
+        actor: 'USER',
+        action: 'CONFIRM_TEST_COMMAND_IN_APP',
+        agent_should: '사용자에게 앱 대시보드(프로젝트 설정)에서 제안된 테스트 명령을 확인(확정)해 달라고 요청하세요.',
+        forbidden: ['원본 파일 직접 수정', 'DB 직접 수정', '검증 생략'],
+      },
+    };
+  }
+
+  /**
+   * User confirms (and cryptographically signs) a test command.
+   * Invoked via API protected by session token.
+   */
+  public confirmTestCommand(repoPath: string, command: string): Project {
+    const project = this.ensureProject(repoPath);
+    const signature = signTestCommand(project.id, command);
+    this.db.updateProjectConfirmedTestCommand(project.id, command, signature);
+    this.recordAgentEvent(
+      project.rootPath,
+      'NOTE',
+      `테스트 명령 확정: ${command}`,
+      `사용자가 테스트 명령을 공식 확정하고 HMAC 전자서명을 발급했습니다.`,
+      null,
+      'user'
+    );
     const updated = this.db.getProject(project.id)!;
     this.emitChange('project_settings_updated', updated);
     return updated;

@@ -58,6 +58,8 @@ export interface Project {
   rootPath: string;
   testCommand?: string;
   testCommandSignature?: string;
+  proposedTestCommand?: string;
+  proposedTestCommandReason?: string;
   verificationMode?: VerificationMode;
   preferredHost?: HostEnvironment;
   lastQuarantineFingerprint?: string;
@@ -109,6 +111,7 @@ export interface Incident {
   orchestrationDecision?: OrchestrationDecision;
   executionTrace?: ExecutionTraceStep[];
   threeLevelHealth?: ThreeLevelHealth;
+  testExecutionNote?: string;
   createdAt: string;
 }
 
@@ -147,7 +150,7 @@ export interface ThreeStageExecutionResult {
 }
 
 export interface DiscoveredCommands {
-  projectType: 'node' | 'python' | 'rust' | 'unknown';
+  projectType: 'node' | 'python' | 'rust' | 'c_cpp' | 'go' | 'java' | 'unknown';
   codeCheckCmd?: string;
   targetTestCmd?: string;
   fullRegressionCmd?: string;

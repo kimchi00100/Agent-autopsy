@@ -92,6 +92,7 @@ export default function App() {
   const [diagnosing, setDiagnosing] = useState(false);
   const [onboarding, setOnboarding] = useState(false);
   const [backendStatus, setBackendStatus] = useState<BackendStatus | null>(null);
+  const [testCommandInput, setTestCommandInput] = useState('');
 
   useEffect(() => {
     localStorage.setItem('agent-autopsy:theme', theme);
@@ -149,6 +150,7 @@ export default function App() {
       if (ov.project.preferredHost) {
         setPreferredHost(ov.project.preferredHost);
       }
+      setTestCommandInput(ov.project.proposedTestCommand || ov.project.testCommand || '');
       setError(null);
       const [tl, inc, cps] = await Promise.all([
         api.timeline(ov.project.id),
@@ -680,6 +682,28 @@ export default function App() {
           </div>
         )}
 
+        {overview && !overview.project.testCommandSignature && view !== 'settings' && (
+          <div className="bg-amber-50 border-b border-amber-200 px-7 py-2.5 text-xs text-amber-900 flex items-center justify-between">
+            <div className="flex items-center gap-2">
+              <AlertTriangle className="h-4 w-4 text-amber-600 shrink-0" />
+              <span>
+                <strong>테스트 명령 미확정:</strong> 프로젝트 검증 테스트 명령이 서명되지 않았습니다. 격리 검증을 위해 사용자의 확인이 필요합니다.
+                {overview.project.proposedTestCommand && (
+                  <span className="ml-2 text-indigo-700 font-medium">
+                    (AI 제안: <code>{overview.project.proposedTestCommand}</code>)
+                  </span>
+                )}
+              </span>
+            </div>
+            <Button
+              className="px-2.5 py-1 text-xs bg-amber-600 hover:bg-amber-700 text-white border-none"
+              onClick={() => setView('settings')}
+            >
+              설정에서 확인하기
+            </Button>
+          </div>
+        )}
+
         {/* View Workspace */}
         <main className="flex-1 overflow-y-auto px-7 py-5">
           {!repoPath && (
@@ -1037,6 +1061,103 @@ export default function App() {
                     프로젝트 자체 진단을 실행하여 Git 상태, AGENTS.md 지침서, 샌드박스 권한을 확인하세요.
                   </div>
                 )}
+              </Card>
+
+              {/* 3.5 테스트 명령 확정 및 전자서명 게이트 */}
+              <Card className="p-5 space-y-4">
+                <div className="flex items-center justify-between border-b border-slate-100 pb-3">
+                  <div className="flex items-center gap-2">
+                    <Terminal className="h-4 w-4 text-emerald-600" />
+                    <span className="text-sm font-bold text-slate-900">검증 테스트 명령 관리 및 전자서명</span>
+                  </div>
+                  <span
+                    className={`rounded-full px-2.5 py-0.5 text-[11px] font-semibold border ${
+                      overview.project.testCommandSignature
+                        ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
+                        : 'bg-amber-50 text-amber-700 border-amber-200'
+                    }`}
+                  >
+                    {overview.project.testCommandSignature ? '확정됨 (서명 완료)' : '미확정 (확인 필요)'}
+                  </span>
+                </div>
+
+                {/* AI 제안 대기 배너 */}
+                {overview.project.proposedTestCommand && (
+                  <div className="rounded-xl border border-indigo-200 bg-indigo-50/70 p-4 space-y-2">
+                    <div className="flex items-center justify-between">
+                      <div className="flex items-center gap-2">
+                        <Sparkles className="h-4 w-4 text-indigo-600" />
+                        <span className="text-xs font-bold text-indigo-950">AI 에이전트의 테스트 명령 제안</span>
+                      </div>
+                      <span className="text-[10px] font-semibold bg-indigo-100 text-indigo-700 px-2 py-0.5 rounded-full border border-indigo-200">
+                        확인 대기 중
+                      </span>
+                    </div>
+                    <div className="text-xs text-indigo-900">
+                      제안 명령: <code className="mono bg-white px-2 py-0.5 rounded border border-indigo-200 font-semibold">{overview.project.proposedTestCommand}</code>
+                    </div>
+                    {overview.project.proposedTestCommandReason && (
+                      <div className="text-[11px] text-indigo-700">
+                        제안 사유: {overview.project.proposedTestCommandReason}
+                      </div>
+                    )}
+                    <div className="pt-2 flex gap-2">
+                      <Button
+                        variant="primary"
+                        className="text-xs bg-indigo-600 hover:bg-indigo-700 text-white"
+                        onClick={async () => {
+                          await api.confirmTestCommand(overview.project.id, overview.project.proposedTestCommand);
+                          notify('ok', `AI가 제안한 테스트 명령 "${overview.project.proposedTestCommand}"이(가) 확정되었습니다.`);
+                          load();
+                        }}
+                      >
+                        <Check className="h-3.5 w-3.5 mr-1" />
+                        이 제안으로 확정 및 서명
+                      </Button>
+                    </div>
+                  </div>
+                )}
+
+                {/* 현재 테스트 명령 확인 및 수정 */}
+                <div className="space-y-3">
+                  <div className="text-xs text-slate-600 leading-relaxed">
+                    Agent Autopsy는 AI 에이전트의 임의 명령 조작을 방지하기 위해 사용자가 확인하고 서명한 테스트 명령으로만 격리 검증을 수행합니다.
+                  </div>
+
+                  <div className="flex items-center gap-2">
+                    <input
+                      type="text"
+                      className="mono flex-1 rounded-lg border border-slate-200 px-3 py-2 text-xs bg-slate-50 focus:bg-white focus:outline-none focus:ring-1 focus:ring-blue-500"
+                      value={testCommandInput}
+                      onChange={(e) => setTestCommandInput(e.target.value)}
+                      placeholder="테스트 명령을 입력하세요 (예: npm test, pytest, go test ./...)"
+                    />
+                    <Button
+                      variant="primary"
+                      className="text-xs shrink-0"
+                      onClick={async () => {
+                        await api.confirmTestCommand(overview.project.id, testCommandInput);
+                        notify('ok', `테스트 명령 "${testCommandInput}"이(가) 확정 및 서명되었습니다.`);
+                        load();
+                      }}
+                    >
+                      <Check className="h-3.5 w-3.5 mr-1" />
+                      확인 및 서명
+                    </Button>
+                  </div>
+
+                  {overview.project.testCommandSignature ? (
+                    <div className="text-[11px] text-emerald-700 flex items-center gap-1.5">
+                      <ShieldCheck className="h-3.5 w-3.5 text-emerald-600" />
+                      <span>현재 명령: <code>{overview.project.testCommand}</code> (HMAC 전자서명 유효)</span>
+                    </div>
+                  ) : (
+                    <div className="text-[11px] text-amber-700 flex items-center gap-1.5">
+                      <AlertTriangle className="h-3.5 w-3.5 text-amber-600" />
+                      <span>테스트 명령이 아직 확정되지 않았습니다. [확인 및 서명] 버튼을 눌러 승인하세요.</span>
+                    </div>
+                  )}
+                </div>
               </Card>
 
               {/* 4. 현재 프로젝트 정보 및 MCP 연결 */}

@@ -627,6 +627,10 @@ export class ApiServer {
 
   public stop(): Promise<void> {
     return new Promise((resolve) => {
+      if (this.pollTimer) {
+        clearInterval(this.pollTimer);
+        this.pollTimer = null;
+      }
       if (this.server) {
         this.server.close(() => resolve());
         this.server = null;

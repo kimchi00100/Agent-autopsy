@@ -94,6 +94,8 @@ export class AutopsyDatabase {
         test_command_signature TEXT,
         verification_mode TEXT DEFAULT 'AUTO',
         preferred_host TEXT DEFAULT 'antigravity',
+        last_quarantine_fingerprint TEXT,
+        last_quarantine_ref TEXT,
         created_at TEXT NOT NULL
       );
 
@@ -255,6 +257,8 @@ export class AutopsyDatabase {
       `ALTER TABLE repair_proposals ADD COLUMN three_level_health_json TEXT;`,
       `ALTER TABLE projects ADD COLUMN test_command_signature TEXT;`,
       `ALTER TABLE repair_proposals ADD COLUMN verified_with_command TEXT;`,
+      `ALTER TABLE projects ADD COLUMN last_quarantine_fingerprint TEXT;`,
+      `ALTER TABLE projects ADD COLUMN last_quarantine_ref TEXT;`,
     ];
 
     for (const sql of migrations) {
@@ -378,6 +382,8 @@ export class AutopsyDatabase {
       testCommandSignature: row.test_command_signature || undefined,
       verificationMode: (row.verification_mode || 'AUTO') as VerificationMode,
       preferredHost: (row.preferred_host || 'antigravity') as HostEnvironment,
+      lastQuarantineFingerprint: row.last_quarantine_fingerprint || undefined,
+      lastQuarantineRef: row.last_quarantine_ref || undefined,
       createdAt: row.created_at,
     }));
   }
@@ -394,6 +400,8 @@ export class AutopsyDatabase {
       testCommandSignature: row.test_command_signature || undefined,
       verificationMode: (row.verification_mode || 'AUTO') as VerificationMode,
       preferredHost: (row.preferred_host || 'antigravity') as HostEnvironment,
+      lastQuarantineFingerprint: row.last_quarantine_fingerprint || undefined,
+      lastQuarantineRef: row.last_quarantine_ref || undefined,
       createdAt: row.created_at,
     };
   }
@@ -420,8 +428,26 @@ export class AutopsyDatabase {
       testCommandSignature: row.test_command_signature || undefined,
       verificationMode: (row.verification_mode || 'AUTO') as VerificationMode,
       preferredHost: (row.preferred_host || 'antigravity') as HostEnvironment,
+      lastQuarantineFingerprint: row.last_quarantine_fingerprint || undefined,
+      lastQuarantineRef: row.last_quarantine_ref || undefined,
       createdAt: row.created_at,
     };
+  }
+
+  public updateProjectQuarantine(
+    id: string,
+    fingerprint: string | null,
+    backupRef: string | null
+  ): void {
+    this.runInImmediateTransaction(() => {
+      this.db
+        .prepare(`
+          UPDATE projects
+          SET last_quarantine_fingerprint = ?, last_quarantine_ref = ?
+          WHERE id = ?
+        `)
+        .run(fingerprint, backupRef, id);
+    });
   }
 
   public updateProjectSettings(

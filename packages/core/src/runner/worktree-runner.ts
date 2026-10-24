@@ -433,6 +433,23 @@ export class WorktreeRunner {
         },
       };
 
+      const dirChanges = this.detectHeavyDirsChange(options.repoPath, beforeHeavySnapshot);
+      if (dirChanges.length > 0) {
+        const taintWarning = `[원본 의존성 폴더 변경 감지]: 격리 검증 중 원본 의존성 폴더(${dirChanges.join(', ')})가 변경되었습니다. 호스트 환경 오염 방지를 위해 검증이 실패로 처리됩니다.`;
+        if (threeLevelHealth.details) {
+          threeLevelHealth.details.functionalSummary = '원본 의존성 폴더 변경 감지';
+          threeLevelHealth.details.requirementSummary = taintWarning;
+        }
+        return {
+          success: false,
+          output: this.formatPipelineReport(stages) + `\n\n❌ ${taintWarning}`,
+          exitCode: 1,
+          durationMs: Date.now() - overallStartTime,
+          stages,
+          threeLevelHealth,
+        };
+      }
+
       return {
         success: false,
         output: this.formatPipelineReport(stages),
@@ -523,36 +540,77 @@ export class WorktreeRunner {
   }
 
   /**
-   * Captures the top-level entries and mtimeMs of heavy dependency directories in the host repo.
+   * Recursively walks a heavy dependency directory up to maxDepth and maxEntries,
+   * recording relative paths and their mtimeMs and size.
    */
-  public captureHeavyDirsSnapshot(repoPath: string): Record<string, Record<string, number>> {
-    const snapshot: Record<string, Record<string, number>> = {};
+  private walkHeavyDir(
+    baseDir: string,
+    currentRel: string,
+    depth: number,
+    maxDepth: number,
+    result: Record<string, { mtimeMs: number; size: number }>,
+    counter: { count: number; max: number }
+  ): void {
+    if (depth > maxDepth || counter.count >= counter.max) return;
+
+    const fullPath = currentRel ? path.join(baseDir, currentRel) : baseDir;
+    let entries: fs.Dirent[] = [];
+    try {
+      entries = fs.readdirSync(fullPath, { withFileTypes: true });
+    } catch {
+      return;
+    }
+
+    for (const entry of entries) {
+      if (counter.count >= counter.max) break;
+      const rel = currentRel ? `${currentRel}/${entry.name}` : entry.name;
+      const entryFullPath = path.join(baseDir, rel);
+
+      try {
+        const stat = fs.statSync(entryFullPath);
+        result[rel] = { mtimeMs: stat.mtimeMs, size: stat.size };
+        counter.count++;
+
+        if (entry.isDirectory() && depth < maxDepth) {
+          this.walkHeavyDir(baseDir, rel, depth + 1, maxDepth, result, counter);
+        }
+      } catch {}
+    }
+  }
+
+  /**
+   * Captures the top-level and nested entries (up to depth 4) of heavy dependency directories in the host repo.
+   */
+  public captureHeavyDirsSnapshot(
+    repoPath: string,
+    maxDepth: number = 4,
+    maxEntriesPerDir: number = 2000
+  ): Record<string, Record<string, { mtimeMs: number; size: number }>> {
+    const snapshot: Record<string, Record<string, { mtimeMs: number; size: number }>> = {};
     for (const heavyDir of HEAVY_DIR_NAMES) {
       const src = path.join(repoPath, heavyDir);
       if (fs.existsSync(src)) {
         snapshot[heavyDir] = {};
-        try {
-          const entries = fs.readdirSync(src);
-          for (const entry of entries) {
-            try {
-              const stat = fs.statSync(path.join(src, entry));
-              snapshot[heavyDir][entry] = stat.mtimeMs;
-            } catch {}
-          }
-        } catch {}
+        const counter = { count: 0, max: maxEntriesPerDir };
+        this.walkHeavyDir(src, '', 1, maxDepth, snapshot[heavyDir], counter);
       }
     }
     return snapshot;
   }
 
   /**
-   * Detects if any heavy dependency directories in the host repo were modified during validation.
+   * Detects if any heavy dependency directories in the host repo (top-level or inner subfolders)
+   * were modified during validation.
    */
   public detectHeavyDirsChange(
     repoPath: string,
-    before: Record<string, Record<string, number>>
+    before: Record<string, Record<string, { mtimeMs: number; size: number }>>,
+    maxDepth: number = 4,
+    maxEntriesPerDir: number = 2000
   ): string[] {
     const changes: string[] = [];
+    const after = this.captureHeavyDirsSnapshot(repoPath, maxDepth, maxEntriesPerDir);
+
     for (const heavyDir of HEAVY_DIR_NAMES) {
       const src = path.join(repoPath, heavyDir);
       const beforeDir = before[heavyDir];
@@ -568,29 +626,29 @@ export class WorktreeRunner {
       }
       if (!beforeDir && !existsNow) continue;
 
-      try {
-        const currentEntries = new Set(fs.readdirSync(src));
-        const beforeEntries = new Set(Object.keys(beforeDir!));
+      const afterDir = after[heavyDir] || {};
+      const currentKeys = new Set(Object.keys(afterDir));
+      const beforeKeys = new Set(Object.keys(beforeDir!));
 
-        for (const entry of currentEntries) {
-          if (!beforeEntries.has(entry)) {
-            changes.push(`${heavyDir}/${entry} 파일 추가`);
-          } else {
-            try {
-              const stat = fs.statSync(path.join(src, entry));
-              if (Math.abs(stat.mtimeMs - (beforeDir![entry] || 0)) > 50) {
-                changes.push(`${heavyDir}/${entry} 내용 수정`);
-              }
-            } catch {}
+      for (const rel of currentKeys) {
+        if (!beforeKeys.has(rel)) {
+          changes.push(`${heavyDir}/${rel} 파일 추가`);
+        } else {
+          const b = beforeDir![rel];
+          const a = afterDir[rel];
+          if (b && a && (b.size !== a.size || Math.abs(b.mtimeMs - a.mtimeMs) > 50)) {
+            changes.push(`${heavyDir}/${rel} 내용 수정`);
           }
         }
-        for (const entry of beforeEntries) {
-          if (!currentEntries.has(entry)) {
-            changes.push(`${heavyDir}/${entry} 파일 삭제`);
-          }
+      }
+
+      for (const rel of beforeKeys) {
+        if (!currentKeys.has(rel)) {
+          changes.push(`${heavyDir}/${rel} 파일 삭제`);
         }
-      } catch {}
+      }
     }
+
     return changes;
   }
 

@@ -82,6 +82,7 @@ export class CoreManager {
   private watchers = new Map<string, AutoBaselineWatcher>();
   private changeListeners = new Set<(type: string, data: any) => void>();
   private isApplyingApprovedPatch = false;
+  private quarantineCache = new Map<string, { fingerprint: string; backupRef: string }>();
   private activeWaiters = new Map<
     string,
     {
@@ -369,8 +370,64 @@ export class CoreManager {
 
     this.db.recordAgentHeartbeat(agentName, sessionId, `체크포인트 생성: ${label}`);
     this.db.insertCheckpoint(cp);
+    this.quarantineCache.delete(project.id);
+    this.db.updateProjectQuarantine(project.id, null, null);
     this.emitChange('checkpoint_created', cp);
     return cp;
+  }
+
+  /**
+   * Computes deterministic fingerprint for an unapproved relative file or folder path.
+   */
+  private computePathFingerprint(fullPath: string): string {
+    try {
+      if (!fs.existsSync(fullPath)) {
+        return '<DELETED>';
+      }
+      const stat = fs.statSync(fullPath);
+      if (stat.isFile()) {
+        return `${stat.size}:${this.gitEngine.getFileSha256(fullPath)}`;
+      }
+      if (stat.isDirectory()) {
+        const entries = fs.readdirSync(fullPath, { withFileTypes: true });
+        const parts: string[] = [];
+        for (const entry of entries) {
+          parts.push(`${entry.name}:${this.computePathFingerprint(path.join(fullPath, entry.name))}`);
+        }
+        return crypto.createHash('sha256').update(parts.sort().join(';')).digest('hex');
+      }
+      return '<SPECIAL>';
+    } catch {
+      return '<ERROR>';
+    }
+  }
+
+  /**
+   * Computes a combined cryptographic fingerprint of all unapproved files (tracked + untracked)
+   * and their exact content hashes.
+   */
+  private computeUnapprovedChangesFingerprint(
+    repoPath: string,
+    unapprovedTracked: string[],
+    unapprovedUntracked: string[]
+  ): string {
+    const hasher = crypto.createHash('sha256');
+    const sortedTracked = [...unapprovedTracked].sort();
+    const sortedUntracked = [...unapprovedUntracked].sort();
+
+    hasher.update(`tracked:${sortedTracked.join(',')}\n`);
+    for (const rel of sortedTracked) {
+      const full = path.resolve(repoPath, rel);
+      hasher.update(`${rel}:${this.computePathFingerprint(full)}\n`);
+    }
+
+    hasher.update(`untracked:${sortedUntracked.join(',')}\n`);
+    for (const rel of sortedUntracked) {
+      const full = path.resolve(repoPath, rel);
+      hasher.update(`${rel}:${this.computePathFingerprint(full)}\n`);
+    }
+
+    return hasher.digest('hex');
   }
 
   /**
@@ -385,28 +442,87 @@ export class CoreManager {
     const activeIncidentsCount = this.db.getActiveIncidentsCount(project.id);
 
     // Policy bypass check: Detect unapproved direct modifications outside checkpoint baseline
-    const unapprovedTracked = latestCheckpoint
-      ? gitStatus.changedFiles.filter((f) => !latestCheckpoint.changedFiles.includes(f))
-      : gitStatus.changedFiles;
-    const unapprovedUntracked = latestCheckpoint
-      ? gitStatus.untrackedFiles.filter((f) => !(latestCheckpoint.untrackedFiles || []).includes(f))
-      : gitStatus.untrackedFiles;
+    const unapprovedTracked = gitStatus.changedFiles.filter((f) => {
+      if (!latestCheckpoint) return true;
+      if (!latestCheckpoint.changedFiles.includes(f)) return true;
+      if (latestCheckpoint.worktreeCommitSha) {
+        try {
+          const diff = this.gitEngine.runGit(project.rootPath, [
+            'diff',
+            '--name-only',
+            latestCheckpoint.worktreeCommitSha,
+            '--',
+            f,
+          ]).trim();
+          return Boolean(diff);
+        } catch {
+          return false;
+        }
+      }
+      return false;
+    });
+
+    const unapprovedUntracked = gitStatus.untrackedFiles.filter((f) => {
+      if (!latestCheckpoint) return true;
+      if (!(latestCheckpoint.untrackedFiles || []).includes(f)) return true;
+      if (latestCheckpoint.worktreeCommitSha) {
+        try {
+          const diff = this.gitEngine.runGit(project.rootPath, [
+            'diff',
+            '--name-only',
+            latestCheckpoint.worktreeCommitSha,
+            '--',
+            f,
+          ]).trim();
+          return Boolean(diff);
+        } catch {
+          return false;
+        }
+      }
+      return false;
+    });
+
     const unapprovedFiles = [...unapprovedTracked, ...unapprovedUntracked];
     const unapprovedModificationsDetected =
       unapprovedFiles.length > 0 && activeIncidentsCount > 0 && !this.isApplyingApprovedPatch;
 
     let quarantineBackupRef: string | undefined = undefined;
     if (unapprovedModificationsDetected) {
-      // Non-destructive safety backup preserving untracked files without destroying user work
-      try {
-        const qId = `quarantine_${Date.now().toString(36)}`;
-        const qSnap = this.gitEngine.createSnapshot(
-          project.rootPath,
-          qId,
-          'Quarantine safety backup of unapproved working tree modifications'
-        );
-        quarantineBackupRef = qSnap.gitRef;
-      } catch {}
+      // 0.5 Check: Compute exact fingerprint of unapproved changes (files list + content hashes)
+      const fingerprint = this.computeUnapprovedChangesFingerprint(
+        project.rootPath,
+        unapprovedTracked,
+        unapprovedUntracked
+      );
+
+      const cached = this.quarantineCache.get(project.id);
+      if (cached && cached.fingerprint === fingerprint) {
+        // Reuse previous backup ref without spawning any git commands
+        quarantineBackupRef = cached.backupRef;
+      } else if (project.lastQuarantineFingerprint === fingerprint && project.lastQuarantineRef) {
+        quarantineBackupRef = project.lastQuarantineRef;
+        this.quarantineCache.set(project.id, { fingerprint, backupRef: quarantineBackupRef });
+      } else {
+        // Non-destructive safety backup preserving untracked files without destroying user work.
+        // Created ONLY when unapproved changes differ from previous quarantine backup!
+        try {
+          const qId = `quarantine_${Date.now().toString(36)}`;
+          const qSnap = this.gitEngine.createSnapshot(
+            project.rootPath,
+            qId,
+            'Quarantine safety backup of unapproved working tree modifications'
+          );
+          quarantineBackupRef = qSnap.gitRef;
+          this.quarantineCache.set(project.id, { fingerprint, backupRef: quarantineBackupRef });
+          this.db.updateProjectQuarantine(project.id, fingerprint, quarantineBackupRef);
+        } catch {}
+      }
+    } else {
+      // No unapproved modifications: clear quarantine cache if previously set
+      if (this.quarantineCache.has(project.id) || project.lastQuarantineFingerprint) {
+        this.quarantineCache.delete(project.id);
+        this.db.updateProjectQuarantine(project.id, null, null);
+      }
     }
 
     return {
@@ -1589,6 +1705,8 @@ export class CoreManager {
       cp.untrackedFiles || []
     );
 
+    this.quarantineCache.delete(project.id);
+    this.db.updateProjectQuarantine(project.id, null, null);
     this.emitChange('checkpoint_rolled_back', { checkpointId, backupRef });
 
     return {

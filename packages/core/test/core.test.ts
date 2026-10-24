@@ -353,6 +353,12 @@ describe('Agent Autopsy Core Engine Integration Tests', () => {
     assert.ok(fs.existsSync(path.join(repoPath, 'unapproved_new_file.txt')), 'Untracked files must not be deleted');
     const content = fs.readFileSync(path.join(repoPath, 'calculator.js'), 'utf8');
     assert.ok(content.includes('direct unapproved modification'), 'Direct user work must be preserved in place');
+
+    // Clean up test 10 unapproved files so subsequent tests start with clean baseline
+    if (fs.existsSync(path.join(repoPath, 'unapproved_new_file.txt'))) {
+      fs.unlinkSync(path.join(repoPath, 'unapproved_new_file.txt'));
+    }
+    execFileSync('git', ['checkout', 'HEAD', '--', 'calculator.js'], { cwd: repoPath, stdio: 'ignore' });
   });
 
   test('11. DirectiveQueue live delivery on active awaitUserDecision (DELIVERED_LIVE)', async () => {
@@ -1171,38 +1177,75 @@ describe('Agent Autopsy Core Engine Integration Tests', () => {
     const inc = core.collectIncidentBundle(repoPath, '의존성 폴더 오염 감지 테스트', 'AssertionError: heavy');
     const project = core.ensureProject(repoPath);
 
-    // Create a dummy node_modules directory in repoPath
+    // Create a dummy node_modules directory with inner subfolder in repoPath
     const nodeModulesDir = path.join(repoPath, 'node_modules');
     const fakeDepDir = path.join(nodeModulesDir, 'sample_dep');
     fs.mkdirSync(fakeDepDir, { recursive: true });
     fs.writeFileSync(path.join(fakeDepDir, 'index.js'), 'module.exports = {};\n');
 
-    // Introduce a malicious test script that pollutes node_modules during execution
-    const maliciousTestScript = path.join(repoPath, 'pollute_test.js');
-    fs.writeFileSync(
-      maliciousTestScript,
-      `const fs = require('fs');\nconst path = require('path');\nfs.writeFileSync(path.join(__dirname, 'node_modules', 'sample_dep', 'taint.txt'), 'polluted!');\nconsole.log('POLLUTION_DONE');\n`
-    );
-
-    core.updateProjectSettings(repoPath, { testCommand: 'node pollute_test.js' });
-
-    const { executionResult } = await core.proposeAndVerifyRepair(repoPath, inc.id, 'fix with pollution', [
+    const validRepair = [
       {
         filePath: 'calculator.js',
-        replacements: [{ search: 'return a / b;', replace: 'return 1;' }],
+        replacements: [
+          {
+            search: '  return a / b;',
+            replace: '  if (b === 0) return 0;\n  return a / b;',
+          },
+        ],
       },
-    ]);
+    ];
 
-    // MUST NOT pass validation because connected heavy directory was mutated
-    assert.strictEqual(executionResult.success, false, 'Validation must fail when host dependency directory is mutated');
+    // --- Case 1: 안쪽 폴더에 파일을 쓰는 경우 (node_modules/sample_dep/taint.txt) ---
+    const innerPollutionCmd = `node -e "require('fs').writeFileSync('node_modules/sample_dep/taint.txt', 'inner polluted'); console.log('ALL TESTS PASSED');"`;
+    core.updateProjectSettings(repoPath, { testCommand: innerPollutionCmd });
+
+    const { executionResult: resInner } = await core.proposeAndVerifyRepair(
+      repoPath,
+      inc.id,
+      'fix with inner pollution',
+      validRepair
+    );
+
+    assert.strictEqual(resInner.success, false, 'Validation must fail when inner dependency folder is mutated');
     assert.ok(
-      executionResult.output.includes('원본 의존성 폴더 변경 감지'),
-      'Output report must explicitly indicate 원본 의존성 폴더 변경 감지'
+      resInner.output.includes('원본 의존성 폴더 변경 감지'),
+      'Output report must explicitly indicate 원본 의존성 폴더 변경 감지 for inner folder pollution'
+    );
+    assert.ok(
+      resInner.output.includes('node_modules/sample_dep/taint.txt'),
+      'Output report must specifically identify the polluted inner file path'
+    );
+    assert.ok(
+      fs.existsSync(path.join(fakeDepDir, 'taint.txt')),
+      'The inner file must have been physically written through junction to the host'
+    );
+
+    // Remove inner file before Case 2
+    fs.unlinkSync(path.join(fakeDepDir, 'taint.txt'));
+
+    // --- Case 2: 최상위 폴더에 파일을 쓰는 경우 (node_modules/top_taint.txt) ---
+    const topPollutionCmd = `node -e "require('fs').writeFileSync('node_modules/top_taint.txt', 'top polluted'); console.log('ALL TESTS PASSED');"`;
+    core.updateProjectSettings(repoPath, { testCommand: topPollutionCmd });
+
+    const { executionResult: resTop } = await core.proposeAndVerifyRepair(
+      repoPath,
+      inc.id,
+      'fix with top-level pollution',
+      validRepair
+    );
+
+    assert.strictEqual(resTop.success, false, 'Validation must fail when top-level dependency folder is mutated');
+    assert.ok(
+      resTop.output.includes('원본 의존성 폴더 변경 감지'),
+      'Output report must explicitly indicate 원본 의존성 폴더 변경 감지 for top-level folder pollution'
+    );
+    assert.ok(
+      resTop.output.includes('node_modules/top_taint.txt'),
+      'Output report must specifically identify the polluted top-level file path'
     );
 
     // Clean up
     fs.rmSync(nodeModulesDir, { recursive: true, force: true });
-    if (fs.existsSync(maliciousTestScript)) fs.unlinkSync(maliciousTestScript);
     core.updateProjectSettings(repoPath, { testCommand: 'node test.js' });
   });
 
@@ -1272,5 +1315,120 @@ describe('Agent Autopsy Core Engine Integration Tests', () => {
     assert.strictEqual(projectsRes.status, 200, 'Query API (/api/projects) must succeed without token');
 
     await apiServer.stop();
+  });
+
+  test('31. Step-0.5-Check: Repeated query API calls with identical unapproved changes create at most 1 quarantine backup', async () => {
+    // 1. Create an active incident so activeIncidentsCount > 0
+    const inc = core.collectIncidentBundle(repoPath, '0.5단계 격리 백업 폭주 방지 테스트', 'AssertionError: test 31');
+
+    // 2. Introduce unapproved direct modifications: both a tracked file edit and an untracked file
+    fs.appendFileSync(path.join(repoPath, 'calculator.js'), '// unapproved line for 0.5 test\n');
+    fs.writeFileSync(path.join(repoPath, 'unapproved_05.txt'), 'precious work');
+
+    const countQuarantineRefs = () => {
+      try {
+        const out = execFileSync('git', ['for-each-ref', '--format=%(refname)', 'refs/autopsy/checkpoints/quarantine_*'], {
+          cwd: repoPath,
+          encoding: 'utf8',
+        }).trim();
+        return out ? out.split('\n').filter(Boolean).length : 0;
+      } catch {
+        return 0;
+      }
+    };
+
+    const initialQuarantineCount = countQuarantineRefs();
+
+    // 3. Start ApiServer to test the exact /api/overview query endpoint hit by Desktop UI polling & SSE
+    const apiServer = new ApiServer(core);
+    const port = await apiServer.start(3886);
+
+    const callOverview = (): Promise<{ status: number; body: any }> => {
+      return new Promise((resolve, reject) => {
+        const payload = JSON.stringify({ repoPath });
+        const req = http.request(
+          {
+            hostname: '127.0.0.1',
+            port,
+            path: '/api/overview',
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'Content-Length': Buffer.byteLength(payload),
+            },
+          },
+          (res) => {
+            let b = '';
+            res.on('data', (c) => (b += c));
+            res.on('end', () => resolve({ status: res.statusCode || 500, body: JSON.parse(b) }));
+          }
+        );
+        req.on('error', reject);
+        req.write(payload);
+        req.end();
+      });
+    };
+
+    try {
+      // 4. Call /api/overview 100 times consecutively with identical unapproved changes
+      let firstBackupRef = '';
+      for (let i = 0; i < 100; i++) {
+        const res = await callOverview();
+        assert.strictEqual(res.status, 200);
+        assert.strictEqual(res.body.health.unapprovedModificationsDetected, true);
+        assert.ok(res.body.health.quarantineBackupRef);
+        if (i === 0) {
+          firstBackupRef = res.body.health.quarantineBackupRef;
+        } else {
+          assert.strictEqual(
+            res.body.health.quarantineBackupRef,
+            firstBackupRef,
+            `Call #${i + 1} must reuse the existing quarantine backup ref without re-snapshotting`
+          );
+        }
+      }
+
+      // 5. CRITICAL VERIFICATION: Exactly 1 quarantine backup created across 100 queries!
+      const countAfter100 = countQuarantineRefs();
+      assert.strictEqual(
+        countAfter100 - initialQuarantineCount,
+        1,
+        `Calling /api/overview 100 consecutive times must produce at most 1 quarantine backup! (actual new: ${countAfter100 - initialQuarantineCount})`
+      );
+
+      // 6. Introduce a new modification to working tree
+      fs.appendFileSync(path.join(repoPath, 'calculator.js'), '// additional change triggering new fingerprint\n');
+      fs.appendFileSync(path.join(repoPath, 'unapproved_05.txt'), '\nadditional untracked line');
+
+      // 7. Call /api/overview again: must detect fingerprint change and create exactly 1 new quarantine backup
+      const resAfterEdit = await callOverview();
+      assert.strictEqual(resAfterEdit.status, 200);
+      const secondBackupRef = resAfterEdit.body.health.quarantineBackupRef;
+      assert.ok(secondBackupRef);
+      assert.notStrictEqual(secondBackupRef, firstBackupRef, 'New modification must create a new quarantine backup ref');
+
+      const countAfterEdit = countQuarantineRefs();
+      assert.strictEqual(
+        countAfterEdit - initialQuarantineCount,
+        2,
+        `Modifying the working tree must create exactly 1 new backup (total 2)`
+      );
+
+      // 8. Call /api/overview 20 more times without changes: ref count must remain 2
+      for (let i = 0; i < 20; i++) {
+        const res = await callOverview();
+        assert.strictEqual(res.body.health.quarantineBackupRef, secondBackupRef);
+      }
+      assert.strictEqual(countQuarantineRefs() - initialQuarantineCount, 2);
+    } finally {
+      // 9. Clean up
+      await apiServer.stop();
+      try {
+        execFileSync('git', ['checkout', 'HEAD', '--', 'calculator.js'], { cwd: repoPath, stdio: 'ignore' });
+        if (fs.existsSync(path.join(repoPath, 'unapproved_05.txt'))) {
+          fs.unlinkSync(path.join(repoPath, 'unapproved_05.txt'));
+        }
+      } catch {}
+    }
   });
 });

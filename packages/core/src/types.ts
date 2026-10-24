@@ -60,6 +60,8 @@ export interface Project {
   testCommandSignature?: string;
   verificationMode?: VerificationMode;
   preferredHost?: HostEnvironment;
+  lastQuarantineFingerprint?: string;
+  lastQuarantineRef?: string;
   createdAt: string;
 }
 

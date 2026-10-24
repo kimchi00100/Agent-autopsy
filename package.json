@@ -1,0 +1,22 @@
+{
+  "name": "agent-autopsy",
+  "version": "0.1.0",
+  "private": true,
+  "description": "AI 코딩 에이전트가 '돌아가지만 틀린' 버그를 추측 대신 실행 증거로 고치게 하고, 사용자가 승인한 수정만 적용하는 로컬 안전 검증 플랫폼",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/kimchi00100/Agent-autopsy.git"
+  },
+  "scripts": {
+    "build": "pnpm --filter \"@agent-autopsy/*\" run build",
+    "test": "pnpm --filter \"@agent-autopsy/core\" run test",
+    "dashboard": "node packages/core/dist/src/bin/server-cli.js",
+    "desktop": "pnpm --filter \"@agent-autopsy/desktop\" start",
+    "build:exe": "pnpm --filter \"@agent-autopsy/desktop\" pack:exe",
+    "mcp": "node packages/mcp-server/dist/index.js"
+  },
+  "devDependencies": {
+    "typescript": "^5.8.0"
+  }
+}

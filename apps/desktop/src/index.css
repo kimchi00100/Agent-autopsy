@@ -1,0 +1,85 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: light;
+}
+
+html, body, #root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  font-family: -apple-system, BlinkMacSystemFont, 'Pretendard', 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+  font-size: 13.5px;
+  background: #f8fafc;
+  color: #0f172a;
+  -webkit-font-smoothing: antialiased;
+}
+
+.mono {
+  font-family: 'Cascadia Code', 'Consolas', 'JetBrains Mono', ui-monospace, monospace;
+}
+
+.canvas-grid {
+  background-color: #f8fafc;
+  background-image: radial-gradient(#cbd5e1 1.25px, transparent 1.25px);
+  background-size: 20px 20px;
+}
+
+/* Custom soft scrollbars */
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 6px; }
+::-webkit-scrollbar-thumb:hover { background: #94a3b8; }
+::-webkit-scrollbar-track { background: transparent; }
+
+@keyframes fade-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+.fade-in { animation: fade-in 0.12s ease-out; }
+
+/* Dark Theme Support */
+html.dark {
+  color-scheme: dark;
+}
+html.dark body {
+  background: #0f172a;
+  color: #f1f5f9;
+}
+html.dark .bg-white {
+  background-color: #1e293b !important;
+}
+html.dark .bg-\[\#F8FAFC\],
+html.dark .bg-slate-50,
+html.dark .bg-slate-50\/60,
+html.dark .bg-slate-50\/70,
+html.dark .bg-slate-50\/80 {
+  background-color: #0f172a !important;
+}
+html.dark .bg-slate-100 {
+  background-color: #334155 !important;
+}
+html.dark .border-slate-200,
+html.dark .border-slate-200\/90,
+html.dark .border-slate-100 {
+  border-color: #334155 !important;
+}
+html.dark .text-slate-900,
+html.dark .text-slate-800 {
+  color: #f8fafc !important;
+}
+html.dark .text-slate-700,
+html.dark .text-slate-600 {
+  color: #cbd5e1 !important;
+}
+html.dark .text-slate-500,
+html.dark .text-slate-400 {
+  color: #94a3b8 !important;
+}
+html.dark .canvas-grid {
+  background-color: #0f172a;
+  background-image: radial-gradient(#334155 1.25px, transparent 1.25px);
+}

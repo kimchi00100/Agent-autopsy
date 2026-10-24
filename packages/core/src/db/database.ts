@@ -21,6 +21,8 @@ import {
   DirectiveKind,
   DirectiveDeliveryStatus,
   ConfirmedIntentData,
+  ReproductionResult,
+  CauseVerdict,
 } from '../types.js';
 import { generateDeterministicProjectId, normalizeRepoPath } from '../utils/paths.js';
 
@@ -99,6 +101,7 @@ export class AutopsyDatabase {
         preferred_host TEXT DEFAULT 'antigravity',
         sensitive_paths_json TEXT DEFAULT '[]',
         risk_threshold_lines INTEGER DEFAULT 200,
+        enable_coverage INTEGER DEFAULT 0,
         last_quarantine_fingerprint TEXT,
         last_quarantine_ref TEXT,
         created_at TEXT NOT NULL
@@ -132,6 +135,8 @@ export class AutopsyDatabase {
         severity TEXT DEFAULT 'UNASSESSED',
         severity_evidence_json TEXT DEFAULT '[]',
         cause_evidence_json TEXT DEFAULT '[]',
+        reproduction_result_json TEXT,
+        coverage_lines_json TEXT,
         agent_name TEXT DEFAULT 'agent',
         session_id TEXT,
         test_execution_note TEXT,
@@ -278,6 +283,9 @@ export class AutopsyDatabase {
       `ALTER TABLE incidents ADD COLUMN cause_evidence_json TEXT DEFAULT '[]';`,
       `ALTER TABLE repair_proposals ADD COLUMN risk_evidence_json TEXT DEFAULT '[]';`,
       `ALTER TABLE repair_proposals ADD COLUMN self_review_checklist_json TEXT DEFAULT '[]';`,
+      `ALTER TABLE projects ADD COLUMN enable_coverage INTEGER DEFAULT 0;`,
+      `ALTER TABLE incidents ADD COLUMN reproduction_result_json TEXT;`,
+      `ALTER TABLE incidents ADD COLUMN coverage_lines_json TEXT;`,
     ];
 
     for (const sql of migrations) {
@@ -480,6 +488,7 @@ export class AutopsyDatabase {
       preferredHost: (row.preferred_host || 'antigravity') as HostEnvironment,
       sensitivePaths: row.sensitive_paths_json ? JSON.parse(row.sensitive_paths_json) : [],
       riskThresholdLines: typeof row.risk_threshold_lines === 'number' ? row.risk_threshold_lines : 200,
+      enableCoverage: Boolean(row.enable_coverage),
       lastQuarantineFingerprint: row.last_quarantine_fingerprint || undefined,
       lastQuarantineRef: row.last_quarantine_ref || undefined,
       createdAt: row.created_at,
@@ -502,6 +511,7 @@ export class AutopsyDatabase {
       preferredHost: (row.preferred_host || 'antigravity') as HostEnvironment,
       sensitivePaths: row.sensitive_paths_json ? JSON.parse(row.sensitive_paths_json) : [],
       riskThresholdLines: typeof row.risk_threshold_lines === 'number' ? row.risk_threshold_lines : 200,
+      enableCoverage: Boolean(row.enable_coverage),
       lastQuarantineFingerprint: row.last_quarantine_fingerprint || undefined,
       lastQuarantineRef: row.last_quarantine_ref || undefined,
       createdAt: row.created_at,
@@ -534,6 +544,7 @@ export class AutopsyDatabase {
       preferredHost: (row.preferred_host || 'antigravity') as HostEnvironment,
       sensitivePaths: row.sensitive_paths_json ? JSON.parse(row.sensitive_paths_json) : [],
       riskThresholdLines: typeof row.risk_threshold_lines === 'number' ? row.risk_threshold_lines : 200,
+      enableCoverage: Boolean(row.enable_coverage),
       lastQuarantineFingerprint: row.last_quarantine_fingerprint || undefined,
       lastQuarantineRef: row.last_quarantine_ref || undefined,
       createdAt: row.created_at,
@@ -565,6 +576,7 @@ export class AutopsyDatabase {
       testCommandSignature?: string;
       sensitivePaths?: string[];
       riskThresholdLines?: number;
+      enableCoverage?: boolean;
     }
   ): void {
     this.runInImmediateTransaction(() => {
@@ -576,6 +588,7 @@ export class AutopsyDatabase {
             test_command_signature = COALESCE(?, test_command_signature),
             sensitive_paths_json = COALESCE(?, sensitive_paths_json),
             risk_threshold_lines = COALESCE(?, risk_threshold_lines),
+            enable_coverage = COALESCE(?, enable_coverage),
             proposed_test_command = CASE WHEN ? IS NOT NULL THEN NULL ELSE proposed_test_command END,
             proposed_test_command_reason = CASE WHEN ? IS NOT NULL THEN NULL ELSE proposed_test_command_reason END
         WHERE id = ?
@@ -587,6 +600,7 @@ export class AutopsyDatabase {
         settings.testCommandSignature || null,
         settings.sensitivePaths ? JSON.stringify(settings.sensitivePaths) : null,
         typeof settings.riskThresholdLines === 'number' ? settings.riskThresholdLines : null,
+        settings.enableCoverage !== undefined ? (settings.enableCoverage ? 1 : 0) : null,
         settings.testCommand || null,
         settings.testCommand || null,
         id
@@ -705,9 +719,10 @@ export class AutopsyDatabase {
           expected_behavior, observed_behavior, broken_step, execution_trace_json, three_level_health_json,
           reproduction_condition, verification_method, verification_type, user_confirmed_intent, user_confirmation_summary, cause_verdict,
           risk_level, risk_signals_json, orchestration_decision_json, test_execution_note,
+          reproduction_result_json, coverage_lines_json,
           created_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `);
       stmt.run(
         incident.id,
@@ -737,6 +752,8 @@ export class AutopsyDatabase {
         incident.riskSignals ? JSON.stringify(incident.riskSignals) : null,
         incident.orchestrationDecision ? JSON.stringify(incident.orchestrationDecision) : null,
         incident.testExecutionNote || null,
+        incident.reproductionResult ? JSON.stringify(incident.reproductionResult) : null,
+        incident.coverageLines ? JSON.stringify(incident.coverageLines) : null,
         incident.createdAt
       );
     });
@@ -774,6 +791,8 @@ export class AutopsyDatabase {
       executionTrace: row.execution_trace_json ? JSON.parse(row.execution_trace_json) : undefined,
       threeLevelHealth: row.three_level_health_json ? JSON.parse(row.three_level_health_json) : undefined,
       testExecutionNote: row.test_execution_note || undefined,
+      reproductionResult: row.reproduction_result_json ? JSON.parse(row.reproduction_result_json) : undefined,
+      coverageLines: row.coverage_lines_json ? JSON.parse(row.coverage_lines_json) : undefined,
       createdAt: row.created_at,
     };
   }
@@ -822,6 +841,31 @@ export class AutopsyDatabase {
     });
   }
 
+  public updateIncidentReproduction(
+    id: string,
+    reproduction: ReproductionResult,
+    causeVerdict?: CauseVerdict,
+    causeEvidence?: string[]
+  ): void {
+    this.runInImmediateTransaction(() => {
+      const updates = ['reproduction_result_json = ?'];
+      const values: any[] = [JSON.stringify(reproduction)];
+
+      if (causeVerdict !== undefined) {
+        updates.push('cause_verdict = ?');
+        values.push(causeVerdict);
+      }
+      if (causeEvidence !== undefined) {
+        updates.push('cause_evidence_json = ?');
+        values.push(JSON.stringify(causeEvidence));
+      }
+
+      values.push(id);
+      const updateStmt = this.db.prepare(`UPDATE incidents SET ${updates.join(', ')} WHERE id = ?`);
+      updateStmt.run(...values);
+    });
+  }
+
   public listIncidents(projectId: string, limit: number = 20): Incident[] {
     const stmt = this.db.prepare(`
       SELECT * FROM incidents 
@@ -858,6 +902,8 @@ export class AutopsyDatabase {
       executionTrace: row.execution_trace_json ? JSON.parse(row.execution_trace_json) : undefined,
       threeLevelHealth: row.three_level_health_json ? JSON.parse(row.three_level_health_json) : undefined,
       testExecutionNote: row.test_execution_note || undefined,
+      reproductionResult: row.reproduction_result_json ? JSON.parse(row.reproduction_result_json) : undefined,
+      coverageLines: row.coverage_lines_json ? JSON.parse(row.coverage_lines_json) : undefined,
       createdAt: row.created_at,
     }));
   }

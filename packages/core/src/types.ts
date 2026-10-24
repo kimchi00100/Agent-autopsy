@@ -65,6 +65,7 @@ export interface Project {
   preferredHost?: HostEnvironment;
   sensitivePaths?: string[];
   riskThresholdLines?: number;
+  enableCoverage?: boolean;
   lastQuarantineFingerprint?: string;
   lastQuarantineRef?: string;
   createdAt: string;
@@ -86,6 +87,17 @@ export interface Checkpoint {
   createdAt: string;
 }
 
+export type ReproductionStatus = 'REPRODUCED' | 'NOT_REPRODUCED' | 'CANNOT_RUN';
+
+export interface ReproductionResult {
+  status: ReproductionStatus;
+  command: string;
+  exitCode: number;
+  output: string;
+  failedLocation?: { filePath: string; line: number };
+  executedAt: string;
+}
+
 export type Severity = 'HIGH' | 'MEDIUM' | 'LOW' | 'UNASSESSED';
 export type CauseVerdict = 'CONFIRMED' | 'LIKELY' | 'UNKNOWN';
 export type VerificationType = 'LOGIC_TEST' | 'DATA_STATE' | 'UI_FLOW' | 'MANUAL_CHECK';
@@ -101,6 +113,9 @@ export interface Incident {
   severity: Severity;
   severityEvidence?: string[];
   causeEvidence?: string[];
+  reproductionResult?: ReproductionResult;
+  coverageLines?: Record<string, number[]>;
+  enableCoverage?: boolean;
   agentName: string;
   sessionId?: string;
   expectedBehavior?: string;
@@ -299,6 +314,8 @@ export interface CauseCandidate {
   removedLines: number;
   ranges: Array<{ start: number; end: number }>;
   temporalOnly: boolean;
+  executionEvidence?: string[];
+  hasExecutionEvidence?: boolean;
 }
 
 export interface FlowNode {

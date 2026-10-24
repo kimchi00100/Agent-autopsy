@@ -97,6 +97,7 @@ export interface Project {
   preferredHost?: HostEnvironment;
   sensitivePaths?: string[];
   riskThresholdLines?: number;
+  enableCoverage?: boolean;
 }
 
 export interface Checkpoint {
@@ -189,6 +190,17 @@ export interface AgentSession {
   observationScope?: ObservationScope[];
 }
 
+export type ReproductionStatus = 'REPRODUCED' | 'NOT_REPRODUCED' | 'CANNOT_RUN';
+
+export interface ReproductionResult {
+  status: ReproductionStatus;
+  command: string;
+  exitCode: number;
+  output: string;
+  failedLocation?: { filePath: string; line: number };
+  executedAt: string;
+}
+
 export type Severity = 'HIGH' | 'MEDIUM' | 'LOW' | 'UNASSESSED';
 
 export interface Incident {
@@ -202,6 +214,9 @@ export interface Incident {
   severity: Severity;
   severityEvidence?: string[];
   causeEvidence?: string[];
+  reproductionResult?: ReproductionResult;
+  coverageLines?: Record<string, number[]>;
+  enableCoverage?: boolean;
   agentName: string;
   expectedBehavior?: string;
   observedBehavior?: string;
@@ -559,6 +574,7 @@ export const api = {
       testCommand?: string;
       sensitivePaths?: string[];
       riskThresholdLines?: number;
+  enableCoverage?: boolean;
     }
   ) => request<{ success: boolean; project: Project }>(`/api/projects/${projectId}/settings`, post(settings)),
   submitReview: (
@@ -609,6 +625,11 @@ export const api = {
     ),
   discoverCommands: (projectId: string) =>
     request<{ success: boolean; commands: DiscoveredCommands }>(`/api/projects/${projectId}/commands`),
+  runReproduction: (incidentId: string, testCommandOrFile: string) =>
+    request<{ success: boolean; reproduction: ReproductionResult }>(
+      `/api/incidents/${incidentId}/reproduce`,
+      post({ testCommandOrFile })
+    ),
   subscribeStream: (onEvent: (event: any) => void): (() => void) => {
     try {
       const fullUrl = resolveFullUrl('/api/stream');

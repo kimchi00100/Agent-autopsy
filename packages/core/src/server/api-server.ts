@@ -291,6 +291,29 @@ export class ApiServer {
       return;
     }
 
+    // POST /api/incidents/:incidentId/reproduce
+    const reproMatch = pathname.match(/^\/api\/incidents\/([^\/]+)\/reproduce$/);
+    if (req.method === 'POST' && reproMatch) {
+      const incidentId = reproMatch[1];
+      const incident = db.getIncident(incidentId);
+      if (!incident) {
+        res.writeHead(404, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: `Incident ${incidentId} not found` }));
+        return;
+      }
+      const project = db.getProject(incident.projectId);
+      const repoPath = project ? project.rootPath : process.cwd();
+      const body = await this.parseJsonBody(req);
+      const testFilePath = body.testFilePath || body.testCommandOrFile || '';
+      const result = await this.coreManager.runReproduction(
+        repoPath,
+        incidentId,
+        testFilePath
+      );
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ success: true, reproduction: result }));
+      return;
+    }
     // GET /api/incidents/:incidentId/analysis
     const anMatch = pathname.match(/^\/api\/incidents\/([^\/]+)\/analysis$/);
     if (req.method === 'GET' && anMatch) {
@@ -378,6 +401,7 @@ export class ApiServer {
         testCommand: body.testCommand,
         sensitivePaths: Array.isArray(body.sensitivePaths) ? body.sensitivePaths : undefined,
         riskThresholdLines: typeof body.riskThresholdLines === 'number' ? body.riskThresholdLines : undefined,
+        enableCoverage: typeof body.enableCoverage === 'boolean' ? body.enableCoverage : undefined,
       });
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ success: true, project: updated }));

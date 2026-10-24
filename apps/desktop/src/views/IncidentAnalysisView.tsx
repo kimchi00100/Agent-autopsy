@@ -15,6 +15,8 @@ import {
   ShieldAlert,
   RotateCcw,
   CheckSquare,
+  Terminal,
+  Activity,
 } from 'lucide-react';
 
 interface Props {
@@ -535,6 +537,38 @@ export default function IncidentAnalysisView({
                 <span className="text-slate-500">발생 시간</span>
                 <span className="text-slate-800">{clock(incident.createdAt)}</span>
               </div>
+            </div>
+
+            {/* Reproduction Test Result (Execution Evidence) */}
+            {incident.reproductionResult && (
+              <div className="mt-4 rounded-xl border border-indigo-200 bg-indigo-50/50 p-3 text-xs space-y-1.5">
+                <div className="flex items-center justify-between font-semibold text-indigo-900">
+                  <span className="flex items-center gap-1.5">
+                    <Terminal className="h-3.5 w-3.5 text-indigo-600" />
+                    실행 증거: 재현 테스트
+                  </span>
+                  <Badge tone={incident.reproductionResult.status === 'REPRODUCED' ? 'red' : incident.reproductionResult.status === 'NOT_REPRODUCED' ? 'green' : 'gray'}>
+                    {incident.reproductionResult.status === 'REPRODUCED' ? '재현됨 (실패 확인)' : incident.reproductionResult.status === 'NOT_REPRODUCED' ? '재현 안 됨 (통과)' : '실행 불가'}
+                  </Badge>
+                </div>
+                <div className="mono text-[11px] text-indigo-800 bg-white/80 p-1.5 rounded border border-indigo-100 truncate">
+                  {incident.reproductionResult.command}
+                </div>
+                {incident.reproductionResult.failedLocation && (
+                  <div className="text-[10px] text-indigo-700">
+                    실패 확인 위치: <code>{incident.reproductionResult.failedLocation.filePath}:{incident.reproductionResult.failedLocation.line}</code>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* Coverage Execution Status */}
+            <div className="mt-4 flex items-center justify-between rounded-xl border border-slate-200 bg-slate-50/70 p-2.5 text-xs text-slate-600">
+              <span className="flex items-center gap-1.5 font-medium">
+                <Activity className="h-3.5 w-3.5 text-slate-400" />
+                커버리지 정밀 분석
+              </span>
+              <Badge tone="gray">아직 지원 안 함</Badge>
             </div>
 
             {/* Missing Evidence Checklist when UNKNOWN */}

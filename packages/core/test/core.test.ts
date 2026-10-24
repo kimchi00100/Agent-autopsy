@@ -4,11 +4,11 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as http from 'node:http';
 import * as url from 'node:url';
-import { execFileSync, spawn, ChildProcess } from 'node:child_process';
+import { execFileSync, execSync, spawn, ChildProcess } from 'node:child_process';
 import { CoreManager } from '../src/core-manager.js';
 import { ApiServer } from '../src/server/api-server.js';
 import { WorktreeRunner } from '../src/runner/worktree-runner.js';
-import { analyzeIncident } from '../src/analysis/analyzer.js';
+import { analyzeIncident, parseStackFrames, STACK_TRACE_PATTERNS } from '../src/analysis/analyzer.js';
 import { verifyApprovalSignature } from '../src/utils/security.js';
 import {
   resolveDataDir,
@@ -1953,5 +1953,431 @@ describe('Agent Autopsy Core Engine Integration Tests', () => {
     assert.ok(migrated, 'Migrated incident must exist');
     assert.strictEqual(migrated.severity, 'UNASSESSED', 'Legacy incident severity without evidence must migrate to UNASSESSED');
     assert.ok(migrated.severityEvidence && migrated.severityEvidence.length > 0, 'Must have migrated evidence array');
+  });
+
+  test('43. Step-3-Check: Multi-language stack trace and file:line parser across Python, JS, C/C++, Java, Go, Rust', () => {
+    // 1. Python traceback
+    const pyError = `Traceback (most recent call last):
+  File "tests/test_calculator.py", line 45, in test_divide
+    result = divide(10, 0)
+ZeroDivisionError: division by zero`;
+    const pyFrames = parseStackFrames(pyError);
+    assert.strictEqual(pyFrames.length, 1);
+    assert.strictEqual(pyFrames[0].filePath, 'tests/test_calculator.py');
+    assert.strictEqual(pyFrames[0].line, 45);
+
+    // 2. JS / Node stack
+    const jsError = `AssertionError [ERR_ASSERTION]: Expected 42 but got 0
+    at Object.<anonymous> (test/calc.test.js:22:9)
+    at Module._compile (node:internal/modules/cjs/loader:123:14)`;
+    const jsFrames = parseStackFrames(jsError);
+    assert.strictEqual(jsFrames.length, 1);
+    assert.strictEqual(jsFrames[0].filePath, 'test/calc.test.js');
+    assert.strictEqual(jsFrames[0].line, 22);
+
+    // 3. C / C++ GCC error
+    const gccError = `src/calculator.c:38:5: error: expected ';' before 'return'`;
+    const gccFrames = parseStackFrames(gccError);
+    assert.strictEqual(gccFrames.length, 1);
+    assert.strictEqual(gccFrames[0].filePath, 'src/calculator.c');
+    assert.strictEqual(gccFrames[0].line, 38);
+
+    // 4. GoogleTest C++ failure
+    const gtestError = `tests/calc_test.cpp:104: Failure
+Expected equality of these values:
+  calc.add(2, 2)
+    Which is: 5
+  4`;
+    const gtestFrames = parseStackFrames(gtestError);
+    assert.strictEqual(gtestFrames.length, 1);
+    assert.strictEqual(gtestFrames[0].filePath, 'tests/calc_test.cpp');
+    assert.strictEqual(gtestFrames[0].line, 104);
+
+    // 5. C/C++ AddressSanitizer (ASan)
+    const asanError = `=================================================================
+==1234==ERROR: AddressSanitizer: heap-buffer-overflow on address 0x602000000014
+    #0 0x401234 in main src/matrix.c:29:10
+=================================================================`;
+    const asanFrames = parseStackFrames(asanError);
+    assert.strictEqual(asanFrames.length, 1);
+    assert.strictEqual(asanFrames[0].filePath, 'src/matrix.c');
+    assert.strictEqual(asanFrames[0].line, 29);
+
+    // 6. Java stack trace
+    const javaError = `java.lang.AssertionError: balance mismatch
+    at com.example.service.BillingServiceTest.testRefund(BillingServiceTest.java:78)`;
+    const javaFrames = parseStackFrames(javaError);
+    assert.strictEqual(javaFrames.length, 1);
+    assert.strictEqual(javaFrames[0].filePath, 'BillingServiceTest.java');
+    assert.strictEqual(javaFrames[0].line, 78);
+
+    // 7. Go panic
+    const goError = `panic: runtime error: integer divide by zero
+goroutine 1 [running]:
+main.divide(...)
+\tsrc/math/calc_test.go:19 +0x40`;
+    const goFrames = parseStackFrames(goError);
+    assert.strictEqual(goFrames.length, 1);
+    assert.strictEqual(goFrames[0].filePath, 'src/math/calc_test.go');
+    assert.strictEqual(goFrames[0].line, 19);
+
+    // 8. Rust panic/error
+    const rustError = `error[E0308]: mismatched types
+  --> src/parser.rs:52:9
+   |
+52 |         Ok(val)
+   |         ^^^^^^^ expected struct String, found &str`;
+    const rustFrames = parseStackFrames(rustError);
+    assert.strictEqual(rustFrames.length, 1);
+    assert.strictEqual(rustFrames[0].filePath, 'src/parser.rs');
+    assert.strictEqual(rustFrames[0].line, 52);
+  });
+
+  test('44. Step-3-Check: User Requirement 1 - Static HIGH score without execution evidence yields at most LIKELY', () => {
+    // Exact stack frame matching diff range (line 10) gives static score HIGH (85), but without execution evidence it is capped at LIKELY
+    const errorOutputExact = `AssertionError: value mismatch
+    at test (src/math.js:10:3)`;
+    const diff = `diff --git a/src/math.js b/src/math.js
+--- a/src/math.js
++++ b/src/math.js
+@@ -10,10 +10,10 @@
+-    return a + b;
++    return a + b * 2;`;
+
+    // Static analysis with exact stack frame matching diff range, NO reproductionResult or coverageLines
+    const analysisExact = analyzeIncident(errorOutputExact, diff);
+    assert.ok(analysisExact.candidates.length > 0);
+    const topExact = analysisExact.candidates[0];
+    assert.strictEqual(topExact.filePath, 'src/math.js');
+    assert.strictEqual(topExact.evidenceStrength, 'HIGH', 'Exact stack frame + diff range should have HIGH static evidence strength');
+
+    // Mandated by user requirement 1: Without execution evidence, causeVerdict MUST be LIKELY, NOT CONFIRMED!
+    assert.strictEqual(analysisExact.causeVerdict, 'LIKELY', 'Static score alone must be capped at LIKELY without execution evidence');
+    assert.strictEqual(topExact.causeVerdict, 'LIKELY');
+    assert.strictEqual(topExact.hasExecutionEvidence, false);
+    assert.ok(
+      analysisExact.missingEvidenceChecklist?.some((item) => item.includes('run_reproduction')),
+      'Must guide agent to run reproduction test'
+    );
+
+    // Frame in same file but different line (e.g. line 15), static score is MEDIUM (45), yields LIKELY
+    const errorOutputFileMatch = `AssertionError: value mismatch
+    at test (src/math.js:15:3)`;
+    const analysisFileMatch = analyzeIncident(errorOutputFileMatch, diff);
+    const topFileMatch = analysisFileMatch.candidates[0];
+    assert.strictEqual(topFileMatch.evidenceStrength, 'MEDIUM');
+    assert.strictEqual(analysisFileMatch.causeVerdict, 'LIKELY');
+    assert.notStrictEqual(analysisFileMatch.causeVerdict, 'CONFIRMED');
+  });
+
+  test('45. Step-3-Check: run_reproduction executes in isolated worktree and records REPRODUCED execution evidence', async () => {
+    // 1. Create a Python repo to test non-JS language execution
+    const pyRepo = path.join(testRoot, 'python_repro_repo');
+    fs.mkdirSync(path.join(pyRepo, 'src'), { recursive: true });
+    execFileSync('git', ['init', '-b', 'main'], { cwd: pyRepo });
+    execFileSync('git', ['config', 'user.name', 'Tester'], { cwd: pyRepo });
+    execFileSync('git', ['config', 'user.email', 'test@local'], { cwd: pyRepo });
+
+    fs.writeFileSync(path.join(pyRepo, 'src', 'calc.py'), 'def add(a, b):\n    return a - b  # Bug!\n');
+    execFileSync('git', ['add', '.'], { cwd: pyRepo });
+    execFileSync('git', ['commit', '-m', 'Init python calc'], { cwd: pyRepo });
+
+    // Confirm test runner in project settings
+    core.updateProjectSettings(pyRepo, { testCommand: 'python -m unittest' });
+
+    // Collect an incident
+    const inc = await core.collectIncidentBundle(pyRepo, '덧셈 버그 발생', 'AssertionError: 2 != 0');
+
+    // Create a reproduction test in the host repo
+    const reproFile = 'test_repro.py';
+    fs.writeFileSync(
+      path.join(pyRepo, reproFile),
+      `import unittest
+from src.calc import add
+
+class TestRepro(unittest.TestCase):
+    def test_add_repro(self):
+        self.assertEqual(add(1, 1), 2)
+
+if __name__ == '__main__':
+    unittest.main()
+`
+    );
+
+    // Call runReproduction with reproduction test file
+    const reproResult = await core.runReproduction(pyRepo, inc.id, reproFile);
+
+    assert.strictEqual(reproResult.status, 'REPRODUCED', 'Bug should be successfully reproduced by failing assertion');
+    assert.ok(reproResult.output.includes('AssertionError') || reproResult.output.includes('FAIL'));
+
+    // Check that incident in DB now contains reproductionResult and causeVerdict is updated
+    const updatedInc = core.getDatabase().getIncident(inc.id)!;
+    assert.ok(updatedInc.reproductionResult);
+    assert.strictEqual(updatedInc.reproductionResult.status, 'REPRODUCED');
+    assert.ok(updatedInc.causeEvidence?.some((e) => e.includes('[실행 증거]')));
+  });
+
+  test('46. Step-3-Check: Execution evidence elevates causeVerdict to CONFIRMED and tags reasons', () => {
+    const errorOutput = `AssertionError: value mismatch
+    at test (src/math.js:10:3)`;
+    const diff = `diff --git a/src/math.js b/src/math.js
+--- a/src/math.js
++++ b/src/math.js
+@@ -10,10 +10,10 @@
++    return a + b * 2;`;
+
+    // Incident with reproduction test execution evidence matching src/math.js
+    const incidentWithRepro = {
+      reproductionResult: {
+        status: 'REPRODUCED' as const,
+        command: 'node repro.test.js',
+        exitCode: 1,
+        output: 'AssertionError: expected 4 got 2 at src/math.js:15',
+        failedLocation: { filePath: 'src/math.js', line: 15 },
+        executedAt: new Date().toISOString(),
+      },
+    };
+
+    const analysis = analyzeIncident(errorOutput, diff, undefined, 'project', 'HEAD', incidentWithRepro);
+    assert.strictEqual(analysis.causeVerdict, 'CONFIRMED', 'Execution evidence must elevate causeVerdict to CONFIRMED');
+    const top = analysis.candidates[0];
+    assert.strictEqual(top.causeVerdict, 'CONFIRMED');
+    assert.strictEqual(top.hasExecutionEvidence, true);
+
+    // Check tags: [스택], [변경], [재현]
+    assert.ok(top.supportingEvidence.some((e) => e.startsWith('[스택]')), 'Must include [스택] tag');
+    assert.ok(top.supportingEvidence.some((e) => e.startsWith('[변경]')), 'Must include [변경] tag');
+    assert.ok(top.supportingEvidence.some((e) => e.startsWith('[재현]')), 'Must include [재현] tag');
+  });
+
+  test('47. Step-3-Check: Coverage execution evidence elevates causeVerdict and demotes unexecuted candidates (주입 데이터)', () => {
+    const errorOutput = `FAIL test.js`;
+    const diff = `diff --git a/src/a.js b/src/a.js
+--- a/src/a.js
++++ b/src/a.js
+@@ -1,3 +1,3 @@
++const a = 1;
+diff --git a/src/b.js b/src/b.js
+--- a/src/b.js
++++ b/src/b.js
+@@ -1,3 +1,3 @@
++const b = 2;`;
+
+    // Incident with coverage lines: failing test executed src/a.js lines, but NEVER executed src/b.js
+    const incidentWithCoverage = {
+      enableCoverage: true,
+      coverageLines: {
+        'src/a.js': [1, 2, 3],
+      },
+    };
+
+    const analysis = analyzeIncident(errorOutput, diff, undefined, 'project', 'HEAD', incidentWithCoverage);
+    const candidateA = analysis.candidates.find((c) => c.filePath === 'src/a.js')!;
+    const candidateB = analysis.candidates.find((c) => c.filePath === 'src/b.js')!;
+
+    // src/a.js has coverage execution evidence
+    assert.ok(candidateA.supportingEvidence.some((e) => e.startsWith('[커버리지]')));
+    // src/b.js was never covered and has counterEvidence demoting it
+    assert.ok(candidateB.counterEvidence.some((e) => e.includes('한 번도 실행하지 않음')));
+    assert.ok(candidateA.score > candidateB.score, 'Covered file must rank higher than unexecuted file');
+  });
+
+  test('48. Step-3-Check: Non-reproduced (exit 0) yields NOT_REPRODUCED and non-runnable yields CANNOT_RUN', async () => {
+    const jsRepo = path.join(testRoot, 'js_repro_status_repo');
+    fs.mkdirSync(jsRepo, { recursive: true });
+    execFileSync('git', ['init', '-b', 'main'], { cwd: jsRepo });
+    execFileSync('git', ['config', 'user.name', 'Tester'], { cwd: jsRepo });
+    execFileSync('git', ['config', 'user.email', 'test@local'], { cwd: jsRepo });
+
+    fs.writeFileSync(path.join(jsRepo, 'app.js'), 'module.exports = 42;\n');
+    fs.writeFileSync(path.join(jsRepo, 'pass_test.js'), 'process.exit(0);\n');
+    execFileSync('git', ['add', '.'], { cwd: jsRepo });
+    execFileSync('git', ['commit', '-m', 'Init app'], { cwd: jsRepo });
+
+    const inc = await core.collectIncidentBundle(jsRepo, '상태 판정 사건');
+
+    // 1. Without confirmed test runner -> CANNOT_RUN
+    const noRunnerResult = await core.runReproduction(jsRepo, inc.id, 'pass_test.js');
+    assert.strictEqual(noRunnerResult.status, 'CANNOT_RUN');
+    assert.ok(noRunnerResult.output.includes('확정된 테스트 러너가 없습니다'));
+
+    // 2. User confirms test runner (e.g. node)
+    core.updateProjectSettings(jsRepo, { testCommand: 'node' });
+
+    // 3. Passing test file -> NOT_REPRODUCED
+    const passResult = await core.runReproduction(jsRepo, inc.id, 'pass_test.js');
+    assert.strictEqual(passResult.status, 'NOT_REPRODUCED');
+
+    // 4. Non-existent test file -> CANNOT_RUN
+    const nonExistentResult = await core.runReproduction(jsRepo, inc.id, 'non_existent_file_xyz.js');
+    assert.strictEqual(nonExistentResult.status, 'CANNOT_RUN');
+    assert.ok(nonExistentResult.output.includes('존재하지 않습니다'));
+
+    // 5. Shell command injection attempt -> CANNOT_RUN
+    const injectionResult = await core.runReproduction(jsRepo, inc.id, 'pass_test.js; exit 1');
+    assert.strictEqual(injectionResult.status, 'CANNOT_RUN');
+    assert.ok(injectionResult.output.includes('유효하지 않은 테스트 파일 경로'));
+  });
+
+  test('49. Step-3-Fixture 1: Python project known bug localization and cause certainty check', async () => {
+    const fixtureRepo = path.join(testRoot, 'fixture_python_known_bug');
+    fs.mkdirSync(path.join(fixtureRepo, 'src'), { recursive: true });
+    fs.mkdirSync(path.join(fixtureRepo, 'tests'), { recursive: true });
+    execFileSync('git', ['init', '-b', 'main'], { cwd: fixtureRepo });
+    execFileSync('git', ['config', 'user.name', 'Tester'], { cwd: fixtureRepo });
+    execFileSync('git', ['config', 'user.email', 'test@local'], { cwd: fixtureRepo });
+
+    // Known bug in src/calc.py: line 4 has the bug (calculates 2x tax instead of 1x)
+    const code = [
+      'def calculate_tax(amount, rate):',
+      '    if rate < 0:',
+      '        raise ValueError("Invalid rate")',
+      '    return amount * rate * 2  # Known bug on line 4',
+      'def is_valid_rate(rate):',
+      '    return rate >= 0',
+    ].join('\n') + '\n';
+    fs.writeFileSync(path.join(fixtureRepo, 'src', 'calc.py'), code);
+
+    execFileSync('git', ['add', '.'], { cwd: fixtureRepo });
+    execFileSync('git', ['commit', '-m', 'Initial commit with known Python bug'], { cwd: fixtureRepo });
+
+    const diff = `diff --git a/src/calc.py b/src/calc.py
+--- a/src/calc.py
++++ b/src/calc.py
+@@ -4,1 +4,1 @@
+-    return amount * rate
++    return amount * rate * 2  # Known bug on line 4
+`;
+
+    // Python traceback pointing directly to line 4
+    const errorOutput = `Traceback (most recent call last):
+  File "tests/test_calc.py", line 12, in test_tax
+    self.assertEqual(calculate_tax(100, 0.1), 10.0)
+  File "src/calc.py", line 4, in calculate_tax
+    return amount * rate * 2
+AssertionError: 20.0 != 10.0`;
+
+    // Run analyzer WITHOUT execution evidence
+    const analysis = analyzeIncident(errorOutput, diff, fixtureRepo, 'py-fixture', 'HEAD');
+
+    // 1. Known bug line/file must be in top 5 candidates
+    assert.ok(analysis.candidates.length > 0, 'Must produce candidates');
+    const top5 = analysis.candidates.slice(0, 5);
+    const foundBugCandidate = top5.find(
+      (c) => c.filePath.includes('src/calc.py') && c.ranges.some((r) => 4 >= r.start && 4 <= r.end)
+    );
+    assert.ok(foundBugCandidate, 'Known bug at src/calc.py line 4 must be among top 5 candidates');
+
+    // 2. Without execution evidence, causeVerdict must NOT be CONFIRMED (must be capped at LIKELY)
+    assert.notStrictEqual(analysis.causeVerdict, 'CONFIRMED', 'Must not be CONFIRMED without execution evidence');
+    assert.strictEqual(analysis.causeVerdict, 'LIKELY');
+  });
+
+  test('50. Step-3-Fixture 2: JavaScript project known bug localization and cause certainty check', async () => {
+    const fixtureRepo = path.join(testRoot, 'fixture_js_known_bug');
+    fs.mkdirSync(path.join(fixtureRepo, 'src'), { recursive: true });
+    execFileSync('git', ['init', '-b', 'main'], { cwd: fixtureRepo });
+    execFileSync('git', ['config', 'user.name', 'Tester'], { cwd: fixtureRepo });
+    execFileSync('git', ['config', 'user.email', 'test@local'], { cwd: fixtureRepo });
+
+    // Known bug in src/formatter.js: line 4 has the bug
+    const code = [
+      'function formatPrice(amount, currency) {',
+      '  if (amount < 0) return "Invalid";',
+      '  // Known bug on line 4: multiplier bug',
+      '  return currency + " " + (amount * 100);',
+      '}',
+      'module.exports = { formatPrice };',
+    ].join('\n') + '\n';
+    fs.writeFileSync(path.join(fixtureRepo, 'src', 'formatter.js'), code);
+
+    execFileSync('git', ['add', '.'], { cwd: fixtureRepo });
+    execFileSync('git', ['commit', '-m', 'Initial commit with known JS bug'], { cwd: fixtureRepo });
+
+    const diff = `diff --git a/src/formatter.js b/src/formatter.js
+--- a/src/formatter.js
++++ b/src/formatter.js
+@@ -4,1 +4,1 @@
+-  return currency + " " + amount;
++  return currency + " " + (amount * 100);
+`;
+
+    const errorOutput = `AssertionError [ERR_ASSERTION]: Expected 'USD 10' but got 'USD 1000'
+    at TestContext.<anonymous> (test/formatter.test.js:8:12)
+    at Object.formatPrice (src/formatter.js:4:27)
+    at runTest (node:internal/test_runner/test:42:10)`;
+
+    // Run analyzer WITHOUT execution evidence
+    const analysis = analyzeIncident(errorOutput, diff, fixtureRepo, 'js-fixture', 'HEAD');
+
+    // 1. Known bug line/file must be in top 5 candidates
+    assert.ok(analysis.candidates.length > 0, 'Must produce candidates');
+    const top5 = analysis.candidates.slice(0, 5);
+    const foundBugCandidate = top5.find(
+      (c) => c.filePath.includes('src/formatter.js') && c.ranges.some((r) => 4 >= r.start && 4 <= r.end)
+    );
+    assert.ok(foundBugCandidate, 'Known bug at src/formatter.js line 4 must be among top 5 candidates');
+
+    // 2. Without execution evidence, causeVerdict must NOT be CONFIRMED (must be capped at LIKELY)
+    assert.notStrictEqual(analysis.causeVerdict, 'CONFIRMED', 'Must not be CONFIRMED without execution evidence');
+    assert.strictEqual(analysis.causeVerdict, 'LIKELY');
+  });
+
+  test('51. Step-3-Fixture 3: C++ project known bug localization and cause certainty check', async (t) => {
+    // Check if a C++ compiler exists on the host machine
+    let cppCompiler: string | null = null;
+    for (const bin of ['g++', 'clang++', 'cl']) {
+      try {
+        const checkCmd = process.platform === 'win32' ? `where.exe ${bin}` : `which ${bin}`;
+        execSync(checkCmd, { stdio: 'pipe' });
+        cppCompiler = bin;
+        break;
+      } catch {}
+    }
+
+    if (!cppCompiler) {
+      t.skip('C++ 컴파일러(g++, clang++, cl)가 호스트 환경에 없어 건너뜀');
+      return;
+    }
+
+    // If compiler is available:
+    const fixtureRepo = path.join(testRoot, 'fixture_cpp_known_bug');
+    fs.mkdirSync(path.join(fixtureRepo, 'src'), { recursive: true });
+    execFileSync('git', ['init', '-b', 'main'], { cwd: fixtureRepo });
+    execFileSync('git', ['config', 'user.name', 'Tester'], { cwd: fixtureRepo });
+    execFileSync('git', ['config', 'user.email', 'test@local'], { cwd: fixtureRepo });
+
+    const code = [
+      '#include <iostream>',
+      'int calculate_area(int w, int h) {',
+      '    return w + h; // Bug on line 3: should be w * h',
+      '}',
+    ].join('\n') + '\n';
+    fs.writeFileSync(path.join(fixtureRepo, 'src', 'matrix.cpp'), code);
+    execFileSync('git', ['add', '.'], { cwd: fixtureRepo });
+    execFileSync('git', ['commit', '-m', 'Initial commit with known C++ bug'], { cwd: fixtureRepo });
+
+    const diff = `diff --git a/src/matrix.cpp b/src/matrix.cpp
+--- a/src/matrix.cpp
++++ b/src/matrix.cpp
+@@ -3,1 +3,1 @@
+-    return w * h;
++    return w + h; // Bug on line 3: should be w * h
+`;
+
+    const errorOutput = `src/matrix.cpp:3: Failure
+Expected equality of these values:
+  calculate_area(5, 4)
+    Which is: 9
+  20`;
+
+    const analysis = analyzeIncident(errorOutput, diff, fixtureRepo, 'cpp-fixture', 'HEAD');
+    const top5 = analysis.candidates.slice(0, 5);
+    const foundBugCandidate = top5.find(
+      (c) => c.filePath.includes('src/matrix.cpp') && c.ranges.some((r) => 3 >= r.start && 3 <= r.end)
+    );
+    assert.ok(foundBugCandidate, 'Known bug at src/matrix.cpp line 3 must be among top 5 candidates');
+    assert.notStrictEqual(analysis.causeVerdict, 'CONFIRMED', 'Must not be CONFIRMED without execution evidence');
+    assert.strictEqual(analysis.causeVerdict, 'LIKELY');
   });
 });

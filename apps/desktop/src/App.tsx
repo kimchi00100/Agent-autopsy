@@ -701,6 +701,21 @@ export default function App() {
           </div>
         )}
 
+        {overview && (!overview.project.sensitivePaths || overview.project.sensitivePaths.length === 0) && view !== 'settings' && (
+          <div className="bg-slate-50 border-b border-slate-200 px-7 py-2 text-xs text-slate-700 flex items-center justify-between">
+            <div className="flex items-center gap-2">
+              <ShieldAlert className="h-4 w-4 text-amber-500 shrink-0" />
+              <span>민감 경로가 지정되지 않아 위험도가 변경 줄 수와 검증 실패 횟수로만 판정됩니다</span>
+            </div>
+            <button
+              className="text-[11px] font-medium text-blue-600 hover:underline shrink-0"
+              onClick={() => setView('settings')}
+            >
+              민감 경로 설정 &gt;
+            </button>
+          </div>
+        )}
+
         {overview && !overview.project.testCommandSignature && view !== 'settings' && (
           <div className="bg-amber-50 border-b border-amber-200 px-7 py-2.5 text-xs text-amber-900 flex items-center justify-between">
             <div className="flex items-center gap-2">
@@ -1217,6 +1232,12 @@ export default function App() {
                         </span>
                       ))}
                     </div>
+                    {sensitivePaths.length === 0 && (
+                      <div className="mt-2 rounded-lg bg-amber-50/80 border border-amber-200 p-2.5 text-xs text-amber-900 flex items-center gap-2">
+                        <ShieldAlert className="h-4 w-4 text-amber-600 shrink-0" />
+                        <span>민감 경로가 지정되지 않아 위험도가 변경 줄 수와 검증 실패 횟수로만 판정됩니다</span>
+                      </div>
+                    )}
                     <div className="mt-2 flex gap-2">
                       <input
                         type="text"
@@ -1246,6 +1267,18 @@ export default function App() {
                         경로 추가
                       </Button>
                     </div>
+                  </div>
+
+                  <div className="pt-3 border-t border-slate-100 flex items-center justify-between">
+                    <div>
+                      <div className="text-xs font-semibold text-slate-700">커버리지 정밀 분석 (LCOV 기반)</div>
+                      <p className="text-[11px] text-slate-500 mt-0.5">
+                        테스트 실패/성공 시 실행된 줄을 비교하여 결함 위치를 특정하는 분석입니다.
+                      </p>
+                    </div>
+                    <span className="rounded bg-slate-100 border border-slate-200 text-slate-500 px-2.5 py-1 text-xs font-medium shrink-0">
+                      아직 지원 안 함
+                    </span>
                   </div>
 
                   <div className="pt-3 border-t border-slate-100 flex items-center justify-between">

@@ -744,6 +744,50 @@ server.tool(
   }
 );
 
+/**
+ * Tool 13: run_reproduction
+ * Runs an agent-provided reproduction test file in an isolated worktree using the user-confirmed test runner
+ * and records the execution evidence for an incident.
+ */
+server.tool(
+  'run_reproduction',
+  'Runs a reproduction test file created by the agent in an isolated worktree using the user-confirmed test runner to verify whether the incident is reproduced. Records the execution evidence ("REPRODUCED", "NOT_REPRODUCED", or "CANNOT_RUN") on the incident. Only relative file paths are accepted (arbitrary shell commands are rejected).',
+  {
+    incidentId: z.string().describe('ID of the incident to run reproduction for'),
+    testFilePath: z.string().describe('Relative path to the reproduction test file in the repository (e.g. "tests/test_repro.py" or "test/repro.test.js"). Only file paths are allowed; tests are executed using the user-confirmed test runner.'),
+    testCommandOrFile: z.string().optional().describe('Deprecated fallback: please provide testFilePath instead'),
+    repoPath: z.string().optional().describe('Root path of the git repository (defaults to current directory)'),
+  },
+  async ({ incidentId, testFilePath, testCommandOrFile, repoPath }) => {
+    try {
+      const targetPath = resolvePath(repoPath);
+      const filePath = testFilePath || testCommandOrFile || '';
+      const result = await coreManager.runReproduction(targetPath, incidentId, filePath);
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify(
+              {
+                success: true,
+                message: `Reproduction test completed with status: ${result.status}`,
+                reproduction: result,
+              },
+              null,
+              2
+            ),
+          },
+        ],
+      };
+    } catch (error: any) {
+      return {
+        isError: true,
+        content: [{ type: 'text', text: `Failed to run reproduction: ${error.message}` }],
+      };
+    }
+  }
+);
+
 // Start stdio transport
 async function main() {
   const transport = new StdioServerTransport();

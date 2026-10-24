@@ -225,26 +225,89 @@ function collectSymbols(line: string, into: Set<string>): void {
   }
 }
 
+export interface StackTracePattern {
+  name: string;
+  pattern: RegExp;
+  extract: (match: RegExpExecArray) => { filePath: string; line: number } | null;
+}
+
+export const STACK_TRACE_PATTERNS: StackTracePattern[] = [
+  // 1. Python traceback: File "tests/test_calc.py", line 12, in test_add
+  {
+    name: 'Python Traceback',
+    pattern: /File "([^"]+)", line (\d+)/g,
+    extract: (m) => ({ filePath: m[1], line: Number(m[2]) }),
+  },
+  // 2. JS / Node / TS: at Object.<anonymous> (test/calc.test.js:12:5) or at test/calc.test.js:12:5
+  {
+    name: 'JavaScript / TypeScript',
+    pattern: /(?:(?:^|\s)at (?:[^\n()]+ \()?|^\s*at\s+)((?:[A-Za-z]:)?[^\s()'"<>|:*?]+\.(?:[cm]?[jt]sx?)):(\d+)(?::\d+)?\)?/gm,
+    extract: (m) => ({ filePath: m[1], line: Number(m[2]) }),
+  },
+  // 3. C / C++ Compiler (GCC, Clang): src/calc.c:25:5: error: ...
+  {
+    name: 'C/C++ Compiler (GCC/Clang)',
+    pattern: /(?:^|\n)((?:[A-Za-z]:)?[^\s()'"<>|:*?]+\.(?:c|cc|cpp|cxx|h|hpp)):(\d+)(?::\d+)?: (?:fatal error|error|warning):/g,
+    extract: (m) => ({ filePath: m[1], line: Number(m[2]) }),
+  },
+  // 4. GoogleTest: test/calc_test.cpp:15: Failure
+  {
+    name: 'GoogleTest',
+    pattern: /(?:^|\n)((?:[A-Za-z]:)?[^\s()'"<>|:*?]+\.(?:cc|cpp|cxx|h|hpp|c)):(\d+): Failure/g,
+    extract: (m) => ({ filePath: m[1], line: Number(m[2]) }),
+  },
+  // 5. C/C++ Sanitizer / ASan / UBSan: #0 0x401234 in main src/calc.c:42:10
+  {
+    name: 'C/C++ Sanitizer (ASan/UBSan)',
+    pattern: /(?:#\d+\s+0x[0-9a-fA-F]+\s+in\s+\S+\s+|\bin\s+)((?:[A-Za-z]:)?[^\s()'"<>|:*?]+\.(?:c|cc|cpp|cxx|h|hpp)):(\d+)/g,
+    extract: (m) => ({ filePath: m[1], line: Number(m[2]) }),
+  },
+  // 6. Java / Kotlin: at com.example.CalcTest.testDiv(CalcTest.java:34)
+  {
+    name: 'Java / Kotlin',
+    pattern: /at\s+[\w.$]+\((?:.*[/\\])?([^\s():]+\.(?:java|kt)):(\d+)\)/g,
+    extract: (m) => ({ filePath: m[1], line: Number(m[2]) }),
+  },
+  // 7. Go: \tsrc/calc_test.go:28 +0x5a
+  {
+    name: 'Go',
+    pattern: /(?:^|\s)((?:[A-Za-z]:)?[^\s()'"<>|:*?]+\.go):(\d+)(?:\s+\+0x[0-9a-fA-F]+)?/gm,
+    extract: (m) => ({ filePath: m[1], line: Number(m[2]) }),
+  },
+  // 8. Rust: --> tests/calc_test.rs:18:9 or at tests/calc_test.rs:18
+  {
+    name: 'Rust',
+    pattern: /(?:-->|at)\s+((?:[A-Za-z]:)?[^\s()'"<>|:*?]+\.rs):(\d+)(?::\d+)?/g,
+    extract: (m) => ({ filePath: m[1], line: Number(m[2]) }),
+  },
+  // 9. Generic File Line Fallback: path/to/file.ext:line(:col)
+  {
+    name: 'Generic File Line',
+    pattern: /(?:^|[\s('"<[])((?:[A-Za-z]:)?[^\s()'"<>|:*?]+\.(?:[cm]?[jt]sx?|py|rs|go|java|kt|c|cc|cpp|cxx|h|hpp|cs)):(\d+)(?::\d+)?(?:$|[\s)'">\]])/gm,
+    extract: (m) => ({ filePath: m[1], line: Number(m[2]) }),
+  },
+];
+
 export function parseStackFrames(errorOutput: string): StackFrame[] {
   const frames: StackFrame[] = [];
   const seen = new Set<string>();
   const push = (filePath: string, line: number) => {
     const normalized = filePath.replace(/\\/g, '/').replace(/^file:\/\/\//, '');
-    const key = `${normalized}:${line}`;
+    const key = `${normalized.toLowerCase()}:${line}`;
     if (!seen.has(key) && !normalized.includes('node_modules') && !normalized.startsWith('node:')) {
       seen.add(key);
       frames.push({ filePath: normalized, line });
     }
   };
 
-  const patterns: RegExp[] = [
-    /\(?((?:[A-Za-z]:)?[^\s()'"<>|:*?]+\.(?:[cm]?[jt]sx?|py|rs|go|java|cs)):(\d+)(?::\d+)?\)?/g,
-    /File "([^"]+)", line (\d+)/g,
-  ];
-  for (const re of patterns) {
+  for (const entry of STACK_TRACE_PATTERNS) {
+    const re = new RegExp(entry.pattern.source, entry.pattern.flags);
     let m: RegExpExecArray | null;
     while ((m = re.exec(errorOutput)) !== null) {
-      push(m[1], Number(m[2]));
+      const extracted = entry.extract(m);
+      if (extracted && extracted.filePath && !isNaN(extracted.line) && extracted.line > 0) {
+        push(extracted.filePath, extracted.line);
+      }
     }
   }
   return frames;
@@ -316,29 +379,66 @@ export function analyzeIncident(
     if (exactFrame) {
       score += 85;
       supportingEvidence.push(
-        `테스트 스택트레이스의 ${exactFrame.line}번째 줄과 변경된 코드 줄 범위가 직접 일치`
+        `[스택] ${path.basename(exactFrame.filePath)}:${exactFrame.line} (변경된 코드 줄 범위와 직접 일치)`
       );
       counterEvidence.push('에러 발생 줄은 일치하나 상위 호출부(Caller)의 인자 전달 부작용 가능성 있음');
     } else if (frames.length > 0) {
       score += 45;
       supportingEvidence.push(
-        `오류 스택트레이스에 ${path.basename(file.filePath)}:${frames[0].line} 이(가) 포함됨`
+        `[스택] ${path.basename(file.filePath)}:${frames[0].line} (오류 스택트레이스에 포함됨)`
       );
       counterEvidence.push('스택트레이스에는 등장하나 이번에 직접 수정된 줄 범위와는 겹치지 않음');
     } else {
       counterEvidence.push('오류 스택트레이스에 해당 파일이 직접 등장하지 않음');
     }
 
+    const totalDiff = file.addedLines + file.removedLines;
+    if (totalDiff > 0) {
+      supportingEvidence.push(`[변경] 최근 체크포인트 이후 ${totalDiff}줄 수정됨 (+${file.addedLines}/-${file.removedLines})`);
+    }
+
+    if (incident?.reproductionResult) {
+      const repro = incident.reproductionResult;
+      if (repro.status === 'REPRODUCED') {
+        if (repro.failedLocation && samePath(file.filePath, repro.failedLocation.filePath)) {
+          score += 90;
+          supportingEvidence.push(
+            `[재현] 에이전트가 만든 재현 테스트가 이 줄(${repro.failedLocation.line}행)에서 실패함 (${repro.command})`
+          );
+        } else {
+          score += 35;
+          supportingEvidence.push(
+            `[재현] 에이전트가 만든 재현 테스트 실행으로 실패 재현됨 (${repro.command})`
+          );
+        }
+      } else if (repro.status === 'NOT_REPRODUCED') {
+        counterEvidence.push(`[재현] 에이전트가 작성한 재현 테스트에서 실패가 재현되지 않음 (${repro.command})`);
+      } else {
+        counterEvidence.push(`[재현] 재현 테스트 실행 불가 (${repro.command})`);
+      }
+    }
+
+    if (incident?.coverageLines) {
+      const covered = incident.coverageLines[file.filePath];
+      if (covered && covered.length > 0) {
+        score += 50;
+        supportingEvidence.push(`[커버리지] 실패 테스트가 실행함 (${covered.length}줄 실행 확인)`);
+      } else if (incident.enableCoverage) {
+        score = Math.max(10, score - 30);
+        counterEvidence.push('[커버리지] 실패 테스트가 이 파일을 한 번도 실행하지 않음 (순위 하향)');
+      }
+    }
+
     const hitSymbols = file.symbols.filter((s) => new RegExp(`\\b${escapeRegExp(s)}\\b`).test(errorOutput));
     if (hitSymbols.length > 0) {
       score += 25;
-      supportingEvidence.push(`오류 출력에 변경된 심볼(${hitSymbols.slice(0, 3).join(', ')})이 직접 언급됨`);
+      supportingEvidence.push(`[심볼] 오류 출력에 변경된 심볼(${hitSymbols.slice(0, 3).join(', ')})이 직접 언급됨`);
     }
 
     const base = path.basename(file.filePath, path.extname(file.filePath));
     if (frames.length === 0 && base.length > 2 && new RegExp(`\\b${escapeRegExp(base)}\\b`).test(errorOutput)) {
       score += 15;
-      supportingEvidence.push(`오류 로그에서 모듈 이름 "${base}" 이(가) 언급됨`);
+      supportingEvidence.push(`[모듈] 오류 로그에서 모듈 이름 "${base}" 이(가) 언급됨`);
     }
 
     if (repoRoot && frames.length === 0) {
@@ -350,7 +450,7 @@ export function analyzeIncident(
             const importRe = new RegExp(`(?:require|import)[^\\n]*['"][^'"]*${escapeRegExp(base)}(?:\\.[a-z]+)?['"]`);
             if (importRe.test(src)) {
               score += 25;
-              supportingEvidence.push(`실패 지점 모듈(${path.basename(f.filePath)})이 이 파일(${base})을 직접 참조함`);
+              supportingEvidence.push(`[참조] 실패 지점 모듈(${path.basename(f.filePath)})이 이 파일(${base})을 직접 참조함`);
               break;
             }
           }
@@ -501,26 +601,52 @@ export function analyzeIncident(
   let causeVerdict: CauseVerdict = incident?.causeVerdict || 'UNKNOWN';
   const missingEvidenceChecklist: string[] = [];
 
-  // 2단계 원인 확신도 판정: 오류 출력이 났다는 사실만으로 CONFIRMED를 주지 않음.
-  // 오류가 났다는 사실은 원인 확정이 아니며, 확신도는 3단계의 실행 증거(재현 테스트, 실행된 줄, 실패 위치)로만 올림.
-  if (
+  // 3단계 원인 확신도 판정:
+  // CONFIRMED는 오직 '실행 증거'가 있을 때만 부여한다:
+  //  1) 재현 테스트가 실패를 재현(REPRODUCED)했고, 실패 위치가 후보 파일/줄과 일치하거나,
+  //  2) 커버리지에서 실패 테스트가 해당 줄을 실행한 경우.
+  // 정적 점수(evidenceStrength HIGH)만 높으면 최대 LIKELY로 제한된다.
+  const hasReproExecutionEvidence = Boolean(
+    incident?.reproductionResult?.status === 'REPRODUCED' &&
     topCandidate &&
-    topCandidate.evidenceStrength === 'HIGH' &&
-    !topCandidate.temporalOnly &&
-    topCandidate.supportingEvidence.length >= 2
-  ) {
+    incident.reproductionResult.failedLocation &&
+    samePath(topCandidate.filePath, incident.reproductionResult.failedLocation.filePath)
+  );
+
+  const hasCoverageExecutionEvidence = Boolean(
+    incident?.coverageLines &&
+    topCandidate &&
+    incident.coverageLines[topCandidate.filePath] &&
+    incident.coverageLines[topCandidate.filePath].length > 0 &&
+    (
+      topCandidate.ranges.length === 0 ||
+      topCandidate.ranges.some((r) =>
+        incident.coverageLines![topCandidate.filePath].some((l) => l >= r.start && l <= r.end)
+      )
+    )
+  );
+
+  const hasExecutionEvidence = hasReproExecutionEvidence || hasCoverageExecutionEvidence;
+
+  if (hasExecutionEvidence && topCandidate && topCandidate.evidenceStrength !== 'LOW' && topCandidate.evidenceStrength !== 'UNKNOWN') {
     causeVerdict = 'CONFIRMED';
     topCandidate.causeVerdict = 'CONFIRMED';
+    topCandidate.hasExecutionEvidence = true;
   } else if (topCandidate && topCandidate.supportingEvidence.length > 0) {
     causeVerdict = 'LIKELY';
     topCandidate.causeVerdict = 'LIKELY';
-    missingEvidenceChecklist.push('호출부 인자 전달 및 상위 호출 체인에서의 상태 변이(State Mutation) 확인 권장');
-    if (topCandidate.evidenceStrength !== 'HIGH') {
-      missingEvidenceChecklist.push('정적 모듈 의존성 추론 상태이므로 격리 프로브 실행을 통한 입출력 검증 필요');
+    topCandidate.hasExecutionEvidence = false;
+    if (topCandidate.evidenceStrength === 'HIGH' && !hasExecutionEvidence) {
+      missingEvidenceChecklist.push(
+        '정적 점수(스택/변경)는 높으나 재현 테스트 또는 커버리지 실행 증거가 없어 LIKELY로 제한되었습니다. run_reproduction 도구로 재현 테스트를 실행하세요.'
+      );
     }
   } else {
     causeVerdict = 'UNKNOWN';
-    if (topCandidate) topCandidate.causeVerdict = 'UNKNOWN';
+    if (topCandidate) {
+      topCandidate.causeVerdict = 'UNKNOWN';
+      topCandidate.hasExecutionEvidence = false;
+    }
     missingEvidenceChecklist.push('스택트레이스 또는 로그에 직접 변경된 코드 줄 번호 증거가 없음');
     missingEvidenceChecklist.push('격리 환경에서의 재현 실행(입출력 값 대조 프로브) 증거 수집 필요');
     missingEvidenceChecklist.push('추측성 코드 수정을 중단하고 추가 로그나 테스트를 먼저 보강하세요');

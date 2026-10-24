@@ -1,15 +1,33 @@
 # Agent Autopsy 패키징 EXE 실기 동작 검증 절차서
 
-본 문서는 `apps/desktop/release/win-unpacked/AgentAutopsy.exe` 빌드 결과물을 기반으로, 사용자가 직접 전 과정을 단계별로 따라 하며 시스템의 핵심 안전 메커니즘을 점검할 수 있도록 구성된 수동 검증 매뉴얼입니다.
+본 문서는 `<procject 경로>\apps\desktop\release\win-unpacked\AgentAutopsy.exe` 빌드 결과물을 기반으로, 사용자가 직접 전 과정을 단계별로 따라 하며 시스템의 핵심 안전 메커니즘을 점검할 수 있도록 구성된 실기 검증 매뉴얼입니다.
 
 ---
 
-## 📋 사전 준비 사항
+## 📋 사전 준비: 독립 데모 프로젝트 생성
 
-- **빌드된 EXE 경로**: `C:\Users\xjwoz\OneDrive\Desktop\procject\apps\desktop\release\win-unpacked\AgentAutopsy.exe`
-- **번들된 MCP 서버 경로**: `C:\Users\xjwoz\OneDrive\Desktop\procject\apps\desktop\release\win-unpacked\resources\bundled\mcp-server.cjs`
-- **테스트용 예제 프로젝트**: `C:\Users\xjwoz\OneDrive\Desktop\procject\examples\shopping-cart`
-  - *참고*: 예제 프로젝트가 Git 저장소가 아닌 경우, 해당 폴더에서 한 번 `git init && git add . && git commit -m "Initial commit"`을 실행해 두세요.
+Agent Autopsy는 열린 폴더의 상위 `.git` 루트를 프로젝트 단위로 자동 인식하므로, `<procject 경로>` 내부의 `examples/shopping-cart`를 직접 열지 않고 **프로젝트 외부의 독립된 폴더**로 복사하여 Git 저장소를 초기화합니다.
+
+### 데모 폴더 복사 및 Git 초기화 (PowerShell)
+```powershell
+# 1. 바탕화면에 독립 검증용 폴더 생성
+New-Item -ItemType Directory -Path "$HOME\Desktop\autopsy-demo" -Force
+
+# 2. shopping-cart 예제 코드 복사
+Copy-Item -Recurse "<procject 경로>\examples\shopping-cart\*" "$HOME\Desktop\autopsy-demo\"
+
+# 3. 독립 Git 저장소 초기화 및 첫 커밋
+cd "$HOME\Desktop\autopsy-demo"
+git init -b main
+git config user.name "Tester"
+git config user.email "tester@local"
+git add .
+git commit -m "Initial commit: cart with WELCOME10 coupon bug"
+```
+
+- **데모 프로젝트 경로**: `%USERPROFILE%\Desktop\autopsy-demo`
+- **패키징된 EXE 경로**: `<procject 경로>\apps\desktop\release\win-unpacked\AgentAutopsy.exe`
+- **번들된 배포용 MCP 서버**: `<procject 경로>\apps\desktop\release\win-unpacked\resources\bundled\mcp-server.cjs`
 
 ---
 
@@ -17,33 +35,37 @@
 
 ### 1.1 실행 방법
 1. 파일 탐색기에서 아래 경로로 이동합니다:
-   `C:\Users\xjwoz\OneDrive\Desktop\procject\apps\desktop\release\win-unpacked\`
+   `<procject 경로>\apps\desktop\release\win-unpacked\`
 2. `AgentAutopsy.exe`를 더블 클릭하여 실행합니다.
 
 ### 1.2 무엇이 보이면 성공인가?
 - ✅ **즉각적인 창 로딩**: 1초 이내에 독립된 Electron 애플리케이션 창이 정상적으로 표시됩니다.
 - ✅ **로컬 백엔드 서버 연결 상태**:
-  - 화면 상단(또는 헤더 상태 표시줄)에 `포트 3847 연결됨` (또는 동적 할당 포트)과 함께 **초록색 상태 뱃지**가 표시됩니다.
+  - 화면 좌측 사이드바 하단의 **`로컬 MCP`** 카드에 초록색 점과 함께 **`실행 중`** 표시가 나타납니다.
+  - 백엔드 프로세스 오류 배너가 뜨지 않고 정상 대기 상태를 유지합니다.
 - ✅ **메인 대시보드 렌더링**:
-  - 좌측 사이드바에 프로젝트 목록 및 네비게이션(Overview, Repair, Diagnostics, Settings)이 나타납니다.
-  - 아직 프로젝트를 열지 않았다면 `"프로젝트를 열어 안전한 코딩을 시작하세요"` 안내 화면이 뜹니다.
+  - 좌측 사이드바에 6개 메인 메뉴(**`대시보드`**, **`사건 분석`**, **`작업 타임라인`**, **`코드 비교`**, **`복구 센터`**, **`프로젝트 설정`**)가 표시됩니다.
+  - 아직 프로젝트가 선택되지 않았다면 중앙에 `"시작하려면 프로젝트 폴더를 선택하세요"` 안내와 **`[프로젝트 폴더 선택]`** 버튼이 나타납니다.
 
 ---
 
-## 2단계: 예제 프로젝트 폴더 열기 및 테스트 명령 [확인/서명]
+## 2단계: 데모 프로젝트 폴더 열기 및 테스트 명령 [확인 및 서명]
 
-에이전트가 임의의 위험한 쉘 명령을 실행하지 못하도록 방지하는 **테스트 명령 사용자 확정(HMAC 서명)** 메커니즘을 확인합니다.
+에이전트가 임의의 위험한 쉘 명령을 실행하지 못하도록 방지하는 **테스트 명령 사용자 확정(HMAC 전자 서명)** 메커니즘을 확인합니다.
 
 ### 2.1 수행 방법
-1. 좌측 사이드바 상단의 **`[+ 프로젝트 열기]`** 버튼을 클릭합니다.
-2. 파일 선택 창에서 테스트용 예제 프로젝트 폴더(`C:\Users\xjwoz\OneDrive\Desktop\procject\examples\shopping-cart`)를 선택합니다.
-3. 프로젝트가 로드되면 상단에 노란색 주의 배너와 함께 탐지된 테스트 명령이 표시됩니다:
-   - 예: `자동 탐지된 테스트 명령: node test.js (미확정)`
-4. 명령 확인 창 또는 프로젝트 설정(Settings) 탭에서 해당 테스트 명령 옆의 **`[명령 확정]`** (또는 `[확인]`) 버튼을 클릭합니다.
+1. 화면 상단 헤더 우측의 **`[폴더 선택]`** 버튼(또는 중앙의 **`[프로젝트 폴더 선택]`** 버튼)을 클릭합니다.
+2. 폴더 선택 창에서 방금 준비한 독립 데모 폴더(`%USERPROFILE%\Desktop\autopsy-demo`)를 선택합니다.
+3. 프로젝트가 로드되면 상단에 노란색 경고 배너가 표시됩니다:
+   - `테스트 명령 미확정: 프로젝트 검증 테스트 명령이 서명되지 않았습니다. 격리 검증을 위해 사용자의 확인이 필요합니다.`
+4. 배너 우측의 **`[설정에서 확인하기]`** 버튼을 클릭하거나, 좌측 사이드바에서 **`프로젝트 설정`** 메뉴를 클릭합니다.
+5. `테스트 명령 (격리 검증용)` 카드에서 테스트 명령 입력창(`node test.js` 등) 우측의 **`[확인 및 서명]`** 버튼(또는 AI 제안이 있는 경우 **`[이 제안으로 확정 및 서명]`** 버튼)을 클릭합니다.
 
 ### 2.2 무엇이 보이면 성공인가?
 - ✅ **안전 서명 완료 상태**:
-  - 노란색 경고 배너가 사라지고, **초록색 체크 아이콘**과 함께 `테스트 명령이 안전하게 확정되었습니다 (서명 완료)` 문구가 표시됩니다.
+  - 상단 노란색 미확정 경고 배너가 즉시 사라집니다.
+  - 상태 배지가 노란색 `미확정 (확인 필요)`에서 초록색 **`확정됨 (서명 완료)`**로 바뀝니다.
+  - 하단에 초록색 방패 아이콘과 함께 `현재 명령: node test.js (HMAC 전자 서명 유효)` 문구가 표시됩니다.
   - 이로써 `X-Autopsy-Token` 세션 토큰을 통해 변조 불가능한 HMAC 서명이 로컬 DB에 영구 고정됩니다.
 
 ---
@@ -54,10 +76,10 @@
 
 ### 3.1 설정 파일 위치
 - 안티그래비티 글로벌 MCP 설정 파일:
-  **`C:\Users\xjwoz\.gemini\config\mcp_config.json`**
+  **`%USERPROFILE%\.gemini\config\mcp_config.json`**
 
 ### 3.2 넣을 내용 (JSON)
-`C:\Users\xjwoz\.gemini\config\mcp_config.json` 파일을 열고 `mcpServers` 항목에 아래 설정을 입력합니다:
+`%USERPROFILE%\.gemini\config\mcp_config.json` 파일을 열고 `mcpServers` 항목에 아래 설정을 입력합니다:
 
 ```json
 {
@@ -65,68 +87,71 @@
     "agent-autopsy": {
       "command": "node",
       "args": [
-        "C:\\Users\\xjwoz\\OneDrive\\Desktop\\procject\\apps\\desktop\\release\\win-unpacked\\resources\\bundled\\mcp-server.cjs"
+        "<procject 경로>\\apps\\desktop\\release\\win-unpacked\\resources\\bundled\\mcp-server.cjs"
       ],
       "env": {
-        "AUTOPSY_DATA_DIR": "C:\\Users\\xjwoz\\AppData\\Roaming\\AgentAutopsy"
+        "AUTOPSY_DATA_DIR": "%APPDATA%\\AgentAutopsy"
       }
     }
   }
 }
 ```
 
-> 💡 **참고**: `AgentAutopsy.exe` 앱의 대시보드 상단 또는 프로젝트 설정 화면에서 **`[MCP 설정 복사]`** 버튼을 클릭하면 클립보드에 위 설정 블록이 자동으로 생성되어 간편하게 붙여넣을 수 있습니다.
+> 💡 **참고**: `AgentAutopsy.exe` 앱의 좌측 사이드바 하단에 있는 **`로컬 MCP (실행 중)`** 카드를 클릭하면 **`코딩 에이전트 연결 (MCP)`** 팝업 창이 열립니다. 여기서 `Antigravity` 탭을 선택하고 **`[설정 복사]`** 버튼을 클릭하여 복사할 수도 있습니다.
 
 ### 3.3 무엇이 보이면 성공인가?
 - ✅ 안티그래비티 대화 세션에서 MCP 서버 목록을 조회할 때 `agent-autopsy`가 정상 로드됩니다.
-- ✅ 사용 가능한 MCP 도구 목록에 아래 17개 Agent Autopsy 공식 도구가 등록됩니다:
+- ✅ 사용 가능한 MCP 도구 목록에 아래 17개 Agent Autopsy 공식 도구가 활성화됩니다:
   `capture_checkpoint`, `inspect_project_state`, `collect_incident_bundle`, `propose_test_command`, `propose_and_verify_repair`, `apply_approved_repair`, `rollback_to_checkpoint`, `record_agent_event`, `submit_orchestration_review`, `request_review_challenge`, `await_user_decision`, `get_pending_directives`, `acknowledge_directive`, `run_reproduction`, `search_history`, `get_incident_attempts`, `get_changes_since_good_checkpoint`
+- ✅ `AgentAutopsy.exe` 앱 좌측 사이드바의 **`연결된 에이전트`** 영역에 안티그래비티 세션이 **`활성`** 상태(초록색 펄스 점)로 나타납니다.
 
 ---
 
 ## 4단계: 버그 신고 및 실시간(SSE) 대시보드 등록 확인
 
 ### 4.1 수행 방법
-안티그래비티 채팅창에 아래와 같이 `shopping-cart` 예제의 버그 증상을 구체적인 원문으로 신고합니다:
+안티그래비티 채팅창에 `%USERPROFILE%\Desktop\autopsy-demo` 프로젝트 경로를 지정하고 버그 증상을 구체적인 원문으로 신고합니다:
 
 > **사용자 입력 예시**:
-> "examples/shopping-cart 예제에서 calculateTotal에 WELCOME10 쿠폰을 적용하면 200원의 10%인 180원이 나와야 하는데 단순 10원만 차감되어 190원이 나옵니다. test.js를 실행해서 실패를 확인하고 원인을 찾아 수정해 주세요."
+> "내 바탕화면의 데모 프로젝트(%USERPROFILE%\Desktop\autopsy-demo)에서 cart.js의 calculateTotal에 WELCOME10 쿠폰을 적용하면 200원의 10%인 180원이 나와야 하는데 단순 10원만 차감되어 190원이 나옵니다. node test.js를 실행해서 실패를 확인하고 사건을 수집한 뒤 격리 검증으로 수정안을 제안해 주세요."
 
-안티그래비티는 내부적으로 `collect_incident_bundle` 도구를 호출하여 사건 번들을 패키징하고 등록합니다.
+안티그래비티는 `collect_incident_bundle` 도구를 호출하여 사건 번들을 패키징하고 등록합니다.
 
 ### 4.2 무엇이 보이면 성공인가?
 - ✅ **실시간(SSE) 무새로고침 반영**:
-  - `AgentAutopsy.exe` 앱 화면을 새로고침(F5)하지 않아도, 수 초 이내에 실시간 이벤트 수신과 함께 사건 알림 토스트가 뜨고 목록에 새 사건이 추가됩니다.
-- ✅ **좌우 대비 분할 화면 및 원문 강조**:
-  - 사건 클릭 시 좌측 **`User Report`** 박스에 사용자가 입력한 신고 원문이 그대로 표시되며, 의도와 일치하는 구절이 **노란색 형광펜(`mark`)으로 강조**됩니다.
-  - 우측 **`AI 의도 해석 및 출처 검증`** 박스에 4대 의도(기대 동작, 관찰 증상, 재현 조건, 검증 수단)가 파란색 **`USER_QUOTE`** 뱃지와 함께 나타납니다.
-  - 만약 원문이 제공되지 않은 경우 `"사용자 원문이 제공되지 않았습니다"` 및 `AI_INFERRED`로 정직하게 표기됩니다.
+  - `AgentAutopsy.exe` 화면을 새로고침(F5)하지 않아도, SSE 스트림을 통해 즉시 실시간 알림 토스트가 뜨고 좌측 사이드바의 **`사건 분석`** 메뉴 옆에 미해결 사건 카운트 배지(예: `1`)가 뜹니다.
+- ✅ **좌우 대비 분할 화면 및 원문 강조 (`사건 분석` 뷰)**:
+  - 좌측 **`User Report`** 박스에 사용자가 입력한 신고 원문이 그대로 표시되며, 의도와 일치하는 구절이 **노란색 형광펜(`<mark>`)으로 강조**됩니다.
+  - 우측 **`AI 의도 해석 및 출처 검증`** 박스에 4대 의도(기대 동작, 관찰 증상, 재현 조건, 검증 수단)가 파란색 **`USER_QUOTE`** 배지와 함께 나타납니다.
+  - 만약 원문이 제공되지 않고 등록된 경우 `"사용자 원문이 제공되지 않았습니다."` 이탤릭 문구와 함께 회색 `AI_INFERRED`로 표기됩니다.
 
 ---
 
 ## 5단계: 격리 검증 및 하드 승인 게이트(Human Gate) 확인
 
-에이전트가 제안한 패치가 작업공간을 직접 오염시키지 않고 격리 검증을 거치며, **오직 사람이 [승인] 버튼을 누를 때만** 실제 파일에 반영되는지 확인합니다.
+에이전트가 제안한 패치가 실제 작업공간 파일을 직접 건드리지 않고 격리 워크트리에서만 테스트되며, **오직 사용자가 [승인 및 복구 실행] 버튼을 누를 때만** 실제 파일에 반영되는지 확인합니다.
 
 ### 5.1 수행 방법
 1. 안티그래비티가 원인 분석 리포트와 함께 Search & Replace 수정안을 격리 워크트리에서 검증(`propose_and_verify_repair`)합니다.
-2. 에이전트의 검증 보고가 올라오면, **승인 버튼을 누르기 전에 실제 작업공간 파일을 직접 확인**합니다:
-   - 파일 탐색기나 에디터(VS Code 등)에서 `examples/shopping-cart/cart.js`를 열어봅니다.
-3. `AgentAutopsy.exe` 대시보드의 **`Repair (수정안 승인 검토)`** 탭으로 이동합니다:
-   - 제안된 수정 내용(Diff Viewer)과 격리 워크트리 3단계 검증 통과 로그(`VERIFIED_PASS`)를 확인합니다.
-4. 우측 상단의 초록색 **`[수정안 승인 및 적용]`** 버튼을 클릭합니다.
+2. 에이전트의 격리 검증 완료 보고가 올라오면, **승인 버튼을 누르기 전에 실제 작업공간 파일을 직접 확인**합니다:
+   - 메모장이나 에디터에서 `%USERPROFILE%\Desktop\autopsy-demo\cart.js`를 열어봅니다.
+3. (선택적 보안 검증) 만약 에이전트가 사용자 승인 없이 `apply_approved_repair`를 미리 호출하는 경우:
+   - 서버는 즉시 차단하며 아래의 실제 보안 위반 오류를 반환합니다:
+     ```
+     [SECURITY GATE VIOLATION]: Repair proposal "prop_xxxx" cannot be applied because its status is "UNAPPROVED". It must be explicitly approved by the user in Agent Autopsy first.
+     ```
+   - (외부에서 HTTP API를 직접 조작하려는 경우에도 유효한 세션 토큰이 없어 `401 Unauthorized`로 차단됩니다.)
+4. `AgentAutopsy.exe` 좌측 사이드바에서 **`복구 센터`** 메뉴로 이동합니다:
+   - 상단에 **`3단계 격리 검증 파이프라인 (Security & Isolation Pipeline)`**의 3단계 통과 결과(`PASS`)를 확인합니다.
+   - 중앙 코드 뷰에서 `왼쪽: 현재 코드`와 `오른쪽: 수정안` Diff를 확인합니다.
+5. 하단 우측의 초록색 **`[승인 및 복구 실행]`** 버튼을 클릭합니다.
+6. 확인 팝업(`적용 전 안전한 Checkpoint가 자동으로 저장되며... 진행할까요?`)에서 **[확인]**을 누릅니다.
 
 ### 5.2 무엇이 보이면 성공인가?
 - ✅ **승인 전 완벽한 원본 보호**:
-  - 대시보드에서 `[수정안 승인 및 적용]`을 누르기 전에는 `examples/shopping-cart/cart.js`의 코드가 **기존 버그 상태 그대로** 유지되며, 작업공간 파일이 단 한 줄도 수정되지 않았음을 확인합니다.
-  - 에이전트가 `apply_approved_repair`를 미리 호출하더라도 서버가 차단하여 `403 Forbidden: User approval required` 오류가 발생합니다.
+  - `[승인 및 복구 실행]`을 누르기 전에는 `%USERPROFILE%\Desktop\autopsy-demo\cart.js`의 코드가 기존 버그 코드(`total = total - 10;`) 상태를 온전히 유지하고 있음을 확인합니다.
 - ✅ **승인 후 안전한 워크스페이스 반영**:
-  - 대시보드에서 `[수정안 승인 및 적용]`을 누르면 즉시 상태가 `APPLIED`로 바뀌고 승인 지문(Fingerprint) 서명이 검증됩니다.
-  - 에디터에서 `examples/shopping-cart/cart.js`를 다시 확인하면 코드가 아래와 같이 올바른 10% 할인 로직으로 깔끔하게 갱신되어 있습니다:
-    ```javascript
-    if (discountCode === 'WELCOME10') {
-      total = total * 0.9;
-    }
-    ```
-- ✅ **테스트 재실행 확인**:
-  - `node examples/shopping-cart/test.js`를 터미널에서 실행하면 `✔ 장바구니 결제 테스트 통과 (ALL TESTS PASSED)`가 출력됩니다.
+  - 승인 버튼 클릭 시 `"수정안을 적용했습니다. 변경 사항을 확인한 뒤 직접 Commit 해 주세요."` 토스트가 뜹니다.
+  - 에디터에서 `%USERPROFILE%\Desktop\autopsy-demo\cart.js`를 다시 확인하면 올바른 10% 할인 로직(`total = total * 0.9;` 또는 `total - total * 0.1`)으로 안전하게 갱신되어 있습니다.
+- ✅ **검증 통과 확인**:
+  - 터미널에서 `node test.js`를 실행하면 `✔ 장바구니 결제 테스트 통과 (ALL TESTS PASSED)`가 출력됩니다.

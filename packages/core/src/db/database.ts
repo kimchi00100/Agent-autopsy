@@ -286,6 +286,10 @@ export class AutopsyDatabase {
       `ALTER TABLE projects ADD COLUMN enable_coverage INTEGER DEFAULT 0;`,
       `ALTER TABLE incidents ADD COLUMN reproduction_result_json TEXT;`,
       `ALTER TABLE incidents ADD COLUMN coverage_lines_json TEXT;`,
+      `ALTER TABLE incidents ADD COLUMN user_report_text TEXT;`,
+      `ALTER TABLE incidents ADD COLUMN intents_json TEXT;`,
+      `ALTER TABLE incidents ADD COLUMN missing_intents_json TEXT DEFAULT '[]';`,
+      `ALTER TABLE repair_proposals ADD COLUMN rejection_reason TEXT;`,
     ];
 
     for (const sql of migrations) {
@@ -719,10 +723,10 @@ export class AutopsyDatabase {
           expected_behavior, observed_behavior, broken_step, execution_trace_json, three_level_health_json,
           reproduction_condition, verification_method, verification_type, user_confirmed_intent, user_confirmation_summary, cause_verdict,
           risk_level, risk_signals_json, orchestration_decision_json, test_execution_note,
-          reproduction_result_json, coverage_lines_json,
+          reproduction_result_json, coverage_lines_json, user_report_text, intents_json, missing_intents_json,
           created_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `);
       stmt.run(
         incident.id,
@@ -754,6 +758,9 @@ export class AutopsyDatabase {
         incident.testExecutionNote || null,
         incident.reproductionResult ? JSON.stringify(incident.reproductionResult) : null,
         incident.coverageLines ? JSON.stringify(incident.coverageLines) : null,
+        incident.userReportText || null,
+        incident.intents ? JSON.stringify(incident.intents) : null,
+        JSON.stringify(incident.missingIntents || []),
         incident.createdAt
       );
     });
@@ -793,6 +800,9 @@ export class AutopsyDatabase {
       testExecutionNote: row.test_execution_note || undefined,
       reproductionResult: row.reproduction_result_json ? JSON.parse(row.reproduction_result_json) : undefined,
       coverageLines: row.coverage_lines_json ? JSON.parse(row.coverage_lines_json) : undefined,
+      userReportText: row.user_report_text || undefined,
+      intents: row.intents_json ? JSON.parse(row.intents_json) : undefined,
+      missingIntents: row.missing_intents_json ? JSON.parse(row.missing_intents_json) : [],
       createdAt: row.created_at,
     };
   }
@@ -904,6 +914,9 @@ export class AutopsyDatabase {
       testExecutionNote: row.test_execution_note || undefined,
       reproductionResult: row.reproduction_result_json ? JSON.parse(row.reproduction_result_json) : undefined,
       coverageLines: row.coverage_lines_json ? JSON.parse(row.coverage_lines_json) : undefined,
+      userReportText: row.user_report_text || undefined,
+      intents: row.intents_json ? JSON.parse(row.intents_json) : undefined,
+      missingIntents: row.missing_intents_json ? JSON.parse(row.missing_intents_json) : [],
       createdAt: row.created_at,
     }));
   }
@@ -964,12 +977,13 @@ export class AutopsyDatabase {
         INSERT INTO repair_proposals (
           id, incident_id, root_cause_analysis, patch_diff, touched_files_json,
           file_changes_json, verification_status, verification_log, approval_status,
+          rejection_reason,
           approval_fingerprint_json, approved_at, applied_at,
           patch_hash, risk_level, risk_evidence_json, self_review_checklist_json,
           orchestration_review_json, approval_readiness, approval_block_reason,
           stages_json, three_level_health_json, verified_with_command,
           created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `);
       stmt.run(
         proposal.id,
@@ -981,6 +995,7 @@ export class AutopsyDatabase {
         proposal.verificationStatus,
         proposal.verificationLog,
         proposal.approvalStatus,
+        proposal.rejectionReason || null,
         proposal.approvalFingerprintJson || null,
         proposal.approvedAt,
         proposal.appliedAt,
@@ -1017,6 +1032,7 @@ export class AutopsyDatabase {
       verificationStatus: row.verification_status as VerificationStatus,
       verificationLog: row.verification_log,
       approvalStatus: row.approval_status as ApprovalStatus,
+      rejectionReason: row.rejection_reason || undefined,
       approvalReadiness: (row.approval_readiness as ApprovalReadiness) || undefined,
       approvalBlockReason: row.approval_block_reason || undefined,
       orchestrationReview: row.orchestration_review_json ? JSON.parse(row.orchestration_review_json) : undefined,
@@ -1071,11 +1087,17 @@ export class AutopsyDatabase {
   public updateProposalApproval(
     id: string,
     status: ApprovalStatus,
-    fingerprint?: ApprovalFingerprint | null,
+    fingerprintOrReason?: ApprovalFingerprint | string | null,
     timestamp: string = new Date().toISOString()
   ): void {
     this.runInImmediateTransaction(() => {
-      const fpJson = fingerprint ? JSON.stringify(fingerprint) : null;
+      let fpJson: string | null = null;
+      let reason: string | null = null;
+      if (typeof fingerprintOrReason === 'string') {
+        reason = fingerprintOrReason;
+      } else if (fingerprintOrReason) {
+        fpJson = JSON.stringify(fingerprintOrReason);
+      }
       if (status === 'APPROVED') {
         const stmt = this.db.prepare(`
           UPDATE repair_proposals 
@@ -1090,6 +1112,13 @@ export class AutopsyDatabase {
           WHERE id = ?
         `);
         stmt.run(status, timestamp, id);
+      } else if (status === 'REJECTED') {
+        const stmt = this.db.prepare(`
+          UPDATE repair_proposals 
+          SET approval_status = ?, rejection_reason = ? 
+          WHERE id = ?
+        `);
+        stmt.run(status, reason, id);
       } else {
         const stmt = this.db.prepare(`
           UPDATE repair_proposals 
@@ -1122,6 +1151,7 @@ export class AutopsyDatabase {
       verificationStatus: row.verification_status as VerificationStatus,
       verificationLog: row.verification_log,
       approvalStatus: row.approval_status as ApprovalStatus,
+      rejectionReason: row.rejection_reason || undefined,
       approvalReadiness: (row.approval_readiness as ApprovalReadiness) || undefined,
       approvalBlockReason: row.approval_block_reason || undefined,
       orchestrationReview: row.orchestration_review_json ? JSON.parse(row.orchestration_review_json) : undefined,
@@ -1158,6 +1188,7 @@ export class AutopsyDatabase {
       verificationStatus: row.verification_status as VerificationStatus,
       verificationLog: row.verification_log,
       approvalStatus: row.approval_status as ApprovalStatus,
+      rejectionReason: row.rejection_reason || undefined,
       approvalReadiness: (row.approval_readiness as ApprovalReadiness) || undefined,
       approvalBlockReason: row.approval_block_reason || undefined,
       orchestrationReview: row.orchestration_review_json ? JSON.parse(row.orchestration_review_json) : undefined,

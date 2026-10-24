@@ -19,6 +19,68 @@ import {
   GitCompare,
 } from 'lucide-react';
 
+
+function HighlightedReportText({ text, quotes }: { text: string; quotes: string[] }) {
+  if (!text) return null;
+  const validQuotes = Array.from(new Set(quotes.filter((q) => q && q.trim().length > 0)));
+  if (validQuotes.length === 0) {
+    return <span className="whitespace-pre-wrap">{text}</span>;
+  }
+
+  type Interval = { start: number; end: number };
+  const intervals: Interval[] = [];
+  const textLower = text.toLowerCase();
+
+  for (const q of validQuotes) {
+    const qLower = q.toLowerCase();
+    let pos = 0;
+    while ((pos = textLower.indexOf(qLower, pos)) !== -1) {
+      intervals.push({ start: pos, end: pos + q.length });
+      pos += q.length;
+    }
+  }
+
+  if (intervals.length === 0) {
+    return <span className="whitespace-pre-wrap">{text}</span>;
+  }
+
+  intervals.sort((a, b) => a.start - b.start);
+  const merged: Interval[] = [];
+  let cur = { ...intervals[0] };
+  for (let i = 1; i < intervals.length; i++) {
+    if (intervals[i].start <= cur.end) {
+      cur.end = Math.max(cur.end, intervals[i].end);
+    } else {
+      merged.push(cur);
+      cur = { ...intervals[i] };
+    }
+  }
+  merged.push(cur);
+
+  const elements: React.ReactNode[] = [];
+  let lastIdx = 0;
+  merged.forEach((iv, i) => {
+    if (iv.start > lastIdx) {
+      elements.push(text.slice(lastIdx, iv.start));
+    }
+    elements.push(
+      <mark
+        key={i}
+        className="bg-emerald-100 text-emerald-950 font-semibold px-1 py-0.5 rounded border border-emerald-300"
+        title="사용자 원문 인용 구절 (USER_QUOTE)"
+      >
+        {text.slice(iv.start, iv.end)}
+      </mark>
+    );
+    lastIdx = iv.end;
+  });
+  if (lastIdx < text.length) {
+    elements.push(text.slice(lastIdx));
+  }
+
+  return <span className="whitespace-pre-wrap leading-relaxed">{elements}</span>;
+}
+
 export default function Repair({
   incidents,
   incidentId,
@@ -74,6 +136,24 @@ export default function Repair({
 
   const proposal = proposals.find((p) => p.id === proposalId) ?? null;
   const files = useMemo(() => (proposal ? parseSideBySide(proposal.patchDiff) : []), [proposal]);
+  const userQuotes = useMemo(() => {
+    if (!incident?.intents) return [];
+    const qList: string[] = [];
+    if (incident.intents.expectedBehavior.source === 'USER_QUOTE' && incident.intents.expectedBehavior.quote) {
+      qList.push(incident.intents.expectedBehavior.quote);
+    }
+    if (incident.intents.observedBehavior.source === 'USER_QUOTE' && incident.intents.observedBehavior.quote) {
+      qList.push(incident.intents.observedBehavior.quote);
+    }
+    if (incident.intents.reproductionCondition.source === 'USER_QUOTE' && incident.intents.reproductionCondition.quote) {
+      qList.push(incident.intents.reproductionCondition.quote);
+    }
+    if (incident.intents.verificationMethod.source === 'USER_QUOTE' && incident.intents.verificationMethod.quote) {
+      qList.push(incident.intents.verificationMethod.quote);
+    }
+    return qList;
+  }, [incident?.intents]);
+
 
   useEffect(() => {
     const next: Record<string, boolean> = {};
@@ -220,6 +300,121 @@ export default function Repair({
 
       {incident && proposal && (
         <div className="space-y-4">
+          {/* Step 4: 사용자 신고 원문 vs AI 해석 나란히 비교 */}
+          <Card className="p-5">
+            <div className="flex items-center justify-between border-b border-slate-100 pb-2.5 mb-3">
+              <div className="flex items-center gap-2">
+                <MessageSquare className="h-4 w-4 text-indigo-600" />
+                <span className="text-xs font-bold text-slate-800">요구사항 및 의도 검증 (사용자 원문 vs AI 해석)</span>
+              </div>
+              <span className="text-[11px] text-slate-400">
+                {incident.userConfirmedIntent ? (
+                  <span className="text-emerald-600 font-semibold flex items-center gap-1">
+                    <CheckCircle2 className="h-3 w-3" /> 4대 의도 확인 완료
+                  </span>
+                ) : (
+                  <span className="text-amber-600 font-semibold flex items-center gap-1">
+                    <AlertTriangle className="h-3 w-3" /> 의도 확인 진행 중
+                  </span>
+                )}
+              </span>
+            </div>
+
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+              {/* 왼쪽: 사용자 신고 원문 */}
+              <div className="rounded-xl border border-slate-200 bg-slate-50/70 p-4 space-y-2">
+                <div className="text-[11px] font-bold text-slate-600 flex items-center justify-between">
+                  <span>사용자 신고 원문</span>
+                  <Badge tone="gray">User Report</Badge>
+                </div>
+                <div className="text-xs leading-relaxed text-slate-800 bg-white p-3 rounded-lg border border-slate-100 whitespace-pre-wrap font-mono min-h-[140px]">
+                  {incident.userReportText && incident.userReportText.trim() && incident.userReportText !== '없음' ? (
+                    <HighlightedReportText text={incident.userReportText} quotes={userQuotes} />
+                  ) : (
+                    <span className="text-slate-400 italic">사용자 원문이 제공되지 않았습니다.</span>
+                  )}
+                </div>
+              </div>
+
+              {/* 오른쪽: AI 해석 및 출처 검증 */}
+              <div className="rounded-xl border border-slate-200 bg-slate-50/70 p-4 space-y-2.5">
+                <div className="text-[11px] font-bold text-slate-600 flex items-center justify-between">
+                  <span>AI 의도 해석 및 출처 검증</span>
+                  <Badge tone="blue">AI Provenance</Badge>
+                </div>
+
+                <div className="space-y-2 text-xs">
+                  {/* 기대 정상 동작 */}
+                  <div className="bg-white p-2.5 rounded-lg border border-slate-100 space-y-1">
+                    <div className="flex items-center justify-between text-[11px]">
+                      <span className="font-semibold text-slate-700">1. 기대 정상 동작 (Expected)</span>
+                      {incident.intents?.expectedBehavior.source === 'USER_QUOTE' ? (
+                        <Badge tone="green">원문 인용 (USER_QUOTE)</Badge>
+                      ) : incident.intents?.expectedBehavior.source === 'AI_INFERRED' ? (
+                        <Badge tone="amber">AI 추론 (AI_INFERRED)</Badge>
+                      ) : (
+                        <Badge tone="red">누락됨 (MISSING)</Badge>
+                      )}
+                    </div>
+                    <div className="text-slate-800 text-[11.5px]">
+                      {incident.intents?.expectedBehavior.value || incident.expectedBehavior || '(미지정)'}
+                    </div>
+                  </div>
+
+                  {/* 실제 오작동 증상 */}
+                  <div className="bg-white p-2.5 rounded-lg border border-slate-100 space-y-1">
+                    <div className="flex items-center justify-between text-[11px]">
+                      <span className="font-semibold text-slate-700">2. 실제 오작동 증상 (Observed)</span>
+                      {incident.intents?.observedBehavior.source === 'USER_QUOTE' ? (
+                        <Badge tone="green">원문 인용 (USER_QUOTE)</Badge>
+                      ) : incident.intents?.observedBehavior.source === 'AI_INFERRED' ? (
+                        <Badge tone="amber">AI 추론 (AI_INFERRED)</Badge>
+                      ) : (
+                        <Badge tone="red">누락됨 (MISSING)</Badge>
+                      )}
+                    </div>
+                    <div className="text-slate-800 text-[11.5px]">
+                      {incident.intents?.observedBehavior.value || incident.observedBehavior || '(미지정)'}
+                    </div>
+                  </div>
+
+                  {/* 재현 조건 */}
+                  <div className="bg-white p-2.5 rounded-lg border border-slate-100 space-y-1">
+                    <div className="flex items-center justify-between text-[11px]">
+                      <span className="font-semibold text-slate-700">3. 재현 조건 (Reproduction)</span>
+                      {incident.intents?.reproductionCondition.source === 'USER_QUOTE' ? (
+                        <Badge tone="green">원문 인용 (USER_QUOTE)</Badge>
+                      ) : incident.intents?.reproductionCondition.source === 'AI_INFERRED' ? (
+                        <Badge tone="amber">AI 추론 (AI_INFERRED)</Badge>
+                      ) : (
+                        <Badge tone="red">누락됨 (MISSING)</Badge>
+                      )}
+                    </div>
+                    <div className="text-slate-800 text-[11.5px]">
+                      {incident.intents?.reproductionCondition.value || incident.reproductionCondition || '(미지정)'}
+                    </div>
+                  </div>
+
+                  {/* 검증 방법 */}
+                  <div className="bg-white p-2.5 rounded-lg border border-slate-100 space-y-1">
+                    <div className="flex items-center justify-between text-[11px]">
+                      <span className="font-semibold text-slate-700">4. 검증 방법 (Verification)</span>
+                      {incident.intents?.verificationMethod.source === 'USER_QUOTE' ? (
+                        <Badge tone="green">원문 인용 (USER_QUOTE)</Badge>
+                      ) : incident.intents?.verificationMethod.source === 'AI_INFERRED' ? (
+                        <Badge tone="amber">AI 추론 (AI_INFERRED)</Badge>
+                      ) : (
+                        <Badge tone="red">누락됨 (MISSING)</Badge>
+                      )}
+                    </div>
+                    <div className="text-slate-800 text-[11.5px]">
+                      {incident.intents?.verificationMethod.value || incident.verificationMethod || '(미지정)'}
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </Card>
           {proposals.length > 1 && (
             <div className="flex gap-2">
               {proposals.map((p, i) => (

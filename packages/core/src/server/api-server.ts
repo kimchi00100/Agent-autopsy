@@ -546,7 +546,8 @@ export class ApiServer {
         return;
       }
       const proposalId = rejectMatch[1];
-      this.coreManager.rejectProposal(proposalId);
+      const body = await this.parseJsonBody(req);
+      this.coreManager.rejectProposal(proposalId, body.reason || body.rejectionReason);
       const updated = db.getRepairProposal(proposalId);
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ success: true, proposal: updated }));

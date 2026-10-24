@@ -3,7 +3,7 @@ import * as http from 'node:http';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
-import { CoreManager, FileChange } from '@agent-autopsy/core';
+import { CoreManager, FileChange, NextAction } from '@agent-autopsy/core';
 
 const coreManager = new CoreManager();
 
@@ -69,6 +69,12 @@ server.tool(
     try {
       const targetPath = resolvePath(repoPath);
       const cp = coreManager.captureCheckpoint(targetPath, label || 'Agent Baseline Checkpoint', agentName || 'mcp-agent');
+      const next_action: NextAction = {
+        actor: 'AGENT',
+        action: 'PROCEED_TASK',
+        agent_should: '체크포인트가 안전하게 저장되었습니다. 작업 또는 버그 조사를 계속 진행하세요.',
+        forbidden: ['승인 없는 원본 파일 직접 수정'],
+      };
       return {
         content: [
           {
@@ -86,6 +92,7 @@ server.tool(
                   changedFiles: cp.changedFiles,
                   createdAt: cp.createdAt,
                 },
+                next_action,
               },
               null,
               2
@@ -96,7 +103,25 @@ server.tool(
     } catch (error: any) {
       return {
         isError: true,
-        content: [{ type: 'text', text: `Failed to capture checkpoint: ${error.message}` }],
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify(
+              {
+                success: false,
+                error: error.message,
+                next_action: {
+                  actor: 'AGENT',
+                  action: 'FIX_CHECKPOINT_ERROR',
+                  agent_should: `체크포인트 캡처 오류(${error.message})를 확인하고 재시도하세요.`,
+                  forbidden: ['승인 없는 원본 파일 직접 수정'],
+                },
+              },
+              null,
+              2
+            ),
+          },
+        ],
       };
     }
   }
@@ -116,6 +141,12 @@ server.tool(
     try {
       const targetPath = resolvePath(repoPath);
       const health = coreManager.inspectProjectState(targetPath);
+      const next_action: NextAction = {
+        actor: 'AGENT',
+        action: 'CHECK_HEALTH',
+        agent_should: '프로젝트 상태를 확인했습니다. 작업 전 체크포인트 생성 또는 사건 수집을 진행하세요.',
+        forbidden: ['승인 없는 원본 파일 직접 수정'],
+      };
       return {
         content: [
           {
@@ -138,6 +169,7 @@ server.tool(
                   : null,
                 activeIncidentsCount: health.activeIncidentsCount,
                 recentCommits: health.recentCommits,
+                next_action,
               },
               null,
               2
@@ -148,7 +180,25 @@ server.tool(
     } catch (error: any) {
       return {
         isError: true,
-        content: [{ type: 'text', text: `Failed to inspect project state: ${error.message}` }],
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify(
+              {
+                success: false,
+                error: error.message,
+                next_action: {
+                  actor: 'AGENT',
+                  action: 'RETRY_INSPECT',
+                  agent_should: '프로젝트 경로를 확인하고 다시 시도하세요.',
+                  forbidden: ['승인 없는 원본 파일 직접 수정'],
+                },
+              },
+              null,
+              2
+            ),
+          },
+        ],
       };
     }
   }
@@ -156,13 +206,14 @@ server.tool(
 
 /**
  * Tool 3: collect_incident_bundle
- * Gathers error logs, git diff against checkpoint, and creates an incident record.
+ * Gathers error logs, git diff against checkpoint, expected vs observed behavior, and creates an incident record.
  */
 server.tool(
   'collect_incident_bundle',
   'Gathers error logs, git diff since the last checkpoint, expected vs observed behavior, and creates a formal incident record for forensic analysis.',
   {
     title: z.string().describe('Short title of the incident (e.g. "VIP20 쿠폰 입력 시 ReferenceError 발생" or "저장 버튼 눌러도 목록에 즉시 미반영")'),
+    userReportText: z.string().optional().describe('사용자가 쓴 신고 원문 그대로'),
     repoPath: z.string().optional().describe('Root path of the git repository (defaults to current directory)'),
     errorOutput: z.string().optional().describe('Error message, stack trace, or test failure output'),
     expectedBehavior: z.string().optional().describe('사용자가 원래 기대했던 정상 동작 / 요구사항 설명'),
@@ -171,12 +222,13 @@ server.tool(
     reproductionCondition: z.string().optional().describe('재현 조건 (어떤 입력 및 환경에서 문제가 발생하는지)'),
     verificationMethod: z.string().optional().describe('기대 결과를 확인할 검증 수단이나 테스트'),
     verificationType: z.enum(['LOGIC_TEST', 'DATA_STATE', 'UI_FLOW', 'MANUAL_CHECK']).optional().describe('검증 유형'),
-    userConfirmedIntent: z.boolean().optional().describe('사용자에게 4가지(기대동작, 관찰증상, 재현조건, 검증방법)를 되물어 명시적 확인을 받았는지 여부'),
+    userConfirmedIntent: z.boolean().optional().describe('사용자에게 4가지(기대동작, 관찰증상, 재현조건, 검증방법)를 되물어 명시적 확인을 받았는지 여부 (참고용)'),
     userConfirmationSummary: z.string().optional().describe('사용자가 확인해 준 내용 요약'),
     agentName: z.string().optional().describe('호출하는 에이전트 이름 (antigravity, claude-code, codex 등)'),
   },
   async ({
     title,
+    userReportText,
     repoPath,
     errorOutput,
     expectedBehavior,
@@ -190,48 +242,26 @@ server.tool(
     agentName,
   }) => {
     try {
-      // Intent Confirmation Gate:
-      // 1) Automatic build/compile/syntax errors (errorOutput exists & no functional mismatch claims) -> proceed automatically!
-      // 2) Functional/runtime bugs reported by user (expectedBehavior/observedBehavior present or no errorOutput) -> require chat confirmation!
-      const isFunctionalRuntimeBug = Boolean(expectedBehavior || observedBehavior || !errorOutput);
-      if (isFunctionalRuntimeBug && !userConfirmedIntent) {
-        return {
-          isError: true,
-          content: [
-            {
-              type: 'text',
-              text: `[USER_INTENT_CONFIRMATION_REQUIRED]:
-빌드/컴파일 에러가 아닌 '사용자 실행 중 기능 오작동(런타임 논리 버그)'입니다.
-코드를 임의로 추측해서 고치지 말고, 현재 채팅창(Codex / Antigravity / Claude Code)에서 사용자에게 다음 4가지를 먼저 되물어 확인받으세요:
-  1. 기대 정상 동작 (expectedBehavior): 원래 어떻게 동작해야 하는지 (예: 자동사냥 시 주변 몹을 탐색해 공격해야 함)
-  2. 실제 오작동 증상 (observedBehavior): 실제로 어떤 현상이 나타나는지 (예: 자동사냥을 켜도 몹을 때리지 않고 가만히 있음)
-  3. 재현 조건 (reproductionCondition): 어떤 상황/입력에서 발생하는지
-  4. 검증 방법 (verificationMethod): 수정 후 어떻게 정상 작동을 확인할지
-사용자가 채팅에서 확인해주면 userConfirmedIntent: true와 함께 collect_incident_bundle을 다시 호출하세요.`,
-            },
-          ],
-        };
-      }
-
       const targetPath = resolvePath(repoPath);
       const effectiveAgent = agentName || 'mcp-agent';
-      const incident = await coreManager.collectIncidentBundle(
-        targetPath,
+      const incident = await coreManager.collectIncidentBundle(targetPath, {
         title,
+        userReportText,
         errorOutput,
-        'HIGH',
-        effectiveAgent,
-        undefined,
+        severity: 'UNASSESSED',
+        agentName: effectiveAgent,
         expectedBehavior,
         observedBehavior,
         brokenStep,
-        undefined,
         reproductionCondition,
         verificationMethod,
         verificationType,
         userConfirmedIntent,
-        userConfirmationSummary
-      );
+        userConfirmationSummary,
+      });
+
+      const next_action = coreManager.getIncidentNextAction(incident);
+
       return {
         content: [
           {
@@ -243,11 +273,16 @@ server.tool(
                 incident: {
                   id: incident.id,
                   title: incident.title,
+                  userReportText: incident.userReportText,
+                  intents: incident.intents,
+                  missingIntents: incident.missingIntents,
                   status: incident.status,
                   baseCheckpointId: incident.baseCheckpointId,
                   expectedBehavior: incident.expectedBehavior,
                   observedBehavior: incident.observedBehavior,
                   brokenStep: incident.brokenStep,
+                  reproductionCondition: incident.reproductionCondition,
+                  verificationMethod: incident.verificationMethod,
                   verificationType: incident.verificationType,
                   userConfirmedIntent: incident.userConfirmedIntent,
                   riskLevel: incident.riskLevel,
@@ -255,12 +290,11 @@ server.tool(
                   orchestrationDecision: incident.orchestrationDecision,
                   testExecutionNote: incident.testExecutionNote,
                   diffSummaryLength: incident.diffSummary.length,
-                  diffSummary: incident.diffSummary.slice(0, 3000), // Preview
+                  diffSummary: incident.diffSummary.slice(0, 3000),
                   errorOutput: incident.errorOutput,
                   createdAt: incident.createdAt,
                 },
-                nextStep:
-                  'Analyze the execution path, run verification in isolated worktree, and call propose_and_verify_repair with your fix.',
+                next_action,
               },
               null,
               2
@@ -271,7 +305,25 @@ server.tool(
     } catch (error: any) {
       return {
         isError: true,
-        content: [{ type: 'text', text: `Failed to collect incident bundle: ${error.message}` }],
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify(
+              {
+                success: false,
+                error: error.message,
+                next_action: {
+                  actor: 'AGENT',
+                  action: 'HANDLE_INCIDENT_ERROR',
+                  agent_should: `사건 번들 수집 오류(${error.message})를 확인하고 인자를 검토하세요.`,
+                  forbidden: ['원인 자의적 짐작', '미승인 코드 수정', 'DB 직접 조작'],
+                },
+              },
+              null,
+              2
+            ),
+          },
+        ],
       };
     }
   }
@@ -318,7 +370,25 @@ server.tool(
     } catch (err: any) {
       return {
         isError: true,
-        content: [{ type: 'text', text: `Failed to propose test command: ${err.message}` }],
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify(
+              {
+                success: false,
+                error: err.message,
+                next_action: {
+                  actor: 'USER',
+                  action: 'CONFIRM_TEST_COMMAND_IN_APP',
+                  agent_should: '사용자에게 앱 대시보드에서 테스트 명령을 직접 확인 및 설정해 달라고 요청하세요.',
+                  forbidden: ['미승인 명령 임의 실행', '원본 파일 직접 수정'],
+                },
+              },
+              null,
+              2
+            ),
+          },
+        ],
       };
     }
   }
@@ -367,6 +437,32 @@ server.tool(
 
       const isPass = proposal.verificationStatus === 'VERIFIED_PASS';
 
+      let next_action: NextAction;
+      if (!isPass) {
+        next_action = {
+          actor: 'AGENT',
+          action: 'REVISE_REPAIR',
+          agent_should: '격리 검증이 실패했습니다. testExecutionOutput을 분석하여 수정안을 개선한 뒤 propose_and_verify_repair를 재호출하세요 (최대 3회).',
+          forbidden: ['원본 파일 직접 수정', 'DB 직접 수정', '검증 생략'],
+        };
+      } else if (proposal.approvalReadiness === 'BLOCKED_AWAITING_REVIEW') {
+        next_action = {
+          actor: 'SUBAGENT',
+          action: 'REQUEST_ORCHESTRATION_REVIEW',
+          agent_should: '격리 검증을 통과했으나 고위험 수정입니다. 독립 서브에이전트 검토를 실행한 후 submit_orchestration_review를 호출하세요.',
+          note: '주의: 서브에이전트 검토 완료는 사용자 승인이 아니며, 최종 승인은 사용자만이 앱 대시보드에서 수행할 수 있습니다.',
+          forbidden: ['원본 파일 직접 수정', 'DB 직접 수정', '승인 API 호출'],
+        };
+      } else {
+        next_action = {
+          actor: 'USER',
+          action: 'APPROVE_IN_APP',
+          agent_should: '격리 검증을 통과했습니다. await_user_decision을 호출하거나 사용자에게 앱 대시보드(http://localhost:3847)에서 수정안을 승인해 달라고 안내하세요.',
+          note: '주의: 사용자가 앱 대시보드에서 직접 승인 버튼을 누르기 전에는 원본 파일에 패치를 적용할 수 없습니다.',
+          forbidden: ['원본 파일 직접 수정', 'DB 직접 수정', '승인 API 호출'],
+        };
+      }
+
       return {
         content: [
           {
@@ -392,6 +488,7 @@ server.tool(
                   : proposal.approvalReadiness === 'BLOCKED_AWAITING_REVIEW'
                   ? 'VERIFICATION PASSED in isolated worktree, but HIGH RISK detected! In accordance with the Risk-Adaptive Evidence Gate, an independent subagent review is required before approval. Please run your subagent (or review task) and call submit_orchestration_review.'
                   : 'VERIFICATION PASSED in isolated worktree! The proposal is now registered and awaiting user approval in Agent Autopsy Desktop. The patch cannot be applied to the real workspace until approved by the user.',
+                next_action,
               },
               null,
               2
@@ -426,7 +523,25 @@ server.tool(
       }
       return {
         isError: true,
-        content: [{ type: 'text', text: `Failed to propose and verify repair: ${error.message}` }],
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify(
+              {
+                success: false,
+                error: error.message,
+                next_action: {
+                  actor: 'AGENT',
+                  action: 'FIX_REPAIR_INPUT',
+                  agent_should: `수정안 제출 오류(${error.message})를 확인하고 Search & Replace 블록을 점검하세요.`,
+                  forbidden: ['원본 파일 직접 수정', 'DB 직접 수정'],
+                },
+              },
+              null,
+              2
+            ),
+          },
+        ],
       };
     }
   }
@@ -447,6 +562,12 @@ server.tool(
     try {
       const targetPath = resolvePath(repoPath);
       const result = coreManager.applyApprovedRepair(targetPath, proposalId);
+      const next_action: NextAction = {
+        actor: 'USER',
+        action: 'REVIEW_AND_COMMIT',
+        agent_should: '승인된 수정안이 작업 트리에 안전하게 적용되었습니다. 변경 사항을 확인한 후 원하는 커밋 메시지로 직접 Git 커밋하세요.',
+        forbidden: ['사용자 동의 없는 임의 원격 푸시', 'DB 직접 조작'],
+      };
       return {
         content: [
           {
@@ -457,6 +578,7 @@ server.tool(
                 message: 'Approved repair applied successfully to the workspace.',
                 touchedFiles: result.touchedFiles,
                 diff: result.diff,
+                next_action,
               },
               null,
               2
@@ -467,7 +589,25 @@ server.tool(
     } catch (error: any) {
       return {
         isError: true,
-        content: [{ type: 'text', text: error.message }],
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify(
+              {
+                success: false,
+                error: error.message,
+                next_action: {
+                  actor: 'USER',
+                  action: 'APPROVE_IN_APP_FIRST',
+                  agent_should: '사용자가 앱 대시보드에서 수정안을 먼저 승인해야 합니다. 사용자에게 승인을 요청하세요.',
+                  forbidden: ['승인 우회 시도', '원본 파일 임의 수정', 'DB 직접 조작'],
+                },
+              },
+              null,
+              2
+            ),
+          },
+        ],
       };
     }
   }
@@ -488,6 +628,12 @@ server.tool(
     try {
       const targetPath = resolvePath(repoPath);
       const result = coreManager.rollbackToCheckpoint(targetPath, checkpointId);
+      const next_action: NextAction = {
+        actor: 'AGENT',
+        action: 'RESUME_AFTER_ROLLBACK',
+        agent_should: '작업 트리가 이전 체크포인트 상태로 안전하게 롤백되었습니다. 새로운 작업 계획을 수립하세요.',
+        forbidden: ['승인 없는 원본 파일 직접 수정'],
+      };
       return {
         content: [
           {
@@ -498,6 +644,7 @@ server.tool(
                 message: `Workspace restored to checkpoint "${checkpointId}".`,
                 backupRef: result.backupRef,
                 backupStashSha: result.backupRef,
+                next_action,
               },
               null,
               2
@@ -508,7 +655,25 @@ server.tool(
     } catch (error: any) {
       return {
         isError: true,
-        content: [{ type: 'text', text: `Failed to rollback to checkpoint: ${error.message}` }],
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify(
+              {
+                success: false,
+                error: error.message,
+                next_action: {
+                  actor: 'AGENT',
+                  action: 'CHECK_CHECKPOINT_ID',
+                  agent_should: `체크포인트 롤백 실패: ${error.message}. 체크포인트 ID를 확인하세요.`,
+                  forbidden: ['강제 git reset --hard'],
+                },
+              },
+              null,
+              2
+            ),
+          },
+        ],
       };
     }
   }
@@ -531,9 +696,43 @@ server.tool(
   async ({ repoPath, kind, title, detail, filePath }) => {
     try {
       const ev = coreManager.recordAgentEvent(resolvePath(repoPath), kind, title, detail || '', filePath || null, 'mcp-agent');
-      return { content: [{ type: 'text', text: JSON.stringify({ success: true, eventId: ev.id }) }] };
+      const next_action: NextAction = {
+        actor: 'AGENT',
+        action: 'CONTINUE_TASK',
+        agent_should: '에이전트 이벤트가 타임라인에 기록되었습니다. 작업을 계속 진행하세요.',
+        forbidden: ['승인 없는 원본 파일 직접 수정'],
+      };
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify({ success: true, eventId: ev.id, next_action }, null, 2),
+          },
+        ],
+      };
     } catch (error: any) {
-      return { isError: true, content: [{ type: 'text', text: `Failed to record event: ${error.message}` }] };
+      return {
+        isError: true,
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify(
+              {
+                success: false,
+                error: error.message,
+                next_action: {
+                  actor: 'AGENT',
+                  action: 'CONTINUE_TASK',
+                  agent_should: '이벤트 기록 실패를 무시하고 작업을 계속하세요.',
+                  forbidden: [],
+                },
+              },
+              null,
+              2
+            ),
+          },
+        ],
+      };
     }
   }
 );
@@ -572,6 +771,14 @@ server.tool(
         submittedByRole,
       });
 
+      const next_action: NextAction = {
+        actor: 'USER',
+        action: 'AWAIT_USER_APPROVAL',
+        agent_should: '서브에이전트 독립 검토가 제출되었습니다. await_user_decision을 호출하거나 대시보드에서 사용자의 승인/피드백 결정을 기다리세요.',
+        note: '중요: 서브에이전트 검토 완료는 사용자의 최종 승인이 아닙니다. 사용자가 앱 대시보드에서 승인해야만 패치를 적용할 수 있습니다.',
+        forbidden: ['승인 간주 후 임의 패치 적용', '원본 파일 직접 수정', 'DB 직접 조작'],
+      };
+
       return {
         content: [
           {
@@ -598,6 +805,7 @@ server.tool(
                   result.proposal.approvalReadiness === 'READY_FOR_APPROVAL'
                     ? 'Proposal is now unlocked and ready for user approval in the Agent Autopsy Desktop UI.'
                     : `Proposal status is ${result.proposal.approvalReadiness}: ${result.proposal.approvalBlockReason}`,
+                next_action,
               },
               null,
               2
@@ -608,7 +816,25 @@ server.tool(
     } catch (error: any) {
       return {
         isError: true,
-        content: [{ type: 'text', text: `Failed to submit orchestration review: ${error.message}` }],
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify(
+              {
+                success: false,
+                error: error.message,
+                next_action: {
+                  actor: 'AGENT',
+                  action: 'FIX_REVIEW_SUBMISSION',
+                  agent_should: `검토 제출 실패(${error.message}). 제안 ID 및 챌린지 토큰을 확인하세요.`,
+                  forbidden: ['승인 간주', '원본 파일 직접 수정'],
+                },
+              },
+              null,
+              2
+            ),
+          },
+        ],
       };
     }
   }
@@ -629,18 +855,42 @@ server.tool(
     try {
       const targetPath = resolvePath(repoPath);
       const challenge = coreManager.createReviewChallenge(targetPath, proposalId);
+      const next_action: NextAction = {
+        actor: 'AGENT',
+        action: 'RUN_SUBAGENT_REVIEW',
+        agent_should: '발급된 챌린지 토큰을 포함하여 독립 서브에이전트에게 검토를 요청하세요.',
+        forbidden: ['가짜 검토 제출', '승인 간주'],
+      };
       return {
         content: [
           {
             type: 'text',
-            text: JSON.stringify({ success: true, challenge }, null, 2),
+            text: JSON.stringify({ success: true, challenge, next_action }, null, 2),
           },
         ],
       };
     } catch (error: any) {
       return {
         isError: true,
-        content: [{ type: 'text', text: `Failed to request review challenge: ${error.message}` }],
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify(
+              {
+                success: false,
+                error: error.message,
+                next_action: {
+                  actor: 'AGENT',
+                  action: 'RETRY_CHALLENGE',
+                  agent_should: '제안 ID를 확인하고 다시 시도하세요.',
+                  forbidden: [],
+                },
+              },
+              null,
+              2
+            ),
+          },
+        ],
       };
     }
   }
@@ -664,18 +914,57 @@ server.tool(
       const targetPath = resolvePath(repoPath);
       coreManager.getDatabase().recordAgentHeartbeat(agentName || 'agent', undefined, `사용자 승인 대기 중: ${proposalId}`);
       const result = await coreManager.awaitUserDecision(targetPath, proposalId, timeoutSec);
+
+      let next_action: NextAction;
+      if (result.status === 'DIRECTIVE_DELIVERED') {
+        const isApprove = result.directive?.kind === 'APPROVE_AND_APPLY';
+        next_action = {
+          actor: 'AGENT',
+          action: isApprove ? 'APPLY_REPAIR' : 'HANDLE_FEEDBACK',
+          agent_should: isApprove
+            ? '사용자가 수정을 승인했습니다. apply_approved_repair를 호출하여 패치를 적용하세요.'
+            : '사용자 피드백을 반영하여 수정안을 개선하세요.',
+          forbidden: ['승인되지 않은 파일 수정', 'DB 직접 조작'],
+        };
+      } else {
+        next_action = {
+          actor: 'USER',
+          action: 'AWAIT_USER_DECISION',
+          agent_should: '대시보드에서 사용자 결정을 대기 중입니다. 필요시 재대기하거나 사용자에게 안내하세요.',
+          forbidden: ['승인 간주', '원본 파일 직접 수정'],
+        };
+      }
+
       return {
         content: [
           {
             type: 'text',
-            text: JSON.stringify(result, null, 2),
+            text: JSON.stringify({ ...result, next_action }, null, 2),
           },
         ],
       };
     } catch (error: any) {
       return {
         isError: true,
-        content: [{ type: 'text', text: `Failed to await user decision: ${error.message}` }],
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify(
+              {
+                success: false,
+                error: error.message,
+                next_action: {
+                  actor: 'AGENT',
+                  action: 'CHECK_PROPOSAL_STATE',
+                  agent_should: `사용자 결정 대기 중 오류: ${error.message}`,
+                  forbidden: ['승인 간주', '원본 파일 직접 수정'],
+                },
+              },
+              null,
+              2
+            ),
+          },
+        ],
       };
     }
   }
@@ -696,18 +985,45 @@ server.tool(
     try {
       const targetPath = resolvePath(repoPath);
       const directives = coreManager.getPendingDirectives(targetPath, agentName);
+      const next_action: NextAction = {
+        actor: 'AGENT',
+        action: directives.length > 0 ? 'ACKNOWLEDGE_DIRECTIVES' : 'PROCEED_TASK',
+        agent_should:
+          directives.length > 0
+            ? '대기 중인 지침을 확인하고 acknowledge_directive로 확인한 뒤 작업을 진행하세요.'
+            : '대기 중인 지침이 없습니다. 현재 작업을 계속하세요.',
+        forbidden: ['사용자 지침 무시'],
+      };
       return {
         content: [
           {
             type: 'text',
-            text: JSON.stringify({ success: true, count: directives.length, directives }, null, 2),
+            text: JSON.stringify({ success: true, count: directives.length, directives, next_action }, null, 2),
           },
         ],
       };
     } catch (error: any) {
       return {
         isError: true,
-        content: [{ type: 'text', text: `Failed to get pending directives: ${error.message}` }],
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify(
+              {
+                success: false,
+                error: error.message,
+                next_action: {
+                  actor: 'AGENT',
+                  action: 'RETRY_GET_DIRECTIVES',
+                  agent_should: '지침 조회 오류를 확인하고 다시 시도하세요.',
+                  forbidden: [],
+                },
+              },
+              null,
+              2
+            ),
+          },
+        ],
       };
     }
   }
@@ -727,18 +1043,42 @@ server.tool(
   async ({ directiveId, agentName }) => {
     try {
       const directive = coreManager.acknowledgeDirective(directiveId, agentName);
+      const next_action: NextAction = {
+        actor: 'AGENT',
+        action: 'EXECUTE_DIRECTIVE',
+        agent_should: '지침 수신이 확인되었습니다. 요청된 수정 또는 분석 작업을 진행하세요.',
+        forbidden: ['원본 파일 직접 수정'],
+      };
       return {
         content: [
           {
             type: 'text',
-            text: JSON.stringify({ success: true, message: `Directive ${directiveId} acknowledged`, directive }, null, 2),
+            text: JSON.stringify({ success: true, message: `Directive ${directiveId} acknowledged`, directive, next_action }, null, 2),
           },
         ],
       };
     } catch (error: any) {
       return {
         isError: true,
-        content: [{ type: 'text', text: `Failed to acknowledge directive: ${error.message}` }],
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify(
+              {
+                success: false,
+                error: error.message,
+                next_action: {
+                  actor: 'AGENT',
+                  action: 'CHECK_DIRECTIVE_ID',
+                  agent_should: `지침 확인 실패: ${error.message}. 지침 ID를 확인하세요.`,
+                  forbidden: [],
+                },
+              },
+              null,
+              2
+            ),
+          },
+        ],
       };
     }
   }
@@ -763,6 +1103,12 @@ server.tool(
       const targetPath = resolvePath(repoPath);
       const filePath = testFilePath || testCommandOrFile || '';
       const result = await coreManager.runReproduction(targetPath, incidentId, filePath);
+      const next_action: NextAction = {
+        actor: 'AGENT',
+        action: 'PROPOSE_REPAIR',
+        agent_should: '재현 테스트 결과가 기록되었습니다. 원인을 분석하고 propose_and_verify_repair로 수정안을 제출하세요.',
+        forbidden: ['원본 파일 직접 수정', 'DB 직접 수정'],
+      };
       return {
         content: [
           {
@@ -772,6 +1118,7 @@ server.tool(
                 success: true,
                 message: `Reproduction test completed with status: ${result.status}`,
                 reproduction: result,
+                next_action,
               },
               null,
               2
@@ -782,7 +1129,218 @@ server.tool(
     } catch (error: any) {
       return {
         isError: true,
-        content: [{ type: 'text', text: `Failed to run reproduction: ${error.message}` }],
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify(
+              {
+                success: false,
+                error: error.message,
+                next_action: {
+                  actor: 'AGENT',
+                  action: 'FIX_REPRODUCTION_INPUT',
+                  agent_should: `재현 테스트 실행 오류: ${error.message}. 상대 파일 경로가 올바른지 확인하세요.`,
+                  forbidden: ['원본 파일 직접 수정', '임의의 셸 명령 실행'],
+                },
+              },
+              null,
+              2
+            ),
+          },
+        ],
+      };
+    }
+  }
+);
+
+/**
+ * Tool 14: search_history
+ * Searches past incidents, confirmed causes, and applied repairs.
+ */
+server.tool(
+  'search_history',
+  '과거 유사 사건, 확정된 원인, 적용된 수정 요약을 조회합니다. 결과는 컨텍스트 낭비를 방지하기 위해 최대 10개, 약 2KB 이내로 반환됩니다.',
+  {
+    repoPath: z.string().optional().describe('Root path of the git repository (defaults to current directory)'),
+    files: z.array(z.string()).optional().describe('관련 파일 경로 목록으로 필터링'),
+    keywords: z.array(z.string()).optional().describe('사건 제목 또는 오류 텍스트에 포함된 키워드 목록으로 필터링'),
+  },
+  async ({ repoPath, files, keywords }) => {
+    try {
+      const targetPath = resolvePath(repoPath);
+      const history = coreManager.searchHistory(targetPath, files, keywords);
+      const next_action: NextAction = {
+        actor: 'AGENT',
+        action: 'ANALYZE_HISTORY',
+        agent_should: '과거 유사 사건 및 해결 기록을 참고하여 현재 버그 분석 및 수정안을 계획하세요.',
+        forbidden: ['과거 수정 무단 덮어쓰기', '원본 파일 직접 수정'],
+      };
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify(
+              {
+                success: true,
+                count: history.length,
+                history,
+                next_action,
+              },
+              null,
+              2
+            ),
+          },
+        ],
+      };
+    } catch (error: any) {
+      return {
+        isError: true,
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify(
+              {
+                success: false,
+                error: error.message,
+                next_action: {
+                  actor: 'AGENT',
+                  action: 'RETRY_SEARCH_HISTORY',
+                  agent_should: `과거 기록 검색 오류: ${error.message}`,
+                  forbidden: [],
+                },
+              },
+              null,
+              2
+            ),
+          },
+        ],
+      };
+    }
+  }
+);
+
+/**
+ * Tool 15: get_incident_attempts
+ * Returns rejected or failed verification attempts for an incident.
+ */
+server.tool(
+  'get_incident_attempts',
+  '해당 사건에서 거절되거나 검증에 실패한 이전 수정안과 그 이유를 조회합니다 (최대 10개).',
+  {
+    incidentId: z.string().describe('조회할 사건(Incident) ID'),
+  },
+  async ({ incidentId }) => {
+    try {
+      const attempts = coreManager.getIncidentAttempts(incidentId);
+      const next_action: NextAction = {
+        actor: 'AGENT',
+        action: 'AVOID_REPEATED_MISTAKES',
+        agent_should: '과거 실패/거절 사유를 분석하여 동일한 실수를 피하고 수정안을 다시 설계하세요.',
+        forbidden: ['동일한 실패 수정안 반복 제출', '원본 파일 직접 수정'],
+      };
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify(
+              {
+                success: true,
+                incidentId,
+                count: attempts.length,
+                attempts,
+                next_action,
+              },
+              null,
+              2
+            ),
+          },
+        ],
+      };
+    } catch (error: any) {
+      return {
+        isError: true,
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify(
+              {
+                success: false,
+                error: error.message,
+                next_action: {
+                  actor: 'AGENT',
+                  action: 'CHECK_INCIDENT_ID',
+                  agent_should: `실패/거절 시도 기록 조회 오류: ${error.message}`,
+                  forbidden: [],
+                },
+              },
+              null,
+              2
+            ),
+          },
+        ],
+      };
+    }
+  }
+);
+
+/**
+ * Tool 16: get_changes_since_good_checkpoint
+ * Returns summary of changes since last clean/good checkpoint.
+ */
+server.tool(
+  'get_changes_since_good_checkpoint',
+  '마지막 정상 시점(깨끗한 체크포인트) 이후 변경된 파일과 라인 수 요약을 반환합니다.',
+  {
+    repoPath: z.string().optional().describe('Root path of the git repository (defaults to current directory)'),
+  },
+  async ({ repoPath }) => {
+    try {
+      const targetPath = resolvePath(repoPath);
+      const changes = coreManager.getChangesSinceGoodCheckpoint(targetPath);
+      const next_action: NextAction = {
+        actor: 'AGENT',
+        action: 'INSPECT_DIFF',
+        agent_should: '마지막 정상 체크포인트 이후 변경된 파일과 줄 수를 분석하여 버그 유입 지점을 추적하세요.',
+        forbidden: ['원본 파일 직접 수정'],
+      };
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify(
+              {
+                success: true,
+                changes,
+                next_action,
+              },
+              null,
+              2
+            ),
+          },
+        ],
+      };
+    } catch (error: any) {
+      return {
+        isError: true,
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify(
+              {
+                success: false,
+                error: error.message,
+                next_action: {
+                  actor: 'AGENT',
+                  action: 'CHECK_REPO_PATH',
+                  agent_should: `정상 시점 이후 변경 요약 조회 오류: ${error.message}`,
+                  forbidden: [],
+                },
+              },
+              null,
+              2
+            ),
+          },
+        ],
       };
     }
   }

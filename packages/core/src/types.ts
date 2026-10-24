@@ -102,11 +102,74 @@ export type Severity = 'HIGH' | 'MEDIUM' | 'LOW' | 'UNASSESSED';
 export type CauseVerdict = 'CONFIRMED' | 'LIKELY' | 'UNKNOWN';
 export type VerificationType = 'LOGIC_TEST' | 'DATA_STATE' | 'UI_FLOW' | 'MANUAL_CHECK';
 
+export type IntentSource = 'USER_QUOTE' | 'AI_INFERRED' | 'MISSING';
+
+export interface IntentProvenance {
+  value: string;
+  source: IntentSource;
+  quote?: string;
+}
+
+export interface StructuredIntents {
+  expectedBehavior: IntentProvenance;
+  observedBehavior: IntentProvenance;
+  reproductionCondition: IntentProvenance;
+  verificationMethod: IntentProvenance;
+}
+
+export interface NextAction {
+  actor: 'USER' | 'AGENT' | 'SUBAGENT';
+  action: string;
+  agent_should: string;
+  forbidden: string[];
+  note?: string;
+  missing_fields?: string[];
+}
+
+export interface HistorySearchItem {
+  id: string;
+  title: string;
+  userReportText?: string;
+  intents?: StructuredIntents;
+  missingIntents?: string[];
+  status: 'OPEN' | 'ANALYZING' | 'RESOLVED';
+  causeVerdict: CauseVerdict;
+  confirmedCause?: string;
+  appliedRepair?: {
+    id: string;
+    summary: string;
+  };
+  createdAt: string;
+}
+
+export interface IncidentAttemptItem {
+  proposalId: string;
+  status: 'REJECTED' | 'VERIFIED_FAIL' | 'TAMPERED';
+  title: string;
+  failedStage?: string;
+  failureReason?: string;
+  createdAt: string;
+}
+
+export interface CheckpointChangesSummary {
+  checkpointId?: string;
+  checkpointLabel?: string;
+  gitHeadSha?: string;
+  createdAt?: string;
+  changedFiles: Array<{ filePath: string; addedLines: number; removedLines: number }>;
+  totalAdded: number;
+  totalRemoved: number;
+  summary: string;
+}
+
 export interface Incident {
   id: string;
   projectId: string;
   baseCheckpointId: string | null;
   title: string;
+  userReportText?: string;
+  intents?: StructuredIntents;
+  missingIntents?: string[];
   errorOutput: string;
   diffSummary: string;
   status: 'OPEN' | 'ANALYZING' | 'RESOLVED';
@@ -285,6 +348,7 @@ export interface RepairProposal {
   verificationStatus: VerificationStatus;
   verificationLog: string;
   approvalStatus: ApprovalStatus;
+  rejectionReason?: string;
   approvalReadiness?: ApprovalReadiness;
   approvalBlockReason?: string;
   orchestrationReview?: OrchestrationReview;

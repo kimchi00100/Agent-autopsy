@@ -6,6 +6,7 @@ import * as http from 'node:http';
 import * as url from 'node:url';
 import { execFileSync, execSync, spawn, ChildProcess } from 'node:child_process';
 import { CoreManager } from '../src/core-manager.js';
+import { Incident } from '../src/types.js';
 import { ApiServer } from '../src/server/api-server.js';
 import { WorktreeRunner } from '../src/runner/worktree-runner.js';
 import { analyzeIncident, parseStackFrames, STACK_TRACE_PATTERNS } from '../src/analysis/analyzer.js';
@@ -1046,6 +1047,7 @@ describe('Agent Autopsy Core Engine Integration Tests', () => {
       {
         repoPath,
         title: '실제 MCP 서브프로세스 사건 A',
+        userReportText: '실제 MCP 서브프로세스 사건 A - 사용자 신고 원문',
         errorOutput: 'TypeError: real mcp process test',
       }
     );
@@ -1098,6 +1100,7 @@ describe('Agent Autopsy Core Engine Integration Tests', () => {
       {
         repoPath,
         title: 'APPDATA 기본 경로 사건 B',
+        userReportText: 'APPDATA 기본 경로 사건 B - 사용자 신고 원문',
         errorOutput: 'TypeError: appdata fallback test',
       }
     );
@@ -2379,5 +2382,313 @@ Expected equality of these values:
     assert.ok(foundBugCandidate, 'Known bug at src/matrix.cpp line 3 must be among top 5 candidates');
     assert.notStrictEqual(analysis.causeVerdict, 'CONFIRMED', 'Must not be CONFIRMED without execution evidence');
     assert.strictEqual(analysis.causeVerdict, 'LIKELY');
+  });
+
+  test('52. Step 4: search_history, get_incident_attempts, and get_changes_since_good_checkpoint return concise summaries under 2KB', async () => {
+    const s4Repo = path.join(testRoot, 's4_history_repo');
+    fs.mkdirSync(path.join(s4Repo, 'src'), { recursive: true });
+    execFileSync('git', ['init', '-b', 'main'], { cwd: s4Repo });
+    execFileSync('git', ['config', 'user.name', 'Tester'], { cwd: s4Repo });
+    execFileSync('git', ['config', 'user.email', 'test@local'], { cwd: s4Repo });
+    fs.writeFileSync(path.join(s4Repo, 'src', 'index.js'), 'console.log("v1");\n');
+    execFileSync('git', ['add', '.'], { cwd: s4Repo });
+    execFileSync('git', ['commit', '-m', 'Initial commit'], { cwd: s4Repo });
+
+    // Capture clean baseline checkpoint
+    const cp = core.captureCheckpoint(s4Repo, 'Initial clean checkpoint', 'tester');
+
+    // Register 12 past incidents to test 10-item cap
+    const project = core.ensureProject(s4Repo);
+    for (let i = 1; i <= 12; i++) {
+      await core.collectIncidentBundle(s4Repo, {
+        title: `과거 결제 버그 #${i} - 쿠폰 할인 계산 오작동`,
+        userReportText: `사용자가 VIP 쿠폰 결제 시 할인이 정상 적용되지 않는다고 신고함 #${i}`,
+        expectedBehavior: '쿠폰 할인 적용',
+        observedBehavior: '정가 결제됨',
+        reproductionCondition: 'VIP 쿠폰 입력 시',
+        verificationMethod: '할인율 확인',
+      });
+    }
+
+    // 1. searchHistory test: max 10 items, < 2KB payload
+    const history = core.searchHistory(s4Repo, ['src/index.js'], ['쿠폰', '할인']);
+    assert.ok(history.length <= 10, 'History search must return at most 10 items');
+    const historyJson = JSON.stringify(history);
+    assert.ok(Buffer.byteLength(historyJson, 'utf8') < 2048, `History payload must be < 2KB (was ${Buffer.byteLength(historyJson, 'utf8')} bytes)`);
+
+    // Register a rejected proposal with reason
+    const incs = core.getDatabase().listIncidents(project.id);
+    const targetInc = incs[0];
+    const proposalId = `prop_s4_${Date.now()}`;
+    core.getDatabase().insertRepairProposal({
+      id: proposalId,
+      incidentId: targetInc.id,
+      rootCauseAnalysis: '잘못된 할인 계산식 수정안 (임시)',
+      patchDiff: '--- a/src/index.js\n+++ b/src/index.js\n@@ -1,1 +1,1 @@\n-console.log("v1");\n+console.log("v2");',
+      fileChangesJson: '[]',
+      touchedFiles: ['src/index.js'],
+      verificationStatus: 'VERIFIED_FAIL',
+      verificationLog: 'AssertionError: 할인 금액 불일치',
+      approvalStatus: 'REJECTED',
+      rejectionReason: '요구사항과 맞지 않는 불필요한 파일 변경 포함',
+      approvedAt: null,
+      appliedAt: null,
+      createdAt: new Date().toISOString(),
+    });
+
+    // 2. getIncidentAttempts test: returns rejected/failed attempts with failure reason under 2KB
+    const attempts = core.getIncidentAttempts(targetInc.id);
+    assert.ok(attempts.length >= 1, 'Must return rejected/failed attempts');
+    assert.strictEqual(attempts[0].status, 'REJECTED');
+    assert.ok(attempts[0].failureReason?.includes('불필요한 파일 변경'), 'Must capture rejection reason');
+    const attemptsJson = JSON.stringify(attempts);
+    assert.ok(Buffer.byteLength(attemptsJson, 'utf8') < 2048, `Attempts payload must be < 2KB (was ${Buffer.byteLength(attemptsJson, 'utf8')} bytes)`);
+
+    // Make an uncommitted change and check changes since good checkpoint
+    fs.appendFileSync(path.join(s4Repo, 'src', 'index.js'), 'console.log("dirty line 1");\nconsole.log("dirty line 2");\n');
+    const changes = core.getChangesSinceGoodCheckpoint(s4Repo);
+    assert.strictEqual(changes.checkpointId, cp.id);
+    assert.ok(changes.totalAdded >= 2, 'Must count added lines');
+    assert.ok(changes.summary.includes(cp.label), 'Summary must reference checkpoint label');
+    const changesJson = JSON.stringify(changes);
+    assert.ok(Buffer.byteLength(changesJson, 'utf8') < 2048, `Changes payload must be < 2KB (was ${Buffer.byteLength(changesJson, 'utf8')} bytes)`);
+  });
+
+  test('53. Step 4: collect_incident_bundle with all 4 intents registers without questions and proceeds directly', async () => {
+    const s4Repo = path.join(testRoot, 's4_intent_complete_repo');
+    fs.mkdirSync(path.join(s4Repo, 'src'), { recursive: true });
+    execFileSync('git', ['init', '-b', 'main'], { cwd: s4Repo });
+    execFileSync('git', ['config', 'user.name', 'Tester'], { cwd: s4Repo });
+    execFileSync('git', ['config', 'user.email', 'test@local'], { cwd: s4Repo });
+    fs.writeFileSync(path.join(s4Repo, 'src', 'calc.js'), 'module.exports = { add: (a, b) => a - b };\n');
+    execFileSync('git', ['add', '.'], { cwd: s4Repo });
+    execFileSync('git', ['commit', '-m', 'Initial commit'], { cwd: s4Repo });
+
+    const userReportText = '더하기 함수 add(1, 2)를 호출했는데 3이 아니라 -1이 나옵니다. 테스트 코드로 결과를 확인해주세요.';
+    const incident = await core.collectIncidentBundle(s4Repo, {
+      title: 'add(1, 2) 호출 시 -1 반환 버그',
+      userReportText,
+      expectedBehavior: 'add(1, 2) 호출 시 3이 반환되어야 함',
+      observedBehavior: '-1이 나옵니다', // directly in userReportText -> USER_QUOTE
+      reproductionCondition: 'add(1, 2) 실행 시',
+      verificationMethod: '테스트 코드로 결과를 확인', // directly in userReportText -> USER_QUOTE
+    });
+
+    // 1. All 4 intents are present: missingIntents must be empty
+    assert.strictEqual(incident.missingIntents?.length, 0, 'missingIntents must be empty when all 4 are provided');
+    assert.strictEqual(incident.userConfirmedIntent, true, 'userConfirmedIntent must be true');
+
+    // 2. Provenance must identify USER_QUOTE vs AI_INFERRED
+    assert.ok(incident.intents, 'Structured intents must exist');
+    assert.strictEqual(incident.intents.observedBehavior.source, 'USER_QUOTE');
+    assert.strictEqual(incident.intents.verificationMethod.source, 'USER_QUOTE');
+    assert.strictEqual(incident.intents.reproductionCondition.source, 'AI_INFERRED');
+
+    // 3. next_action must direct to proceed with reproduction or repair without asking questions
+    const nextAction = core.getIncidentNextAction(incident);
+    assert.strictEqual(nextAction.actor, 'AGENT');
+    assert.strictEqual(nextAction.action, 'RUN_REPRODUCTION_OR_PROPOSE_REPAIR');
+    assert.strictEqual(nextAction.missing_fields, undefined);
+
+    // 4. Strict USER_QUOTE check: AI-synthesized sentence with scattered user words MUST be AI_INFERRED
+    const userReportMixed = '장바구니 결제 시 오류가 발생합니다.';
+    const incidentMixed = await core.collectIncidentBundle(s4Repo, {
+      title: 'AI 합성 문장 테스트',
+      userReportText: userReportMixed,
+      expectedBehavior: '정상 결제',
+      observedBehavior: '사용자가 장바구니에서 결제를 진행할 때 오류가 나는 상태',
+      reproductionCondition: '결제 진행 시',
+      verificationMethod: '결제 확인',
+    });
+    assert.strictEqual(
+      incidentMixed.intents?.observedBehavior.source,
+      'AI_INFERRED',
+      'AI-synthesized sentence with scattered user words must be classified as AI_INFERRED'
+    );
+    assert.strictEqual(
+      incidentMixed.intents?.observedBehavior.quote,
+      undefined,
+      'AI_INFERRED must not have quote'
+    );
+
+    // 5. Without userReportText: all intents must be AI_INFERRED, 0 USER_QUOTE, userReportText is '없음', and next_action.action is 'PROVIDE_USER_REPORT'
+    const incidentNoReport = await core.collectIncidentBundle(s4Repo, {
+      title: '더하기 함수 add(1, 2)를 호출했는데 3이 아니라 -1이 나옵니다. 테스트 코드로 결과를 확인해주세요.',
+      expectedBehavior: '3이 반환되어야 함',
+      observedBehavior: '-1이 나옵니다',
+      reproductionCondition: 'add(1, 2) 실행 시',
+      verificationMethod: '테스트 코드로 결과를 확인',
+    });
+    assert.strictEqual(incidentNoReport.userReportText, '없음');
+    assert.ok(incidentNoReport.intents);
+    const quotes = Object.values(incidentNoReport.intents).filter((i: any) => i.source === 'USER_QUOTE');
+    assert.strictEqual(quotes.length, 0, '원문 없이 보내면 USER_QUOTE가 하나도 안 나와야 함 (title을 원문으로 쓰지 않음)');
+    assert.strictEqual(incidentNoReport.intents.observedBehavior.source, 'AI_INFERRED');
+    assert.strictEqual(incidentNoReport.intents.verificationMethod.source, 'AI_INFERRED');
+    const nextActionNoReport = core.getIncidentNextAction(incidentNoReport);
+    assert.strictEqual(nextActionNoReport.actor, 'USER');
+    assert.strictEqual(nextActionNoReport.action, 'PROVIDE_USER_REPORT');
+    assert.ok(nextActionNoReport.agent_should.includes('userReportText') || nextActionNoReport.agent_should.includes('원문'));
+  });
+
+  test('54. Step 4: collect_incident_bundle with missing intent(s) registers and outputs next_action.action: CLARIFY_INTENT with only missing fields', async () => {
+    const s4Repo = path.join(testRoot, 's4_intent_missing_repo');
+    fs.mkdirSync(path.join(s4Repo, 'src'), { recursive: true });
+    execFileSync('git', ['init', '-b', 'main'], { cwd: s4Repo });
+    execFileSync('git', ['config', 'user.name', 'Tester'], { cwd: s4Repo });
+    execFileSync('git', ['config', 'user.email', 'test@local'], { cwd: s4Repo });
+    fs.writeFileSync(path.join(s4Repo, 'src', 'calc.js'), 'module.exports = {};\n');
+    execFileSync('git', ['add', '.'], { cwd: s4Repo });
+    execFileSync('git', ['commit', '-m', 'Initial commit'], { cwd: s4Repo });
+
+    const userReportText = '로그인이 안 돼요.';
+    // Provide expected and observed behavior, but omit reproductionCondition and verificationMethod
+    const incident = await core.collectIncidentBundle(s4Repo, {
+      title: '로그인이 안 돼요.',
+      userReportText,
+      expectedBehavior: '로그인 성공 후 대시보드로 이동',
+      observedBehavior: '로그인이 안 돼요.',
+      reproductionCondition: '', // MISSING
+      verificationMethod: undefined, // MISSING
+    });
+
+    // 1. Incident must be registered in DB (not thrown)
+    assert.ok(incident.id, 'Incident must be registered successfully');
+    assert.strictEqual(incident.missingIntents?.length, 2);
+    assert.ok(incident.missingIntents?.includes('reproductionCondition'));
+    assert.ok(incident.missingIntents?.includes('verificationMethod'));
+    assert.strictEqual(incident.userConfirmedIntent, false);
+
+    // 2. next_action must be CLARIFY_INTENT with only the missing fields
+    const nextAction = core.getIncidentNextAction(incident);
+    assert.strictEqual(nextAction.actor, 'USER');
+    assert.strictEqual(nextAction.action, 'CLARIFY_INTENT');
+    assert.deepStrictEqual(nextAction.missing_fields, ['reproductionCondition', 'verificationMethod']);
+    assert.ok(nextAction.agent_should.includes('reproductionCondition'));
+    assert.ok(nextAction.agent_should.includes('verificationMethod'));
+    assert.ok(!nextAction.agent_should.includes('expectedBehavior'), 'Must NOT ask for expectedBehavior since it was provided');
+  });
+
+  test('55. Step 4: Multi-Process Real MCP server enforces next_action on all 17 tools and clarifies review completion is NOT user approval', async () => {
+    const monorepoRoot = fs.existsSync(path.resolve(process.cwd(), 'packages/mcp-server'))
+      ? process.cwd()
+      : path.resolve(process.cwd(), '../..');
+    const mcpDistScript = path.resolve(monorepoRoot, 'packages/mcp-server/dist/index.js');
+
+    // Helper: start live MCP server session over stdio
+    const startMcpSession = (env: NodeJS.ProcessEnv): Promise<{ callTool: (name: string, args: any) => Promise<{ text: string; isError?: boolean }>; close: () => void }> => {
+      return new Promise((resolve, reject) => {
+        const cp = spawn('node', [mcpDistScript], {
+          env: { ...process.env, ...env },
+          stdio: ['pipe', 'pipe', 'pipe'],
+        });
+
+        let stdoutBuf = '';
+        let isInitialized = false;
+        let nextId = 2;
+        const pendingRequests = new Map<number, (res: { text: string; isError?: boolean }) => void>();
+
+        cp.stdout.on('data', (chunk) => {
+          stdoutBuf += chunk.toString();
+          const lines = stdoutBuf.split('\n');
+          stdoutBuf = lines.pop() || '';
+
+          for (const line of lines) {
+            if (!line.trim()) continue;
+            try {
+              const msg = JSON.parse(line);
+              if (msg.id === 1 && !isInitialized) {
+                isInitialized = true;
+                cp.stdin.write(JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' }) + '\n');
+                resolve({
+                  callTool: (toolName: string, args: any) => {
+                    return new Promise<{ text: string; isError?: boolean }>((resTool) => {
+                      const reqId = nextId++;
+                      pendingRequests.set(reqId, resTool);
+                      cp.stdin.write(
+                        JSON.stringify({
+                          jsonrpc: '2.0',
+                          id: reqId,
+                          method: 'tools/call',
+                          params: { name: toolName, arguments: args },
+                        }) + '\n'
+                      );
+                    });
+                  },
+                  close: () => cp.kill(),
+                });
+              } else if (msg.id && pendingRequests.has(msg.id)) {
+                const resTool = pendingRequests.get(msg.id)!;
+                pendingRequests.delete(msg.id);
+                const text = msg.result?.content?.[0]?.text || '';
+                resTool({ text, isError: msg.result?.isError });
+              }
+            } catch {}
+          }
+        });
+
+        cp.on('error', reject);
+        cp.stdin.write(
+          JSON.stringify({
+            jsonrpc: '2.0',
+            id: 1,
+            method: 'initialize',
+            params: {
+              protocolVersion: '2024-11-05',
+              capabilities: {},
+              clientInfo: { name: 'test-harness', version: '1.0' },
+            },
+          }) + '\n'
+        );
+      });
+    };
+
+    const tempSharedDataDir = path.join(testRoot, 'mcp_17_tools_data');
+    fs.mkdirSync(tempSharedDataDir, { recursive: true });
+    const session = await startMcpSession({ AUTOPSY_DATA_DIR: tempSharedDataDir });
+
+    const mcpRepo = path.join(testRoot, 'mcp_17_tools_repo');
+    fs.mkdirSync(path.join(mcpRepo, 'src'), { recursive: true });
+    execFileSync('git', ['init', '-b', 'main'], { cwd: mcpRepo });
+    execFileSync('git', ['config', 'user.name', 'Tester'], { cwd: mcpRepo });
+    execFileSync('git', ['config', 'user.email', 'test@local'], { cwd: mcpRepo });
+    fs.writeFileSync(path.join(mcpRepo, 'src', 'app.js'), 'console.log("hello");\n');
+    execFileSync('git', ['add', '.'], { cwd: mcpRepo });
+    execFileSync('git', ['commit', '-m', 'Init commit'], { cwd: mcpRepo });
+
+    const toolCalls = [
+      { name: 'capture_checkpoint', args: { repoPath: mcpRepo, label: 'test checkpoint' } },
+      { name: 'inspect_project_state', args: { repoPath: mcpRepo } },
+      { name: 'collect_incident_bundle', args: { repoPath: mcpRepo, title: 'MCP Inc', userReportText: '오류 발생', errorOutput: 'Err' } },
+      { name: 'propose_test_command', args: { repoPath: mcpRepo, command: 'npm test', reason: 'unit' } },
+      { name: 'propose_and_verify_repair', args: { incidentId: 'invalid_id', rootCauseAnalysis: 'r', fileChanges: [] } },
+      { name: 'apply_approved_repair', args: { proposalId: 'invalid_prop', repoPath: mcpRepo } },
+      { name: 'rollback_to_checkpoint', args: { checkpointId: 'invalid_cp', repoPath: mcpRepo } },
+      { name: 'record_agent_event', args: { repoPath: mcpRepo, kind: 'NOTE', title: 'ev' } },
+      { name: 'submit_orchestration_review', args: { proposalId: 'prop_dummy', repoPath: mcpRepo, reviewer: 'rev', findings: ['f'] } },
+      { name: 'request_review_challenge', args: { proposalId: 'prop_dummy', repoPath: mcpRepo } },
+      { name: 'await_user_decision', args: { proposalId: 'prop_dummy', repoPath: mcpRepo, timeoutSec: 1 } },
+      { name: 'get_pending_directives', args: { repoPath: mcpRepo } },
+      { name: 'acknowledge_directive', args: { directiveId: 'dir_dummy' } },
+      { name: 'run_reproduction', args: { incidentId: 'inc_dummy', testFilePath: 'nonexistent/file.js', repoPath: mcpRepo } },
+      { name: 'search_history', args: { repoPath: mcpRepo } },
+      { name: 'get_incident_attempts', args: { incidentId: 'inc_dummy' } },
+      { name: 'get_changes_since_good_checkpoint', args: { repoPath: mcpRepo } },
+    ];
+
+    assert.strictEqual(toolCalls.length, 17, 'Must test exactly all 17 MCP tools');
+
+    for (const tc of toolCalls) {
+      const res = await session.callTool(tc.name, tc.args);
+      assert.ok(res.text && res.text.length > 0, `Tool ${tc.name} returned empty text`);
+      const data = JSON.parse(res.text);
+      assert.ok(data.next_action, `Tool ${tc.name} response must contain next_action: ${res.text}`);
+      assert.ok(['USER', 'AGENT', 'SUBAGENT'].includes(data.next_action.actor), `Tool ${tc.name} next_action.actor invalid`);
+      assert.ok(typeof data.next_action.action === 'string' && data.next_action.action.length > 0, `Tool ${tc.name} next_action.action missing`);
+      assert.ok(typeof data.next_action.agent_should === 'string' && data.next_action.agent_should.length > 0, `Tool ${tc.name} next_action.agent_should missing`);
+      assert.ok(Array.isArray(data.next_action.forbidden), `Tool ${tc.name} next_action.forbidden must be array`);
+    }
+
+    session.close();
   });
 });

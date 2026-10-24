@@ -35,6 +35,7 @@ import {
   ProjectOverview,
   ApprovalFingerprint,
   VerificationMode,
+  Severity,
   RiskLevel,
   OrchestrationReviewStatus,
   ApprovalReadiness,
@@ -62,6 +63,36 @@ import { analyzeIncident, IncidentAnalysis, parseUnifiedDiff } from './analysis/
 
 function parseUnifiedDiffFiles(diff: string): string[] {
   return parseUnifiedDiff(diff).map((f) => f.filePath);
+}
+
+export function matchesGlobPath(filePath: string, pattern: string): boolean {
+  const normPath = filePath.replace(/\\/g, '/').replace(/^\/+/, '');
+  const normPattern = pattern.replace(/\\/g, '/').replace(/^\/+/, '');
+
+  if (normPattern === '*' || normPattern === '**' || normPattern === '**/*') return true;
+
+  const regexStr = normPattern
+    .replace(/[.+^${}()|[\]\\]/g, '\\$&')
+    .replace(/\*\*/g, '§§')
+    .replace(/\*/g, '[^/]*')
+    .replace(/§§/g, '.*')
+    .replace(/\?/g, '[^/]');
+
+  const regex = new RegExp(`^${regexStr}$`, 'i');
+  return regex.test(normPath) || regex.test(path.basename(normPath));
+}
+
+export function countDiffLines(unifiedDiff: string): { addedLines: number; removedLines: number; totalChangedLines: number } {
+  let addedLines = 0;
+  let removedLines = 0;
+  if (!unifiedDiff) return { addedLines: 0, removedLines: 0, totalChangedLines: 0 };
+  const lines = unifiedDiff.split(/\r?\n/);
+  for (const line of lines) {
+    if (line.startsWith('+++') || line.startsWith('---')) continue;
+    if (line.startsWith('+')) addedLines++;
+    else if (line.startsWith('-')) removedLines++;
+  }
+  return { addedLines, removedLines, totalChangedLines: addedLines + removedLines };
 }
 
 function firstMeaningfulLine(text: string): string {
@@ -1012,7 +1043,7 @@ export class CoreManager {
       | {
           title: string;
           errorOutput?: string;
-          severity?: 'HIGH' | 'MEDIUM' | 'LOW';
+          severity?: Severity;
           agentName?: string;
           sessionId?: string;
           expectedBehavior?: string;
@@ -1026,7 +1057,7 @@ export class CoreManager {
           userConfirmationSummary?: string;
         },
     errorOutput?: string,
-    severity: 'HIGH' | 'MEDIUM' | 'LOW' = 'HIGH',
+    severity: Severity = 'UNASSESSED',
     agentName: string = 'agent',
     sessionId?: string,
     expectedBehavior?: string,
@@ -1040,10 +1071,19 @@ export class CoreManager {
     userConfirmationSummary?: string
   ): Promise<Incident> {
     let title: string;
+    let finalSeverity: Severity = 'UNASSESSED';
+    let severityEvidence: string[] = [];
+
     if (typeof titleOrOptions === 'object' && titleOrOptions !== null) {
       title = titleOrOptions.title;
       errorOutput = titleOrOptions.errorOutput;
-      severity = titleOrOptions.severity || 'HIGH';
+      if (titleOrOptions.severity) {
+        finalSeverity = titleOrOptions.severity;
+        severityEvidence = [`사용자 명시적 신고 등급: ${finalSeverity}`];
+      } else {
+        finalSeverity = 'UNASSESSED';
+        severityEvidence = ['사용자 미지정: 기본 미판정 (UNASSESSED)'];
+      }
       agentName = titleOrOptions.agentName || 'agent';
       sessionId = titleOrOptions.sessionId;
       expectedBehavior = titleOrOptions.expectedBehavior;
@@ -1057,6 +1097,13 @@ export class CoreManager {
       userConfirmationSummary = titleOrOptions.userConfirmationSummary;
     } else {
       title = titleOrOptions;
+      if (severity && severity !== 'UNASSESSED') {
+        finalSeverity = severity;
+        severityEvidence = [`사용자 명시적 신고 등급: ${finalSeverity}`];
+      } else {
+        finalSeverity = 'UNASSESSED';
+        severityEvidence = ['사용자 미지정: 기본 미판정 (UNASSESSED)'];
+      }
     }
 
     if ((expectedBehavior || observedBehavior) && !userConfirmedIntent) {
@@ -1127,21 +1174,30 @@ export class CoreManager {
     }
 
     const changedFiles = parseUnifiedDiffFiles(diffSummary);
-    const codeHealth: HealthLevelStatus =
-      finalErrorOutput.includes('SyntaxError') || finalErrorOutput.includes('ReferenceError') || finalErrorOutput.includes('TypeError')
-        ? 'FAIL'
-        : 'PASS';
+    const hasErrorOutput = Boolean(finalErrorOutput && finalErrorOutput.trim());
+    const codeHealth: HealthLevelStatus = hasErrorOutput ? 'FAIL' : 'PASS';
     const threeLevelHealth: ThreeLevelHealth = {
       code: codeHealth,
       functional: 'FAIL',
       requirement: 'FAIL',
       details: {
-        codeSummary: codeHealth === 'PASS' ? '빌드 및 타입 검사 정상' : '런타임/구문 예외 감지됨',
+        codeSummary: codeHealth === 'PASS' ? '빌드 및 타입 검사 정상' : '오류 출력 감지됨 (원인 추정 단계)',
         functionalSummary: '사용자 의도와 실제 동작 불일치',
         requirementSummary: '최종 요구사항 미충족',
       },
     };
-    const causeVerdict: CauseVerdict = codeHealth === 'FAIL' ? 'CONFIRMED' : 'UNKNOWN';
+
+    // 2단계: 오류 출력에 SyntaxError/TypeError가 있다고 CONFIRMED로 올리지 않음.
+    // 확신도는 3단계 실행 증거(재현 테스트, 실행 경로 등)로만 올림. 기본값은 UNKNOWN.
+    const causeVerdict: CauseVerdict = 'UNKNOWN';
+    const causeEvidence: string[] = [];
+    if (hasErrorOutput) {
+      causeEvidence.push('테스트/런타임 오류 출력 감지 (원인 추정 단계)');
+      causeEvidence.push('실행 증거(재현 테스트, 실행 경로 등) 미확보로 원인 확신도 미확정(UNKNOWN) 유지');
+    } else {
+      causeEvidence.push('오류 출력 없음: 사용자 보고 증상 기반 분석 대기');
+      causeEvidence.push('원인 불명은 위험 신호가 아니며, 재현 테스트 작성 및 증거 수집 필요');
+    }
 
     // Risk-Adaptive Evidence Gate evaluation
     const decision = this.evaluateOrchestrationDecision(
@@ -1164,7 +1220,9 @@ export class CoreManager {
       errorOutput: finalErrorOutput || testExecutionNote || '오류 출력이 기록되지 않았습니다.',
       diffSummary: diffSummary || '변경된 Git diff가 감지되지 않았습니다.',
       status: 'OPEN',
-      severity,
+      severity: finalSeverity,
+      severityEvidence,
+      causeEvidence,
       agentName,
       sessionId,
       expectedBehavior,
@@ -1192,6 +1250,8 @@ export class CoreManager {
 
   /**
    * Risk-Adaptive Evidence Gate: Evaluates task difficulty & risk to issue an OrchestrationDecision
+   * Judged strictly by what the patch changes: sensitivePaths glob, changed lines threshold, verification retries.
+   * File count or UNKNOWN cause does NOT escalate risk.
    */
   public evaluateOrchestrationDecision(
     project: Project,
@@ -1207,62 +1267,71 @@ export class CoreManager {
     const mode: VerificationMode = project.verificationMode || 'AUTO';
     const host: HostEnvironment = project.preferredHost || 'antigravity';
 
-    // 1. Security-sensitive domain detection
-    const securityPattern = /auth|token|jwt|crypto|password|secret|permission|role|payment|checkout|discount|coupon|billing|migration|schema|drop\s+table/i;
-    const isSecuritySensitive =
-      securityPattern.test(title) ||
-      securityPattern.test(errorOutput) ||
-      changedFiles.some((f) => securityPattern.test(f));
+    // 1. 민감 경로: 사용자가 프로젝트마다 직접 지정 (project.sensitivePaths)
+    // 기존 키워드 정규식(auth|token|payment...) 완전 제거
+    const sensitivePatterns = project.sensitivePaths || [];
+    const matchedSensitiveFiles = changedFiles.filter((file) =>
+      sensitivePatterns.some((pattern) => matchesGlobPath(file, pattern))
+    );
+    const touchesSensitivePath = matchedSensitiveFiles.length > 0;
 
-    if (isSecuritySensitive) {
-      riskSignals.push('보안·인증·결제 관련 민감 로직 감지');
-    }
+    // 2. 바뀐 줄 수 계산 (diffSummary에서 추가/삭제 줄 수 합산)
+    const { totalChangedLines } = countDiffLines(diffSummary);
+    const thresholdLines = typeof project.riskThresholdLines === 'number' ? project.riskThresholdLines : 200;
+    const halfThresholdLines = Math.floor(thresholdLines / 2); // 기본 100줄
 
-    // 2. Blast radius (multi-file / multi-module)
-    if (changedFiles.length >= 3) {
-      riskSignals.push(`광범위한 변경 영향도 (${changedFiles.length}개 파일 수정)`);
-    } else if (changedFiles.length >= 2) {
-      riskSignals.push(`다중 모듈 연계 변경 (${changedFiles.length}개 파일 수정)`);
-    }
-
-    // 3. Functional mismatch or uncertainty signal
-    if (causeVerdict === 'UNKNOWN') {
-      riskSignals.push('원인 증거 불충분 (UNKNOWN 판정)');
-    } else if (causeVerdict === 'LIKELY') {
-      riskSignals.push('원인 간접 추론 (LIKELY 판정)');
-    }
-
-    if (threeLevelHealth && threeLevelHealth.code === 'PASS' && threeLevelHealth.functional === 'FAIL') {
-      riskSignals.push('코드는 정상이나 기능이 의도와 불일치하는 상태');
-    }
-
-    // 4. Repeated retry failures
-    if (retryCount >= 2) {
-      riskSignals.push(`격리 검증 연속 ${retryCount}회 실패`);
-    } else if (retryCount >= 1) {
-      riskSignals.push('이전 수정안 격리 검증 실패 이력 감지');
-    }
-
-    // Determine Risk Level
+    // 3. 위험도 등급 판정:
+    // - 높음: 민감 경로를 건드림, 바뀐 줄 수가 기준 이상(기본 200줄), 같은 사건에서 격리 검증 2회 이상 실패
+    // - 중간: 바뀐 줄 수가 높음 기준의 절반 이상(기본 100줄), 또는 같은 사건에서 격리 검증 1회 실패
+    // - 낮음: 위 조건에 해당하지 않음
     let riskLevel: RiskLevel = 'LOW';
-    if (isSecuritySensitive || changedFiles.length >= 3 || retryCount >= 2) {
-      riskLevel = 'HIGH';
-    } else if (changedFiles.length >= 2 || causeVerdict !== 'CONFIRMED' || retryCount === 1) {
-      riskLevel = 'MEDIUM';
+
+    if (touchesSensitivePath) {
+      riskSignals.push(`사용자 지정 민감 경로 수정 감지 (${matchedSensitiveFiles.join(', ')})`);
+    }
+    if (totalChangedLines >= thresholdLines) {
+      riskSignals.push(`대규모 코드 변경 (${totalChangedLines}줄 >= 설정 기준 ${thresholdLines}줄)`);
+    }
+    if (retryCount >= 2) {
+      riskSignals.push(`동일 사건 격리 검증 ${retryCount}회 실패 이력 감지`);
     }
 
-    // Generate Directive & Review Requirement based on mode & risk
+    if (touchesSensitivePath || totalChangedLines >= thresholdLines || retryCount >= 2) {
+      riskLevel = 'HIGH';
+    } else if (totalChangedLines >= halfThresholdLines || retryCount === 1) {
+      riskLevel = 'MEDIUM';
+      if (totalChangedLines >= halfThresholdLines) {
+        riskSignals.push(`중규모 코드 변경 (${totalChangedLines}줄 >= 기준 ${halfThresholdLines}줄)`);
+      }
+      if (retryCount === 1) {
+        riskSignals.push('동일 사건 이전 격리 검증 실패 1회 감지');
+      }
+    } else {
+      riskLevel = 'LOW';
+      riskSignals.push(`민감 경로 미포함, 소규모 변경 (${totalChangedLines}줄 < ${halfThresholdLines}줄), 격리 검증 실패 이력 없음`);
+    }
+
+    // 4. 모드별 서브에이전트 검토 조건:
+    // - 자동 판단 모드(기본): 수정 위험도가 높음(HIGH)일 때만 서브에이전트 검토 필수
+    // - 심층 검증 우선 모드: 수정 위험도가 중간(MEDIUM) 이상이면 서브에이전트 검토 필수
+    // - 메인 AI 전용 모드: 서브에이전트를 부르지 않는다. 위험도가 중간 이상이면 자체 점검표 작성.
     let directive: OrchestrationDecision['directive'] = 'DIRECT_SOLVE';
     let reviewRequirement: OrchestrationDecision['reviewRequirement'] = 'NONE';
     const skippedWarnings: string[] = [];
+    let selfReviewChecklist: string[] | undefined;
 
     if (mode === 'MAIN_ONLY') {
       directive = 'SKIPPED_MAIN_ONLY';
       reviewRequirement = 'NONE';
       if (riskLevel !== 'LOW') {
         skippedWarnings.push(
-          `[메인 AI 전용 모드]: ${riskLevel} 위험도 작업이지만 사용자 설정에 의해 서브에이전트 오케스트레이션이 생략되었습니다. (위험 신호: ${riskSignals.join(', ')})`
+          `[메인 AI 전용 모드]: ${riskLevel} 위험도 작업이지만 사용자 설정에 의해 서브에이전트 독립 검토가 생략되었습니다.`
         );
+        selfReviewChecklist = [
+          `민감 경로 점검: ${touchesSensitivePath ? '사용자 지정 민감 경로 포함 (' + matchedSensitiveFiles.join(', ') + ')' : '민감 경로 미포함'}`,
+          `기존 동작 변경 부위: ${changedFiles.join(', ')} 파일의 인터페이스 및 사이드이펙트 영향 점검`,
+          `테스트 미커버 영역: 격리 검증 스위트 외 엣지케이스 및 추가 수동 점검 필요 사항`,
+        ];
       }
     } else if (mode === 'DEEP_PRIORITY') {
       if (riskLevel === 'LOW') {
@@ -1273,16 +1342,13 @@ export class CoreManager {
         reviewRequirement = 'MANDATORY_BEFORE_APPROVAL';
       }
     } else {
-      // AUTO mode
-      if (riskLevel === 'LOW') {
-        directive = 'DIRECT_SOLVE';
-        reviewRequirement = 'NONE';
-      } else if (riskLevel === 'MEDIUM') {
-        directive = 'INVOKE_NATIVE_ORCHESTRATION';
-        reviewRequirement = 'CONDITIONAL';
-      } else {
+      // AUTO mode: ONLY HIGH triggers mandatory subagent review
+      if (riskLevel === 'HIGH') {
         directive = 'INVOKE_NATIVE_ORCHESTRATION';
         reviewRequirement = 'MANDATORY_BEFORE_APPROVAL';
+      } else {
+        directive = 'DIRECT_SOLVE';
+        reviewRequirement = 'NONE';
       }
     }
 
@@ -1300,10 +1366,10 @@ export class CoreManager {
 
     const requiresOrchestration = directive === 'INVOKE_NATIVE_ORCHESTRATION';
     const reason = requiresOrchestration
-      ? '고위험 경로 또는 다중 모듈 변경으로 독립 서브에이전트 검증이 필요합니다.'
+      ? '사용자 지정 민감 경로 수정 또는 대규모 변경(설정 기준 초과)으로 독립 서브에이전트 검증이 필요합니다.'
       : directive === 'SKIPPED_MAIN_ONLY'
       ? '메인 AI 전용 모드로 설정되어 추가 AI 오케스트레이션이 생략되었습니다.'
-      : '단순 저위험 작업으로 메인 AI 단독 처리가 가능합니다.';
+      : '단순 저위험 작업(민감 경로 미포함 및 소규모 변경)으로 메인 AI 단독 처리가 가능합니다.';
 
     return {
       requiresOrchestration,
@@ -1316,6 +1382,7 @@ export class CoreManager {
       reviewRequirement,
       hostDelegationGuide,
       skippedVerificationWarnings: skippedWarnings,
+      selfReviewChecklist,
     };
   }
 
@@ -1446,7 +1513,7 @@ export class CoreManager {
         approvalBlockReason = `[고위험 변경]: ${decision.riskSignals.join(', ')} 등의 이유로 호스트 내장 서브에이전트의 독립 교차 검토가 필수입니다. submit_orchestration_review 도구로 검토 증거를 제출해야 정규 승인이 가능합니다.`;
       } else if (decision.verificationMode === 'MAIN_ONLY' && decision.riskLevel !== 'LOW') {
         approvalReadiness = 'APPROVABLE_WITH_RISK_WARNING';
-        approvalBlockReason = `[메인 AI 전용 모드]: ${decision.riskLevel} 위험도 검증이 생략되었습니다.`;
+        approvalBlockReason = `[메인 AI 전용 모드]: ${decision.riskLevel} 위험도 독립 검토가 생략되었습니다. 승인 전 자체 점검표를 확인하세요.`;
       } else {
         approvalReadiness = 'READY_FOR_APPROVAL';
         approvalBlockReason = null;
@@ -1467,6 +1534,8 @@ export class CoreManager {
       patchDiff: prepared.unifiedDiff,
       patchHash,
       riskLevel: decision.riskLevel,
+      riskEvidence: decision.riskSignals,
+      selfReviewChecklist: decision.selfReviewChecklist,
       touchedFiles: prepared.touchedFiles,
       fileChangesJson: JSON.stringify(fileChanges),
       verificationStatus,
@@ -1645,7 +1714,13 @@ export class CoreManager {
 
   public updateProjectSettings(
     repoPath: string,
-    settings: { verificationMode?: VerificationMode; preferredHost?: HostEnvironment; testCommand?: string }
+    settings: {
+      verificationMode?: VerificationMode;
+      preferredHost?: HostEnvironment;
+      testCommand?: string;
+      sensitivePaths?: string[];
+      riskThresholdLines?: number;
+    }
   ): Project {
     const project = this.ensureProject(repoPath);
     const testCommandSignature = settings.testCommand

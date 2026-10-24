@@ -501,10 +501,17 @@ export function analyzeIncident(
   let causeVerdict: CauseVerdict = incident?.causeVerdict || 'UNKNOWN';
   const missingEvidenceChecklist: string[] = [];
 
-  if (topCandidate && topCandidate.matchPercentage >= 80 && !topCandidate.temporalOnly) {
+  // 2단계 원인 확신도 판정: 오류 출력이 났다는 사실만으로 CONFIRMED를 주지 않음.
+  // 오류가 났다는 사실은 원인 확정이 아니며, 확신도는 3단계의 실행 증거(재현 테스트, 실행된 줄, 실패 위치)로만 올림.
+  if (
+    topCandidate &&
+    topCandidate.evidenceStrength === 'HIGH' &&
+    !topCandidate.temporalOnly &&
+    topCandidate.supportingEvidence.length >= 2
+  ) {
     causeVerdict = 'CONFIRMED';
     topCandidate.causeVerdict = 'CONFIRMED';
-  } else if (topCandidate && topCandidate.matchPercentage >= 45) {
+  } else if (topCandidate && topCandidate.supportingEvidence.length > 0) {
     causeVerdict = 'LIKELY';
     topCandidate.causeVerdict = 'LIKELY';
     missingEvidenceChecklist.push('호출부 인자 전달 및 상위 호출 체인에서의 상태 변이(State Mutation) 확인 권장');

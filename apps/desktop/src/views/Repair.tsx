@@ -280,6 +280,39 @@ export default function Repair({
               <span>이 수정안은 <code className="rounded border border-slate-300 bg-white px-1.5 py-0.5 font-mono text-[11px] font-bold text-indigo-700">{proposal.verifiedWithCommand || 'npm test'}</code> (으)로 검증됨</span>
             </div>
 
+            {/* Risk Evidence List */}
+            {proposal.riskEvidence && proposal.riskEvidence.length > 0 && (
+              <div className="mb-3 rounded-lg border border-slate-100 bg-slate-50/70 p-2.5 text-xs text-slate-700">
+                <span className="font-semibold text-slate-500">위험도 판정 근거:</span>
+                <ul className="mt-1 space-y-0.5 list-disc pl-4 text-[11px] text-slate-600">
+                  {proposal.riskEvidence.map((ev, i) => (
+                    <li key={i}>{ev}</li>
+                  ))}
+                </ul>
+              </div>
+            )}
+
+            {/* Main AI Self-Review Checklist (when MAIN_ONLY mode has MEDIUM/HIGH risk) */}
+            {proposal.selfReviewChecklist && proposal.selfReviewChecklist.length > 0 && (
+              <div className="mb-3 rounded-xl border border-amber-300 bg-amber-50/60 p-4 text-xs text-amber-950">
+                <div className="flex items-center gap-1.5 font-bold text-amber-900 mb-2">
+                  <AlertTriangle className="h-4 w-4 text-amber-600" />
+                  <span>메인 AI 자체 점검표 (독립 검토 생략 안내)</span>
+                </div>
+                <div className="text-[11px] text-amber-800 mb-2">
+                  메인 AI 전용 모드 설정에 따라 외부 서브에이전트 오케스트레이션이 생략되었습니다. 승인 전 아래 점검표를 확인하세요:
+                </div>
+                <ul className="space-y-1 text-slate-800 font-medium">
+                  {proposal.selfReviewChecklist.map((item, i) => (
+                    <li key={i} className="flex items-start gap-1.5 bg-white/80 p-2 rounded-lg border border-amber-200 text-[11px]">
+                      <span className="text-amber-600 font-bold shrink-0">✓</span>
+                      <span>{item}</span>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )}
+
             {/* 0-C: Tampered alert banner */}
             {proposal.approvalStatus === 'TAMPERED' && (
               <div className="mb-3 rounded-lg border border-red-300 bg-red-50 p-4 text-xs text-red-900 shadow-sm">

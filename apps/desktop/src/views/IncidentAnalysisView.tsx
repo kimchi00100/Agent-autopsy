@@ -251,10 +251,15 @@ export default function IncidentAnalysisView({
             <div className="text-[11px] text-slate-400 font-medium">심각도 및 담당 에이전트</div>
             <div className="mt-1 flex items-center justify-between text-xs">
               <span className="font-semibold text-slate-800">{incident.agentName || 'Antigravity'}</span>
-              <Badge tone={incident.severity === 'HIGH' ? 'red' : 'amber'}>
-                {incident.severity === 'HIGH' ? '높음' : '보통'}
+              <Badge tone={incident.severity === 'HIGH' ? 'red' : incident.severity === 'MEDIUM' ? 'amber' : incident.severity === 'LOW' ? 'green' : 'gray'}>
+                {incident.severity === 'HIGH' ? '높음' : incident.severity === 'MEDIUM' ? '보통' : incident.severity === 'LOW' ? '낮음' : '미판정'}
               </Badge>
             </div>
+            {incident.severityEvidence && incident.severityEvidence.length > 0 && (
+              <div className="mt-1.5 text-[10px] text-slate-500 leading-tight">
+                {incident.severityEvidence.join(' · ')}
+              </div>
+            )}
           </div>
         </div>
       </Card>
@@ -499,11 +504,22 @@ export default function IncidentAnalysisView({
               <div className="flex justify-between py-0.5">
                 <span className="text-slate-500">원인 판정</span>
                 <span className={`font-semibold ${
-                  causeVerdict === 'CONFIRMED' ? 'text-emerald-600' : causeVerdict === 'LIKELY' ? 'text-amber-600' : 'text-rose-600'
+                  causeVerdict === 'CONFIRMED' ? 'text-emerald-600' : causeVerdict === 'LIKELY' ? 'text-amber-600' : 'text-slate-600'
                 }`}>
-                  {causeVerdict}
+                  {causeVerdict === 'CONFIRMED' ? '확정 (CONFIRMED)' : causeVerdict === 'LIKELY' ? '유력 (LIKELY)' : '미확정 (UNKNOWN)'}
                 </span>
               </div>
+              {incident.causeEvidence && incident.causeEvidence.length > 0 && (
+                <div className="py-1 px-2 rounded bg-slate-50 border border-slate-100 text-[10px] text-slate-600 space-y-0.5">
+                  <div className="font-semibold text-slate-500">원인 판정 근거:</div>
+                  {incident.causeEvidence.map((ev, i) => (
+                    <div key={i} className="flex items-start gap-1">
+                      <span>•</span>
+                      <span>{ev}</span>
+                    </div>
+                  ))}
+                </div>
+              )}
               <div className="flex justify-between py-0.5">
                 <span className="text-slate-500">검증 유형</span>
                 <span className="font-medium text-slate-800">{verificationType}</span>
@@ -586,8 +602,8 @@ export default function IncidentAnalysisView({
                         </span>
                         <span className="mono truncate">{cand.filePath}</span>
                       </div>
-                      <span className="font-semibold text-amber-600 text-[11px]">
-                        확신도 {cand.matchPercentage}%
+                      <span className="font-semibold text-slate-700 text-[11px]">
+                        증거 강도: {cand.evidenceStrength === 'HIGH' ? '높음' : cand.evidenceStrength === 'MEDIUM' ? '보통' : cand.evidenceStrength === 'LOW' ? '낮음' : '미확정'}
                       </span>
                     </div>
 

@@ -306,13 +306,15 @@ export class WorktreeRunner {
     }
 
     const checkDependencyMutations = async (): Promise<{ dirChanges: string[]; truncationNote: string }> => {
+      // 의존성 폴더 감시를 끄기 전에 300ms 정도 기다려서, 테스트 마지막 순간(프로세스 종료 직전)의 쓰기 이벤트가 늦게 도착해도 놓치지 않게 함
+      await new Promise((r) => setTimeout(r, 300));
+      const isWatching = heavyWatch.isWatching;
+      const detectedChanges = [...heavyWatch.detectedChanges];
       heavyWatch.stop();
-      // Allow pending filesystem buffer events to settle
-      await new Promise((r) => setTimeout(r, 60));
 
-      if (heavyWatch.isWatching) {
+      if (isWatching) {
         return {
-          dirChanges: [...heavyWatch.detectedChanges],
+          dirChanges: detectedChanges,
           truncationNote: '',
         };
       }

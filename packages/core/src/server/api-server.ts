@@ -376,6 +376,8 @@ export class ApiServer {
         verificationMode: body.verificationMode,
         preferredHost: body.preferredHost,
         testCommand: body.testCommand,
+        sensitivePaths: Array.isArray(body.sensitivePaths) ? body.sensitivePaths : undefined,
+        riskThresholdLines: typeof body.riskThresholdLines === 'number' ? body.riskThresholdLines : undefined,
       });
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ success: true, project: updated }));

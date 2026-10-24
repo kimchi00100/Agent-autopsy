@@ -50,6 +50,7 @@ export interface OrchestrationDecision {
   reviewRequirement: 'NONE' | 'CONDITIONAL' | 'MANDATORY_BEFORE_APPROVAL';
   hostDelegationGuide: string;
   skippedVerificationWarnings: string[];
+  selfReviewChecklist?: string[];
 }
 
 export interface Project {
@@ -62,6 +63,8 @@ export interface Project {
   proposedTestCommandReason?: string;
   verificationMode?: VerificationMode;
   preferredHost?: HostEnvironment;
+  sensitivePaths?: string[];
+  riskThresholdLines?: number;
   lastQuarantineFingerprint?: string;
   lastQuarantineRef?: string;
   createdAt: string;
@@ -83,6 +86,7 @@ export interface Checkpoint {
   createdAt: string;
 }
 
+export type Severity = 'HIGH' | 'MEDIUM' | 'LOW' | 'UNASSESSED';
 export type CauseVerdict = 'CONFIRMED' | 'LIKELY' | 'UNKNOWN';
 export type VerificationType = 'LOGIC_TEST' | 'DATA_STATE' | 'UI_FLOW' | 'MANUAL_CHECK';
 
@@ -94,7 +98,9 @@ export interface Incident {
   errorOutput: string;
   diffSummary: string;
   status: 'OPEN' | 'ANALYZING' | 'RESOLVED';
-  severity: 'HIGH' | 'MEDIUM' | 'LOW';
+  severity: Severity;
+  severityEvidence?: string[];
+  causeEvidence?: string[];
   agentName: string;
   sessionId?: string;
   expectedBehavior?: string;
@@ -257,6 +263,8 @@ export interface RepairProposal {
   patchDiff: string;
   patchHash?: string;
   riskLevel?: RiskLevel;
+  riskEvidence?: string[];
+  selfReviewChecklist?: string[];
   touchedFiles: string[];
   fileChangesJson: string;
   verificationStatus: VerificationStatus;

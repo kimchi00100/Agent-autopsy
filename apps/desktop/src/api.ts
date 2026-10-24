@@ -25,6 +25,8 @@ export interface OrchestrationDecision {
   reason: string;
   verificationMode: VerificationMode;
   host: HostEnvironment;
+  selfReviewChecklist?: string[];
+  skippedVerificationWarnings?: string[];
 }
 
 export interface OrchestrationReview {
@@ -93,6 +95,8 @@ export interface Project {
   proposedTestCommandReason?: string;
   verificationMode?: VerificationMode;
   preferredHost?: HostEnvironment;
+  sensitivePaths?: string[];
+  riskThresholdLines?: number;
 }
 
 export interface Checkpoint {
@@ -185,6 +189,8 @@ export interface AgentSession {
   observationScope?: ObservationScope[];
 }
 
+export type Severity = 'HIGH' | 'MEDIUM' | 'LOW' | 'UNASSESSED';
+
 export interface Incident {
   id: string;
   projectId: string;
@@ -193,7 +199,9 @@ export interface Incident {
   errorOutput: string;
   diffSummary: string;
   status: 'OPEN' | 'ANALYZING' | 'RESOLVED';
-  severity: 'HIGH' | 'MEDIUM' | 'LOW';
+  severity: Severity;
+  severityEvidence?: string[];
+  causeEvidence?: string[];
   agentName: string;
   expectedBehavior?: string;
   observedBehavior?: string;
@@ -227,6 +235,8 @@ export interface Proposal {
   patchDiff: string;
   patchHash?: string;
   riskLevel?: RiskLevel;
+  riskEvidence?: string[];
+  selfReviewChecklist?: string[];
   touchedFiles: string[];
   verificationStatus: 'PENDING' | 'VERIFIED_PASS' | 'VERIFIED_FAIL';
   verificationLog: string;
@@ -543,7 +553,13 @@ export const api = {
   checkpoints: (projectId: string) => request<{ checkpoints: Checkpoint[] }>(`/api/projects/${projectId}/checkpoints`),
   updateSettings: (
     projectId: string,
-    settings: { verificationMode?: VerificationMode; preferredHost?: HostEnvironment; testCommand?: string }
+    settings: {
+      verificationMode?: VerificationMode;
+      preferredHost?: HostEnvironment;
+      testCommand?: string;
+      sensitivePaths?: string[];
+      riskThresholdLines?: number;
+    }
   ) => request<{ success: boolean; project: Project }>(`/api/projects/${projectId}/settings`, post(settings)),
   submitReview: (
     proposalId: string,

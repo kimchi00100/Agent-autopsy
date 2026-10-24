@@ -210,9 +210,11 @@ describe('Agent Autopsy Core Engine Integration Tests', () => {
   test('8. Risk-Adaptive Evidence Gate & Orchestration Decision', () => {
     const project = core.ensureProject(repoPath);
 
-    // 1. Simple low-risk check
+    // 1. Simple low-risk check (no sensitive paths, low lines)
+    core.updateProjectSettings(repoPath, { sensitivePaths: [], verificationMode: 'AUTO' });
+    const lowProject = core.ensureProject(repoPath);
     const lowDecision = core.evaluateOrchestrationDecision(
-      project,
+      lowProject,
       '오타 수정',
       '',
       'diff',
@@ -222,9 +224,11 @@ describe('Agent Autopsy Core Engine Integration Tests', () => {
     assert.strictEqual(lowDecision.riskLevel, 'LOW');
     assert.strictEqual(lowDecision.requiresOrchestration, false);
 
-    // 2. High-risk security / payment / discount domain
+    // 2. High-risk user-designated sensitive path
+    core.updateProjectSettings(repoPath, { sensitivePaths: ['src/shop/**'] });
+    const sensProject = core.ensureProject(repoPath);
     const highDecision = core.evaluateOrchestrationDecision(
-      project,
+      sensProject,
       'VIP 할인 쿠폰 결제 검증 로직 수정',
       'AssertionError: discount overflow',
       'diff',
@@ -233,10 +237,10 @@ describe('Agent Autopsy Core Engine Integration Tests', () => {
     );
     assert.strictEqual(highDecision.riskLevel, 'HIGH');
     assert.strictEqual(highDecision.requiresOrchestration, true);
-    assert.ok(highDecision.riskSignals.some((s) => s.includes('보안')));
+    assert.ok(highDecision.riskSignals.some((s) => s.includes('민감 경로')));
 
     // 3. MAIN_ONLY mode honors user preference while preserving risk warnings
-    core.updateProjectSettings(repoPath, { verificationMode: 'MAIN_ONLY' });
+    core.updateProjectSettings(repoPath, { verificationMode: 'MAIN_ONLY', sensitivePaths: ['payment.js'] });
     const mainOnlyProject = core.ensureProject(repoPath);
     const mainOnlyDecision = core.evaluateOrchestrationDecision(
       mainOnlyProject,
@@ -251,18 +255,17 @@ describe('Agent Autopsy Core Engine Integration Tests', () => {
   });
 
   test('9. Independent Orchestration Review & Hard Gate Enforcement', async () => {
-    // Reset back to AUTO mode
-    core.updateProjectSettings(repoPath, { verificationMode: 'AUTO' });
+    // Reset back to AUTO mode with sensitive path designated
+    core.updateProjectSettings(repoPath, { verificationMode: 'AUTO', sensitivePaths: ['calculator.js'] });
 
-    // Create an incident in discount/payment domain
+    // Create an incident
     const highRiskIncident = await core.collectIncidentBundle(
       repoPath,
       '결제 및 할인 쿠폰 취소 롤백 실패',
       'AssertionError: discount balance mismatch'
     );
-    assert.strictEqual(highRiskIncident.riskLevel, 'HIGH');
 
-    // Propose a repair
+    // Propose a repair touching sensitive path (calculator.js)
     const { proposal } = await core.proposeAndVerifyRepair(
       repoPath,
       highRiskIncident.id,
@@ -275,7 +278,8 @@ describe('Agent Autopsy Core Engine Integration Tests', () => {
       ]
     );
 
-    // High risk proposal should be BLOCKED_AWAITING_REVIEW
+    // High risk proposal touching sensitive path should be HIGH risk and BLOCKED_AWAITING_REVIEW
+    assert.strictEqual(proposal.riskLevel, 'HIGH');
     assert.strictEqual(proposal.approvalReadiness, 'BLOCKED_AWAITING_REVIEW');
 
     // Standard approval must be blocked without explicit force acknowledgement
@@ -330,6 +334,9 @@ describe('Agent Autopsy Core Engine Integration Tests', () => {
     // Now normal approval succeeds without force override!
     const fingerprint = core.approveProposal(proposal.id);
     assert.ok(fingerprint.patchHash);
+
+    // Reset sensitivePaths so subsequent tests are not affected
+    core.updateProjectSettings(repoPath, { sensitivePaths: [] });
   });
 
   test('10. Non-destructive safety quarantine on unexpected working tree changes', async () => {
@@ -1275,6 +1282,34 @@ describe('Agent Autopsy Core Engine Integration Tests', () => {
       'The deep file must have been physically written through junction to the host'
     );
 
+    // Clean up deep file before Case 4
+    fs.unlinkSync(path.join(deepDir, 'deep_taint.txt'));
+
+    // --- Case 4: 테스트 프로세스가 끝나기 직전에 쓰는 경우 (process.on('exit') 이벤트에서 쓰기) ---
+    const exitPollutionCmd = `node -e "process.on('exit', () => { require('fs').writeFileSync('node_modules/exit_taint.txt', 'exit hook pollution'); }); console.log('ALL TESTS PASSED');"`;
+    core.updateProjectSettings(repoPath, { testCommand: exitPollutionCmd });
+
+    const { executionResult: resExit } = await core.proposeAndVerifyRepair(
+      repoPath,
+      inc.id,
+      'fix with process exit pollution',
+      validRepair
+    );
+
+    assert.strictEqual(resExit.success, false, 'Validation must fail when dependency folder is mutated right before process termination');
+    assert.ok(
+      resExit.output.includes('원본 의존성 폴더 변경 감지'),
+      'Output report must explicitly indicate 원본 의존성 폴더 변경 감지 for process exit hook pollution'
+    );
+    assert.ok(
+      resExit.output.includes('exit_taint.txt'),
+      'Output report must specifically identify the polluted exit file path'
+    );
+    assert.ok(
+      fs.existsSync(path.join(nodeModulesDir, 'exit_taint.txt')),
+      'The exit-hook file must have been physically written to the host node_modules'
+    );
+
     // Clean up
     fs.rmSync(nodeModulesDir, { recursive: true, force: true });
     core.updateProjectSettings(repoPath, { testCommand: 'node test.js' });
@@ -1672,5 +1707,251 @@ describe('Agent Autopsy Core Engine Integration Tests', () => {
 
     // Verify verification passed and runner executes safely
     assert.strictEqual(proposal.verificationStatus, 'VERIFIED_PASS');
+  });
+
+  test('36. Step-2-Check: Severity defaults to UNASSESSED without guessing; explicit user severity applied with evidence', async () => {
+    const sRepo = path.join(testRoot, 'sev_check_repo');
+    fs.mkdirSync(sRepo, { recursive: true });
+    execFileSync('git', ['init', '-b', 'main'], { cwd: sRepo });
+    execFileSync('git', ['config', 'user.name', 'Tester'], { cwd: sRepo });
+    execFileSync('git', ['config', 'user.email', 'test@local'], { cwd: sRepo });
+    fs.writeFileSync(path.join(sRepo, 'app.js'), 'console.log("hello");\n');
+    execFileSync('git', ['add', '.'], { cwd: sRepo });
+    execFileSync('git', ['commit', '-m', 'Init'], { cwd: sRepo });
+
+    // Case 1: No severity specified -> Default UNASSESSED
+    const incDefault = await core.collectIncidentBundle(sRepo, '버그 신고 (심각도 미지정)');
+    assert.strictEqual(incDefault.severity, 'UNASSESSED', 'Severity must default to UNASSESSED');
+    assert.ok(incDefault.severityEvidence && incDefault.severityEvidence.length > 0, 'Must have severity evidence');
+    assert.ok(incDefault.severityEvidence[0].includes('사용자 미지정: 기본 미판정'));
+
+    // Case 2: Explicit severity specified by user -> applied with evidence
+    const incExplicit = await core.collectIncidentBundle(sRepo, {
+      title: '사용자 지정 심각도 버그',
+      severity: 'HIGH',
+      errorOutput: 'custom error',
+    });
+    assert.strictEqual(incExplicit.severity, 'HIGH', 'Explicit severity must be applied');
+    assert.ok(incExplicit.severityEvidence && incExplicit.severityEvidence[0].includes('사용자 명시적 신고 등급: HIGH'));
+  });
+
+  test('37. Step-2-Check: SyntaxError/TypeError does NOT grant CONFIRMED cause; causeVerdict remains UNKNOWN with clear evidence', async () => {
+    const cRepo = path.join(testRoot, 'cause_check_repo');
+    fs.mkdirSync(cRepo, { recursive: true });
+    execFileSync('git', ['init', '-b', 'main'], { cwd: cRepo });
+    execFileSync('git', ['config', 'user.name', 'Tester'], { cwd: cRepo });
+    execFileSync('git', ['config', 'user.email', 'test@local'], { cwd: cRepo });
+    fs.writeFileSync(path.join(cRepo, 'app.js'), 'console.log("hello");\n');
+    execFileSync('git', ['add', '.'], { cwd: cRepo });
+    execFileSync('git', ['commit', '-m', 'Init'], { cwd: cRepo });
+
+    // Incident with TypeError
+    const incTypeErr = await core.collectIncidentBundle(
+      cRepo,
+      'TypeError 발생 사건',
+      'TypeError: Cannot read properties of undefined (reading "execute")\n    at app.js:10:15'
+    );
+    assert.strictEqual(incTypeErr.causeVerdict, 'UNKNOWN', 'TypeError must NOT automatically grant CONFIRMED');
+    assert.ok(incTypeErr.causeEvidence && incTypeErr.causeEvidence.length > 0);
+    assert.ok(incTypeErr.causeEvidence.some((e) => e.includes('원인 추정 단계') || e.includes('미확정')));
+
+    // Incident with SyntaxError
+    const incSyntaxErr = await core.collectIncidentBundle(
+      cRepo,
+      'SyntaxError 발생 사건',
+      'SyntaxError: Unexpected token "}"\n    at app.js:5:1'
+    );
+    assert.strictEqual(incSyntaxErr.causeVerdict, 'UNKNOWN', 'SyntaxError must NOT automatically grant CONFIRMED');
+  });
+
+  test('38. Step-2-Check: Completion Criteria 1 - Functional bug (no error msg), 7 files modified 1-2 lines each, no sensitive paths -> subagent review NOT required', async () => {
+    const multiRepo = path.join(testRoot, 'multi_file_repo');
+    fs.mkdirSync(multiRepo, { recursive: true });
+    execFileSync('git', ['init', '-b', 'main'], { cwd: multiRepo });
+    execFileSync('git', ['config', 'user.name', 'Tester'], { cwd: multiRepo });
+    execFileSync('git', ['config', 'user.email', 'test@local'], { cwd: multiRepo });
+
+    // Create 7 files
+    for (let i = 1; i <= 7; i++) {
+      fs.writeFileSync(path.join(multiRepo, `file_${i}.js`), `function fn${i}() {\n  return ${i};\n}\nmodule.exports = { fn${i} };\n`);
+    }
+    fs.writeFileSync(path.join(multiRepo, 'test.js'), 'console.log("OK");\n');
+    execFileSync('git', ['add', '.'], { cwd: multiRepo });
+    execFileSync('git', ['commit', '-m', 'Init 7 files'], { cwd: multiRepo });
+
+    core.updateProjectSettings(multiRepo, {
+      testCommand: 'node test.js',
+      sensitivePaths: [], // No sensitive paths
+      riskThresholdLines: 200,
+      verificationMode: 'AUTO',
+    });
+
+    // Functional bug report: no error message
+    const inc = await core.collectIncidentBundle(multiRepo, '기능 버그 신고 (오류 메시지 없음)');
+
+    // 7 files modified, 1-2 lines each (total changed lines: ~14 lines << 100)
+    const fileChanges = [];
+    for (let i = 1; i <= 7; i++) {
+      fileChanges.push({
+        filePath: `file_${i}.js`,
+        replacements: [
+          {
+            search: `  return ${i};`,
+            replace: `  const x = ${i};\n  return x;`,
+          },
+        ],
+      });
+    }
+
+    const { proposal } = await core.proposeAndVerifyRepair(
+      multiRepo,
+      inc.id,
+      '7개 파일 각 1~2줄 기능 로직 경량 수정',
+      fileChanges
+    );
+
+    assert.strictEqual(proposal.verificationStatus, 'VERIFIED_PASS');
+    assert.strictEqual(proposal.riskLevel, 'LOW', '7 files with 1-2 lines each must be judged LOW risk');
+    assert.strictEqual(proposal.approvalReadiness, 'READY_FOR_APPROVAL', 'Subagent review must NOT be required for LOW risk in AUTO mode');
+    assert.strictEqual(proposal.approvalBlockReason, undefined);
+    assert.ok(proposal.riskEvidence && proposal.riskEvidence.length > 0, 'Must record risk evidence list');
+  });
+
+  test('39. Step-2-Check: Completion Criteria 2 - Touching even 1 line of sensitive path makes risk HIGH & subagent review MANDATORY', async () => {
+    const sensRepo = path.join(testRoot, 'sensitive_path_repo');
+    fs.mkdirSync(sensRepo, { recursive: true });
+    execFileSync('git', ['init', '-b', 'main'], { cwd: sensRepo });
+    execFileSync('git', ['config', 'user.name', 'Tester'], { cwd: sensRepo });
+    execFileSync('git', ['config', 'user.email', 'test@local'], { cwd: sensRepo });
+
+    fs.mkdirSync(path.join(sensRepo, 'src'), { recursive: true });
+    fs.writeFileSync(path.join(sensRepo, 'src', 'secret.js'), 'const SECRET_KEY = "old_secret";\nmodule.exports = { SECRET_KEY };\n');
+    fs.writeFileSync(path.join(sensRepo, 'test.js'), 'console.log("OK");\n');
+    execFileSync('git', ['add', '.'], { cwd: sensRepo });
+    execFileSync('git', ['commit', '-m', 'Init sensitive repo'], { cwd: sensRepo });
+
+    // User designates sensitive paths in project settings
+    core.updateProjectSettings(sensRepo, {
+      testCommand: 'node test.js',
+      sensitivePaths: ['src/secret.js', 'config/**'],
+      riskThresholdLines: 200,
+      verificationMode: 'AUTO',
+    });
+
+    const inc = await core.collectIncidentBundle(sensRepo, '민감 키 변경 사건');
+
+    // Modify just ONE line in the sensitive path
+    const { proposal } = await core.proposeAndVerifyRepair(
+      sensRepo,
+      inc.id,
+      '민감 키 1줄 수정',
+      [
+        {
+          filePath: 'src/secret.js',
+          replacements: [
+            {
+              search: 'const SECRET_KEY = "old_secret";',
+              replace: 'const SECRET_KEY = "new_secret";',
+            },
+          ],
+        },
+      ]
+    );
+
+    assert.strictEqual(proposal.verificationStatus, 'VERIFIED_PASS');
+    assert.strictEqual(proposal.riskLevel, 'HIGH', 'Touching sensitive path must evaluate to HIGH risk');
+    assert.strictEqual(proposal.approvalReadiness, 'BLOCKED_AWAITING_REVIEW', 'Subagent review is MANDATORY before approval');
+    assert.ok(proposal.approvalBlockReason && proposal.approvalBlockReason.includes('호스트 내장 서브에이전트의 독립 교차 검토가 필수'));
+    assert.ok(proposal.riskEvidence && proposal.riskEvidence.some((e) => e.includes('민감 경로 수정 감지')));
+  });
+
+  test('40. Step-2-Check: Line threshold (200 HIGH, 100 MEDIUM) and isolated verification retry count escalations', async () => {
+    const lineRepo = path.join(testRoot, 'line_thresh_repo');
+    fs.mkdirSync(lineRepo, { recursive: true });
+    execFileSync('git', ['init', '-b', 'main'], { cwd: lineRepo });
+    execFileSync('git', ['config', 'user.name', 'Tester'], { cwd: lineRepo });
+    execFileSync('git', ['config', 'user.email', 'test@local'], { cwd: lineRepo });
+
+    fs.writeFileSync(path.join(lineRepo, 'big.js'), '// initial\n');
+    fs.writeFileSync(path.join(lineRepo, 'test.js'), 'console.log("OK");\n');
+    execFileSync('git', ['add', '.'], { cwd: lineRepo });
+    execFileSync('git', ['commit', '-m', 'Init big repo'], { cwd: lineRepo });
+
+    core.updateProjectSettings(lineRepo, {
+      testCommand: 'node test.js',
+      sensitivePaths: [],
+      riskThresholdLines: 200,
+      verificationMode: 'AUTO',
+    });
+
+    const inc = await core.collectIncidentBundle(lineRepo, '대규모 변경 사건');
+
+    // Generate ~110 lines addition (>= 100 lines, < 200 lines) -> MEDIUM
+    const medLines = Array.from({ length: 110 }, (_, i) => `const var_${i} = ${i};`).join('\n');
+    const { proposal: propMed } = await core.proposeAndVerifyRepair(lineRepo, inc.id, '중규모 110줄 변경', [
+      { filePath: 'big.js', replacements: [{ search: '// initial', replace: `// initial\n${medLines}` }] },
+    ]);
+    assert.strictEqual(propMed.riskLevel, 'MEDIUM', '110 lines must evaluate to MEDIUM risk');
+    assert.strictEqual(propMed.approvalReadiness, 'READY_FOR_APPROVAL', 'MEDIUM risk does not require subagent in AUTO mode');
+
+    // Generate ~220 lines addition (>= 200 lines) -> HIGH
+    const highLines = Array.from({ length: 220 }, (_, i) => `const high_${i} = ${i};`).join('\n');
+    const { proposal: propHigh } = await core.proposeAndVerifyRepair(lineRepo, inc.id, '대규모 220줄 변경', [
+      { filePath: 'big.js', replacements: [{ search: '// initial', replace: `// initial\n${highLines}` }] },
+    ]);
+    assert.strictEqual(propHigh.riskLevel, 'HIGH', '220 lines must evaluate to HIGH risk');
+    assert.strictEqual(propHigh.approvalReadiness, 'BLOCKED_AWAITING_REVIEW', 'HIGH risk requires subagent in AUTO mode');
+  });
+
+  test('41. Step-2-Check: MAIN_ONLY mode never calls subagents and produces selfReviewChecklist with risk warning', async () => {
+    const moRepo = path.join(testRoot, 'main_only_repo');
+    fs.mkdirSync(moRepo, { recursive: true });
+    execFileSync('git', ['init', '-b', 'main'], { cwd: moRepo });
+    execFileSync('git', ['config', 'user.name', 'Tester'], { cwd: moRepo });
+    execFileSync('git', ['config', 'user.email', 'test@local'], { cwd: moRepo });
+
+    fs.writeFileSync(path.join(moRepo, 'auth.js'), 'const token = "x";\n');
+    fs.writeFileSync(path.join(moRepo, 'test.js'), 'console.log("OK");\n');
+    execFileSync('git', ['add', '.'], { cwd: moRepo });
+    execFileSync('git', ['commit', '-m', 'Init main only repo'], { cwd: moRepo });
+
+    core.updateProjectSettings(moRepo, {
+      testCommand: 'node test.js',
+      sensitivePaths: ['auth.js'],
+      verificationMode: 'MAIN_ONLY',
+    });
+
+    const inc = await core.collectIncidentBundle(moRepo, '메인 전용 모드 사건');
+    const { proposal } = await core.proposeAndVerifyRepair(moRepo, inc.id, '민감 파일 수정', [
+      { filePath: 'auth.js', replacements: [{ search: 'const token = "x";', replace: 'const token = "y";' }] },
+    ]);
+
+    assert.strictEqual(proposal.riskLevel, 'HIGH');
+    assert.strictEqual(proposal.approvalReadiness, 'APPROVABLE_WITH_RISK_WARNING', 'MAIN_ONLY must NOT block approval awaiting subagent');
+    assert.ok(proposal.approvalBlockReason && proposal.approvalBlockReason.includes('메인 AI 전용 모드'));
+    assert.ok(proposal.selfReviewChecklist && proposal.selfReviewChecklist.length === 3, 'Must generate 3-part self review checklist');
+    assert.ok(proposal.selfReviewChecklist[0].includes('민감 경로 점검'));
+    assert.ok(proposal.selfReviewChecklist[1].includes('기존 동작 변경 부위'));
+    assert.ok(proposal.selfReviewChecklist[2].includes('테스트 미커버 영역'));
+  });
+
+  test('42. Step-2-Check: Existing DB incidents and proposals migration fills UNASSESSED and evidence arrays', async () => {
+    const rawDb = (core.getDatabase() as any).db;
+    const legacyIncId = `inc_legacy_${Date.now()}`;
+    const legacyProj = core.ensureProject(repoPath);
+
+    // Insert legacy row with HIGH severity and NULL evidence
+    rawDb.prepare(`
+      INSERT INTO incidents (id, project_id, title, error_output, diff_summary, status, severity, created_at)
+      VALUES (?, ?, 'Legacy Bug', 'err', 'diff', 'OPEN', 'HIGH', datetime('now'))
+    `).run(legacyIncId, legacyProj.id);
+
+    // Run migration
+    core.getDatabase().migrateUnassessedFields();
+
+    const migrated = core.getDatabase().getIncident(legacyIncId);
+    assert.ok(migrated, 'Migrated incident must exist');
+    assert.strictEqual(migrated.severity, 'UNASSESSED', 'Legacy incident severity without evidence must migrate to UNASSESSED');
+    assert.ok(migrated.severityEvidence && migrated.severityEvidence.length > 0, 'Must have migrated evidence array');
   });
 });

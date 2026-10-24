@@ -88,6 +88,9 @@ export default function App() {
   const [compareMode, setCompareMode] = useState<'working' | 'checkpoint' | 'proposal' | 'commit'>('working');
   const [verificationMode, setVerificationMode] = useState<VerificationMode>('AUTO');
   const [preferredHost, setPreferredHost] = useState<HostEnvironment>('antigravity');
+  const [sensitivePaths, setSensitivePaths] = useState<string[]>([]);
+  const [riskThresholdLines, setRiskThresholdLines] = useState<number>(200);
+  const [newSensitivePathInput, setNewSensitivePathInput] = useState('');
   const [diagnostics, setDiagnostics] = useState<ProjectDiagnostics | null>(null);
   const [diagnosing, setDiagnosing] = useState(false);
   const [onboarding, setOnboarding] = useState(false);
@@ -150,6 +153,8 @@ export default function App() {
       if (ov.project.preferredHost) {
         setPreferredHost(ov.project.preferredHost);
       }
+      setSensitivePaths(ov.project.sensitivePaths || []);
+      setRiskThresholdLines(ov.project.riskThresholdLines ?? 200);
       setTestCommandInput(ov.project.proposedTestCommand || ov.project.testCommand || '');
       setError(null);
       const [tl, inc, cps] = await Promise.all([
@@ -236,6 +241,20 @@ export default function App() {
       });
       const modeKorean = mode === 'AUTO' ? '자동 판단 모드' : mode === 'MAIN_ONLY' ? '메인 AI 전용 모드' : '심층 검증 우선 모드';
       notify('ok', `설정이 저장되었습니다: [${modeKorean}]`);
+      load();
+    } catch (err: any) {
+      notify('error', err.message);
+    }
+  };
+
+  const handleSaveRiskSettings = async () => {
+    if (!overview) return;
+    try {
+      await api.updateSettings(overview.project.id, {
+        sensitivePaths,
+        riskThresholdLines,
+      });
+      notify('ok', '민감 경로 및 위험도 임계값이 저장되었습니다.');
       load();
     } catch (err: any) {
       notify('error', err.message);
@@ -1160,7 +1179,105 @@ export default function App() {
                 </div>
               </Card>
 
-              {/* 4. 현재 프로젝트 정보 및 MCP 연결 */}
+              {/* 4. 민감 경로 및 위험도 임계값 설정 */}
+              <Card className="p-5 space-y-4">
+                <div className="flex items-center justify-between border-b border-slate-100 pb-3">
+                  <div className="flex items-center gap-2">
+                    <ShieldAlert className="h-4 w-4 text-amber-600" />
+                    <span className="text-sm font-bold text-slate-900">민감 경로 및 위험도 임계값 설정</span>
+                  </div>
+                  <span className="text-[11px] text-slate-500">
+                    패치가 실제로 변경하는 파일과 줄 수로 위험도를 정밀 판정합니다.
+                  </span>
+                </div>
+
+                <div className="space-y-3">
+                  <div>
+                    <label className="text-xs font-semibold text-slate-700">사용자 지정 민감 경로 (Glob 패턴 목록)</label>
+                    <p className="text-[11px] text-slate-500 mt-0.5">
+                      이 경로에 해당하는 파일이 단 1줄이라도 수정되면 수정 위험도가 즉시 '고위험(HIGH)'으로 승격되어 독립 교차 검토가 요구됩니다.
+                    </p>
+                    <div className="mt-2 flex flex-wrap gap-1.5 min-h-[32px] p-2 rounded-lg border border-slate-200 bg-slate-50/50">
+                      {sensitivePaths.length === 0 && (
+                        <span className="text-xs text-slate-400 italic">등록된 민감 경로가 없습니다. (기본값: 빈 목록)</span>
+                      )}
+                      {sensitivePaths.map((p, idx) => (
+                        <span
+                          key={idx}
+                          className="inline-flex items-center gap-1 rounded bg-amber-50 px-2 py-0.5 text-xs font-mono text-amber-800 border border-amber-200"
+                        >
+                          {p}
+                          <button
+                            type="button"
+                            onClick={() => setSensitivePaths((cur) => cur.filter((_, i) => i !== idx))}
+                            className="text-amber-600 hover:text-rose-600 ml-1 font-bold"
+                          >
+                            ×
+                          </button>
+                        </span>
+                      ))}
+                    </div>
+                    <div className="mt-2 flex gap-2">
+                      <input
+                        type="text"
+                        value={newSensitivePathInput}
+                        onChange={(e) => setNewSensitivePathInput(e.target.value)}
+                        placeholder="예: src/auth/**, *.env, config/*"
+                        className="flex-1 rounded-lg border border-slate-200 bg-white px-3 py-1.5 text-xs text-slate-800 focus:outline-none focus:border-blue-500"
+                        onKeyDown={(e) => {
+                          if (e.key === 'Enter' && newSensitivePathInput.trim()) {
+                            e.preventDefault();
+                            if (!sensitivePaths.includes(newSensitivePathInput.trim())) {
+                              setSensitivePaths((cur) => [...cur, newSensitivePathInput.trim()]);
+                            }
+                            setNewSensitivePathInput('');
+                          }
+                        }}
+                      />
+                      <Button
+                        variant="default"
+                        onClick={() => {
+                          if (newSensitivePathInput.trim() && !sensitivePaths.includes(newSensitivePathInput.trim())) {
+                            setSensitivePaths((cur) => [...cur, newSensitivePathInput.trim()]);
+                            setNewSensitivePathInput('');
+                          }
+                        }}
+                      >
+                        경로 추가
+                      </Button>
+                    </div>
+                  </div>
+
+                  <div className="pt-3 border-t border-slate-100 flex items-center justify-between">
+                    <div>
+                      <label className="text-xs font-semibold text-slate-700">고위험 변경 줄 수 임계값</label>
+                      <p className="text-[11px] text-slate-500 mt-0.5">
+                        수정안의 총 변경 줄 수(추가+삭제)가 이 기준 이상이면 '높음', 절반 이상이면 '중간' 위험도로 판정됩니다.
+                      </p>
+                    </div>
+                    <div className="flex items-center gap-1.5">
+                      <input
+                        type="number"
+                        min="10"
+                        max="5000"
+                        step="10"
+                        value={riskThresholdLines}
+                        onChange={(e) => setRiskThresholdLines(Number(e.target.value) || 200)}
+                        className="w-24 text-right rounded-lg border border-slate-200 bg-white px-2 py-1 text-xs text-slate-800 font-mono"
+                      />
+                      <span className="text-xs text-slate-500 font-medium">줄</span>
+                    </div>
+                  </div>
+
+                  <div className="pt-2 flex justify-end">
+                    <Button variant="primary" onClick={handleSaveRiskSettings}>
+                      민감 경로 및 임계값 저장
+                    </Button>
+                  </div>
+                </div>
+              </Card>
+
+              {/* 5. 현재 프로젝트 정보 및 MCP 연결 */}
               <Card className="p-5 space-y-3">
                 <div className="text-xs font-semibold text-slate-500">현재 프로젝트 저장소 정보</div>
                 <div className="text-xs">

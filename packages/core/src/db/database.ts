@@ -63,6 +63,7 @@ export class AutopsyDatabase {
       this.createTables();
       this.migrateColumns();
       this.migrateDeterministicProjectIds();
+      this.migrateUnassessedFields();
       if (this.status !== 'MIGRATED') {
         this.status = 'READY';
       }
@@ -96,6 +97,8 @@ export class AutopsyDatabase {
         proposed_test_command_reason TEXT,
         verification_mode TEXT DEFAULT 'AUTO',
         preferred_host TEXT DEFAULT 'antigravity',
+        sensitive_paths_json TEXT DEFAULT '[]',
+        risk_threshold_lines INTEGER DEFAULT 200,
         last_quarantine_fingerprint TEXT,
         last_quarantine_ref TEXT,
         created_at TEXT NOT NULL
@@ -126,7 +129,9 @@ export class AutopsyDatabase {
         error_output TEXT NOT NULL,
         diff_summary TEXT NOT NULL,
         status TEXT NOT NULL,
-        severity TEXT DEFAULT 'HIGH',
+        severity TEXT DEFAULT 'UNASSESSED',
+        severity_evidence_json TEXT DEFAULT '[]',
+        cause_evidence_json TEXT DEFAULT '[]',
         agent_name TEXT DEFAULT 'agent',
         session_id TEXT,
         test_execution_note TEXT,
@@ -149,6 +154,8 @@ export class AutopsyDatabase {
         approved_at TEXT,
         applied_at TEXT,
         verified_with_command TEXT,
+        risk_evidence_json TEXT DEFAULT '[]',
+        self_review_checklist_json TEXT DEFAULT '[]',
         created_at TEXT NOT NULL,
         FOREIGN KEY (incident_id) REFERENCES incidents(id) ON DELETE CASCADE
       );
@@ -265,6 +272,12 @@ export class AutopsyDatabase {
       `ALTER TABLE projects ADD COLUMN proposed_test_command TEXT;`,
       `ALTER TABLE projects ADD COLUMN proposed_test_command_reason TEXT;`,
       `ALTER TABLE incidents ADD COLUMN test_execution_note TEXT;`,
+      `ALTER TABLE projects ADD COLUMN sensitive_paths_json TEXT DEFAULT '[]';`,
+      `ALTER TABLE projects ADD COLUMN risk_threshold_lines INTEGER DEFAULT 200;`,
+      `ALTER TABLE incidents ADD COLUMN severity_evidence_json TEXT DEFAULT '[]';`,
+      `ALTER TABLE incidents ADD COLUMN cause_evidence_json TEXT DEFAULT '[]';`,
+      `ALTER TABLE repair_proposals ADD COLUMN risk_evidence_json TEXT DEFAULT '[]';`,
+      `ALTER TABLE repair_proposals ADD COLUMN self_review_checklist_json TEXT DEFAULT '[]';`,
     ];
 
     for (const sql of migrations) {
@@ -274,6 +287,36 @@ export class AutopsyDatabase {
         // Column already exists
       }
     }
+  }
+
+  /**
+   * Step 2 migration: Ensures existing incidents and proposals default to UNASSESSED
+   * and have non-null evidence lists.
+   */
+  public migrateUnassessedFields(): void {
+    try {
+      this.db.exec(`
+        UPDATE incidents
+        SET severity = 'UNASSESSED'
+        WHERE severity IS NULL OR severity = '' OR (severity = 'HIGH' AND (severity_evidence_json IS NULL OR severity_evidence_json = '[]' OR severity_evidence_json = ''));
+
+        UPDATE incidents
+        SET severity_evidence_json = '["기존 데이터 마이그레이션: 미판정"]'
+        WHERE severity_evidence_json IS NULL OR severity_evidence_json = '' OR severity_evidence_json = '[]';
+
+        UPDATE incidents
+        SET cause_evidence_json = '["기존 데이터 마이그레이션: 미판정"]'
+        WHERE cause_evidence_json IS NULL OR cause_evidence_json = '' OR cause_evidence_json = '[]';
+
+        UPDATE repair_proposals
+        SET risk_evidence_json = '["기존 데이터 마이그레이션: 미판정"]'
+        WHERE risk_evidence_json IS NULL OR risk_evidence_json = '' OR risk_evidence_json = '[]';
+
+        UPDATE repair_proposals
+        SET self_review_checklist_json = '[]'
+        WHERE self_review_checklist_json IS NULL;
+      `);
+    } catch {}
   }
 
   /**
@@ -358,9 +401,9 @@ export class AutopsyDatabase {
         INSERT INTO projects (
           id, name, root_path, test_command, test_command_signature,
           proposed_test_command, proposed_test_command_reason,
-          verification_mode, preferred_host, created_at
+          verification_mode, preferred_host, sensitive_paths_json, risk_threshold_lines, created_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(root_path) DO UPDATE SET
           id = excluded.id,
           name = excluded.name,
@@ -369,7 +412,9 @@ export class AutopsyDatabase {
           proposed_test_command = COALESCE(excluded.proposed_test_command, projects.proposed_test_command),
           proposed_test_command_reason = COALESCE(excluded.proposed_test_command_reason, projects.proposed_test_command_reason),
           verification_mode = COALESCE(excluded.verification_mode, projects.verification_mode),
-          preferred_host = COALESCE(excluded.preferred_host, projects.preferred_host);
+          preferred_host = COALESCE(excluded.preferred_host, projects.preferred_host),
+          sensitive_paths_json = COALESCE(excluded.sensitive_paths_json, projects.sensitive_paths_json),
+          risk_threshold_lines = COALESCE(excluded.risk_threshold_lines, projects.risk_threshold_lines);
       `);
       stmt.run(
         projectId,
@@ -381,6 +426,8 @@ export class AutopsyDatabase {
         project.proposedTestCommandReason || null,
         project.verificationMode || 'AUTO',
         project.preferredHost || 'antigravity',
+        JSON.stringify(project.sensitivePaths || []),
+        project.riskThresholdLines ?? 200,
         project.createdAt
       );
     });
@@ -431,6 +478,8 @@ export class AutopsyDatabase {
       proposedTestCommandReason: row.proposed_test_command_reason || undefined,
       verificationMode: (row.verification_mode || 'AUTO') as VerificationMode,
       preferredHost: (row.preferred_host || 'antigravity') as HostEnvironment,
+      sensitivePaths: row.sensitive_paths_json ? JSON.parse(row.sensitive_paths_json) : [],
+      riskThresholdLines: typeof row.risk_threshold_lines === 'number' ? row.risk_threshold_lines : 200,
       lastQuarantineFingerprint: row.last_quarantine_fingerprint || undefined,
       lastQuarantineRef: row.last_quarantine_ref || undefined,
       createdAt: row.created_at,
@@ -451,6 +500,8 @@ export class AutopsyDatabase {
       proposedTestCommandReason: row.proposed_test_command_reason || undefined,
       verificationMode: (row.verification_mode || 'AUTO') as VerificationMode,
       preferredHost: (row.preferred_host || 'antigravity') as HostEnvironment,
+      sensitivePaths: row.sensitive_paths_json ? JSON.parse(row.sensitive_paths_json) : [],
+      riskThresholdLines: typeof row.risk_threshold_lines === 'number' ? row.risk_threshold_lines : 200,
       lastQuarantineFingerprint: row.last_quarantine_fingerprint || undefined,
       lastQuarantineRef: row.last_quarantine_ref || undefined,
       createdAt: row.created_at,
@@ -481,6 +532,8 @@ export class AutopsyDatabase {
       proposedTestCommandReason: row.proposed_test_command_reason || undefined,
       verificationMode: (row.verification_mode || 'AUTO') as VerificationMode,
       preferredHost: (row.preferred_host || 'antigravity') as HostEnvironment,
+      sensitivePaths: row.sensitive_paths_json ? JSON.parse(row.sensitive_paths_json) : [],
+      riskThresholdLines: typeof row.risk_threshold_lines === 'number' ? row.risk_threshold_lines : 200,
       lastQuarantineFingerprint: row.last_quarantine_fingerprint || undefined,
       lastQuarantineRef: row.last_quarantine_ref || undefined,
       createdAt: row.created_at,
@@ -510,6 +563,8 @@ export class AutopsyDatabase {
       preferredHost?: HostEnvironment;
       testCommand?: string;
       testCommandSignature?: string;
+      sensitivePaths?: string[];
+      riskThresholdLines?: number;
     }
   ): void {
     this.runInImmediateTransaction(() => {
@@ -519,6 +574,8 @@ export class AutopsyDatabase {
             preferred_host = COALESCE(?, preferred_host),
             test_command = COALESCE(?, test_command),
             test_command_signature = COALESCE(?, test_command_signature),
+            sensitive_paths_json = COALESCE(?, sensitive_paths_json),
+            risk_threshold_lines = COALESCE(?, risk_threshold_lines),
             proposed_test_command = CASE WHEN ? IS NOT NULL THEN NULL ELSE proposed_test_command END,
             proposed_test_command_reason = CASE WHEN ? IS NOT NULL THEN NULL ELSE proposed_test_command_reason END
         WHERE id = ?
@@ -528,6 +585,8 @@ export class AutopsyDatabase {
         settings.preferredHost || null,
         settings.testCommand || null,
         settings.testCommandSignature || null,
+        settings.sensitivePaths ? JSON.stringify(settings.sensitivePaths) : null,
+        typeof settings.riskThresholdLines === 'number' ? settings.riskThresholdLines : null,
         settings.testCommand || null,
         settings.testCommand || null,
         id
@@ -642,13 +701,13 @@ export class AutopsyDatabase {
       const stmt = this.db.prepare(`
         INSERT INTO incidents (
           id, project_id, base_checkpoint_id, title, error_output, diff_summary,
-          status, severity, agent_name, session_id,
+          status, severity, severity_evidence_json, cause_evidence_json, agent_name, session_id,
           expected_behavior, observed_behavior, broken_step, execution_trace_json, three_level_health_json,
           reproduction_condition, verification_method, verification_type, user_confirmed_intent, user_confirmation_summary, cause_verdict,
           risk_level, risk_signals_json, orchestration_decision_json, test_execution_note,
           created_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `);
       stmt.run(
         incident.id,
@@ -658,7 +717,9 @@ export class AutopsyDatabase {
         incident.errorOutput || '',
         incident.diffSummary || '',
         incident.status,
-        incident.severity || 'HIGH',
+        incident.severity || 'UNASSESSED',
+        JSON.stringify(incident.severityEvidence || []),
+        JSON.stringify(incident.causeEvidence || []),
         incident.agentName || 'agent',
         incident.sessionId || null,
         incident.expectedBehavior || null,
@@ -693,7 +754,9 @@ export class AutopsyDatabase {
       errorOutput: row.error_output,
       diffSummary: row.diff_summary,
       status: row.status as any,
-      severity: (row.severity || 'HIGH') as any,
+      severity: (row.severity || 'UNASSESSED') as any,
+      severityEvidence: row.severity_evidence_json ? JSON.parse(row.severity_evidence_json) : [],
+      causeEvidence: row.cause_evidence_json ? JSON.parse(row.cause_evidence_json) : [],
       agentName: row.agent_name || 'agent',
       sessionId: row.session_id || undefined,
       expectedBehavior: row.expected_behavior || undefined,
@@ -775,7 +838,9 @@ export class AutopsyDatabase {
       errorOutput: row.error_output,
       diffSummary: row.diff_summary,
       status: row.status as any,
-      severity: (row.severity || 'HIGH') as any,
+      severity: (row.severity || 'UNASSESSED') as any,
+      severityEvidence: row.severity_evidence_json ? JSON.parse(row.severity_evidence_json) : [],
+      causeEvidence: row.cause_evidence_json ? JSON.parse(row.cause_evidence_json) : [],
       agentName: row.agent_name || 'agent',
       sessionId: row.session_id || undefined,
       expectedBehavior: row.expected_behavior || undefined,
@@ -854,10 +919,11 @@ export class AutopsyDatabase {
           id, incident_id, root_cause_analysis, patch_diff, touched_files_json,
           file_changes_json, verification_status, verification_log, approval_status,
           approval_fingerprint_json, approved_at, applied_at,
-          patch_hash, risk_level, orchestration_review_json, approval_readiness, approval_block_reason,
+          patch_hash, risk_level, risk_evidence_json, self_review_checklist_json,
+          orchestration_review_json, approval_readiness, approval_block_reason,
           stages_json, three_level_health_json, verified_with_command,
           created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `);
       stmt.run(
         proposal.id,
@@ -874,6 +940,8 @@ export class AutopsyDatabase {
         proposal.appliedAt,
         proposal.patchHash || null,
         proposal.riskLevel || null,
+        JSON.stringify(proposal.riskEvidence || []),
+        JSON.stringify(proposal.selfReviewChecklist || []),
         proposal.orchestrationReview ? JSON.stringify(proposal.orchestrationReview) : null,
         proposal.approvalReadiness || 'READY_FOR_APPROVAL',
         proposal.approvalBlockReason || null,
@@ -896,6 +964,8 @@ export class AutopsyDatabase {
       patchDiff: row.patch_diff,
       patchHash: row.patch_hash || undefined,
       riskLevel: (row.risk_level as RiskLevel) || undefined,
+      riskEvidence: row.risk_evidence_json ? JSON.parse(row.risk_evidence_json) : [],
+      selfReviewChecklist: row.self_review_checklist_json ? JSON.parse(row.self_review_checklist_json) : [],
       touchedFiles: JSON.parse(row.touched_files_json),
       fileChangesJson: row.file_changes_json,
       verificationStatus: row.verification_status as VerificationStatus,
@@ -999,6 +1069,8 @@ export class AutopsyDatabase {
       patchDiff: row.patch_diff,
       patchHash: row.patch_hash || undefined,
       riskLevel: (row.risk_level as RiskLevel) || undefined,
+      riskEvidence: row.risk_evidence_json ? JSON.parse(row.risk_evidence_json) : [],
+      selfReviewChecklist: row.self_review_checklist_json ? JSON.parse(row.self_review_checklist_json) : [],
       touchedFiles: JSON.parse(row.touched_files_json),
       fileChangesJson: row.file_changes_json,
       verificationStatus: row.verification_status as VerificationStatus,
@@ -1033,6 +1105,8 @@ export class AutopsyDatabase {
       patchDiff: row.patch_diff,
       patchHash: row.patch_hash || undefined,
       riskLevel: (row.risk_level as RiskLevel) || undefined,
+      riskEvidence: row.risk_evidence_json ? JSON.parse(row.risk_evidence_json) : [],
+      selfReviewChecklist: row.self_review_checklist_json ? JSON.parse(row.self_review_checklist_json) : [],
       touchedFiles: JSON.parse(row.touched_files_json),
       fileChangesJson: row.file_changes_json,
       verificationStatus: row.verification_status as VerificationStatus,

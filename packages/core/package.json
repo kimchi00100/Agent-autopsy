@@ -14,7 +14,9 @@
   },
   "dependencies": {
     "chokidar": "^4.0.3",
-    "diff": "^7.0.0"
+    "diff": "^7.0.0",
+    "tree-sitter-wasms": "0.1.13",
+    "web-tree-sitter": "0.24.7"
   },
   "devDependencies": {
     "@types/diff": "^7.0.0",

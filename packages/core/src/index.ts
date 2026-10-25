@@ -9,4 +9,5 @@ export * from './notifications/toast.js';
 export * from './analysis/analyzer.js';
 export * from './utils/paths.js';
 export * from './utils/security.js';
+export * from './localization/function-extractor.js';
 export * from './core-manager.js';

@@ -35,6 +35,9 @@ import {
   hashAuditPayload,
   getInstallationSecretKey,
   computeProposalRowSignature,
+  verifyProposalRowSignature,
+  computeIncidentRowSignature,
+  verifyIncidentRowSignature,
 } from '../utils/security.js';
 
 export class AutopsyDatabase {
@@ -153,6 +156,7 @@ export class AutopsyDatabase {
         agent_name TEXT DEFAULT 'agent',
         session_id TEXT,
         test_execution_note TEXT,
+        row_signature TEXT,
         created_at TEXT NOT NULL,
         FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE,
         FOREIGN KEY (base_checkpoint_id) REFERENCES checkpoints(id) ON DELETE SET NULL
@@ -331,6 +335,7 @@ export class AutopsyDatabase {
       `ALTER TABLE incidents ADD COLUMN change_scope_summary_json TEXT;`,
       `ALTER TABLE repair_proposals ADD COLUMN rejection_reason TEXT;`,
       `ALTER TABLE repair_proposals ADD COLUMN row_signature TEXT;`,
+      `ALTER TABLE incidents ADD COLUMN row_signature TEXT;`,
     ];
 
     for (const sql of migrations) {
@@ -438,6 +443,44 @@ export class AutopsyDatabase {
             }
             this.db.prepare(`UPDATE checkpoints SET project_id = ? WHERE project_id = ?`).run(canonicalId, p.id);
             this.db.prepare(`UPDATE incidents SET project_id = ? WHERE project_id = ?`).run(canonicalId, p.id);
+
+            // Re-sign updated incidents and proposals to preserve HMAC validity
+            try {
+              const secret = getInstallationSecretKey();
+              const updatedIncidents = this.db.prepare(`SELECT id, user_report_text, created_at, row_signature FROM incidents WHERE project_id = ?`).all(canonicalId) as any[];
+              for (const incRow of updatedIncidents) {
+                if (incRow.row_signature) {
+                  const newIncSig = computeIncidentRowSignature(secret, {
+                    id: incRow.id,
+                    project_id: canonicalId,
+                    user_report_text: incRow.user_report_text || '',
+                    created_at: incRow.created_at,
+                  });
+                  this.db.prepare(`UPDATE incidents SET row_signature = ? WHERE id = ?`).run(newIncSig, incRow.id);
+                }
+              }
+
+              const updatedProposals = this.db.prepare(`
+                SELECT p.id, p.incident_id, p.file_changes_json, p.verification_status, p.created_at, p.row_signature
+                FROM repair_proposals p
+                JOIN incidents i ON i.id = p.incident_id
+                WHERE i.project_id = ?
+              `).all(canonicalId) as any[];
+              for (const propRow of updatedProposals) {
+                if (propRow.row_signature) {
+                  const newPropSig = computeProposalRowSignature(secret, {
+                    id: propRow.id,
+                    incident_id: propRow.incident_id,
+                    project_id: canonicalId,
+                    file_changes_json: propRow.file_changes_json,
+                    verification_status: propRow.verification_status,
+                    created_at: propRow.created_at,
+                  });
+                  this.db.prepare(`UPDATE repair_proposals SET row_signature = ? WHERE id = ?`).run(newPropSig, propRow.id);
+                }
+              }
+            } catch {}
+
             try {
               this.db.prepare(`UPDATE agent_events SET project_id = ? WHERE project_id = ?`).run(canonicalId, p.id);
             } catch {}
@@ -777,6 +820,18 @@ export class AutopsyDatabase {
   // Incidents
   public insertIncident(incident: Incident): void {
     this.runInImmediateTransaction(() => {
+      let rowSig = incident.rowSignature;
+      if (rowSig === undefined) {
+        const secret = getInstallationSecretKey();
+        rowSig = computeIncidentRowSignature(secret, {
+          id: incident.id,
+          project_id: incident.projectId,
+          user_report_text: incident.userReportText || '',
+          created_at: incident.createdAt,
+        });
+        incident.rowSignature = rowSig;
+      }
+
       const stmt = this.db.prepare(`
         INSERT INTO incidents (
           id, project_id, base_checkpoint_id, title, error_output, diff_summary,
@@ -785,10 +840,10 @@ export class AutopsyDatabase {
           reproduction_condition, verification_method, verification_type, user_confirmed_intent, user_confirmation_summary, cause_verdict,
           risk_level, risk_signals_json, orchestration_decision_json, test_execution_note,
           reproduction_result_json, coverage_lines_json, user_report_text, intents_json, missing_intents_json,
-          change_scope_summary_json,
+          change_scope_summary_json, row_signature,
           created_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `);
       const rawScope = incident.changeScopeSummary;
       const scopeSummaryJson = rawScope ? (typeof rawScope === 'string' ? JSON.stringify(rawScope) : JSON.stringify(rawScope)) : null;
@@ -826,6 +881,7 @@ export class AutopsyDatabase {
         incident.intents ? JSON.stringify(incident.intents) : null,
         JSON.stringify(incident.missingIntents || []),
         scopeSummaryJson,
+        rowSig || null,
         incident.createdAt
       );
 
@@ -845,10 +901,34 @@ export class AutopsyDatabase {
     });
   }
 
-  public getIncident(id: string): Incident | null {
-    const stmt = this.db.prepare(`SELECT * FROM incidents WHERE id = ?`);
-    const row = stmt.get(id) as any;
-    if (!row) return null;
+  private mapIncidentRow(row: any): Incident {
+    let integrityStatus: '정상' | '서명 없음' | '변조 의심' = '정상';
+    let integrityCode: 'VALID' | 'UNSIGNED' | 'TAMPERED' = 'VALID';
+
+    if (!row.row_signature || String(row.row_signature).trim() === '') {
+      integrityStatus = '서명 없음';
+      integrityCode = 'UNSIGNED';
+    } else {
+      const secret = getInstallationSecretKey();
+      const isValid = verifyIncidentRowSignature(
+        secret,
+        {
+          id: row.id,
+          project_id: row.project_id,
+          user_report_text: row.user_report_text || '',
+          created_at: row.created_at,
+        },
+        row.row_signature
+      );
+      if (!isValid) {
+        integrityStatus = '변조 의심';
+        integrityCode = 'TAMPERED';
+      } else {
+        integrityStatus = '정상';
+        integrityCode = 'VALID';
+      }
+    }
+
     return {
       id: row.id,
       projectId: row.project_id,
@@ -891,8 +971,18 @@ export class AutopsyDatabase {
             }
           })()
         : undefined,
+      rowSignature: row.row_signature || null,
+      integrityStatus,
+      integrityCode,
       createdAt: row.created_at,
     };
+  }
+
+  public getIncident(id: string): Incident | null {
+    const stmt = this.db.prepare(`SELECT * FROM incidents WHERE id = ?`);
+    const row = stmt.get(id) as any;
+    if (!row) return null;
+    return this.mapIncidentRow(row);
   }
 
   public updateIncidentChangeScopeSummary(id: string, summary: any): void {
@@ -979,50 +1069,7 @@ export class AutopsyDatabase {
       LIMIT ?
     `);
     const rows = stmt.all(projectId, limit) as any[];
-    return rows.map((row) => ({
-      id: row.id,
-      projectId: row.project_id,
-      baseCheckpointId: row.base_checkpoint_id,
-      title: row.title,
-      errorOutput: row.error_output,
-      diffSummary: row.diff_summary,
-      status: row.status as any,
-      severity: (row.severity || 'UNASSESSED') as any,
-      severityEvidence: row.severity_evidence_json ? JSON.parse(row.severity_evidence_json) : [],
-      causeEvidence: row.cause_evidence_json ? JSON.parse(row.cause_evidence_json) : [],
-      agentName: row.agent_name || 'agent',
-      sessionId: row.session_id || undefined,
-      expectedBehavior: row.expected_behavior || undefined,
-      observedBehavior: row.observed_behavior || undefined,
-      brokenStep: row.broken_step || undefined,
-      reproductionCondition: row.reproduction_condition || undefined,
-      verificationMethod: row.verification_method || undefined,
-      verificationType: row.verification_type || undefined,
-      userConfirmedIntent: Boolean(row.user_confirmed_intent),
-      userConfirmationSummary: row.user_confirmation_summary || undefined,
-      causeVerdict: row.cause_verdict || undefined,
-      riskLevel: row.risk_level || undefined,
-      riskSignals: row.risk_signals_json ? JSON.parse(row.risk_signals_json) : undefined,
-      orchestrationDecision: row.orchestration_decision_json ? JSON.parse(row.orchestration_decision_json) : undefined,
-      executionTrace: row.execution_trace_json ? JSON.parse(row.execution_trace_json) : undefined,
-      threeLevelHealth: row.three_level_health_json ? JSON.parse(row.three_level_health_json) : undefined,
-      testExecutionNote: row.test_execution_note || undefined,
-      reproductionResult: row.reproduction_result_json ? JSON.parse(row.reproduction_result_json) : undefined,
-      coverageLines: row.coverage_lines_json ? JSON.parse(row.coverage_lines_json) : undefined,
-      userReportText: row.user_report_text || undefined,
-      intents: row.intents_json ? JSON.parse(row.intents_json) : undefined,
-      missingIntents: row.missing_intents_json ? JSON.parse(row.missing_intents_json) : [],
-      changeScopeSummary: row.change_scope_summary_json
-        ? (() => {
-            try {
-              return JSON.parse(row.change_scope_summary_json);
-            } catch {
-              return row.change_scope_summary_json;
-            }
-          })()
-        : undefined,
-      createdAt: row.created_at,
-    }));
+    return rows.map((row) => this.mapIncidentRow(row));
   }
 
   // Agent Sessions
@@ -1079,10 +1126,14 @@ export class AutopsyDatabase {
     this.runInImmediateTransaction(() => {
       let rowSig = proposal.rowSignature;
       if (rowSig === undefined) {
+        const inc = this.db.prepare('SELECT project_id FROM incidents WHERE id = ?').get(proposal.incidentId) as any;
+        const projectId = inc ? String(inc.project_id) : '';
+
         const secret = getInstallationSecretKey();
         rowSig = computeProposalRowSignature(secret, {
           id: proposal.id,
           incident_id: proposal.incidentId,
+          project_id: projectId,
           file_changes_json: proposal.fileChangesJson,
           verification_status: proposal.verificationStatus,
           created_at: proposal.createdAt,
@@ -1218,15 +1269,34 @@ export class AutopsyDatabase {
     approvalBlockReason?: string | null
   ): void {
     this.runInImmediateTransaction(() => {
+      const current = this.db.prepare('SELECT id, incident_id, file_changes_json, created_at FROM repair_proposals WHERE id = ?').get(id) as any;
+      if (!current) {
+        throw new Error(`Proposal with ID "${id}" not found.`);
+      }
+
+      const inc = this.db.prepare('SELECT project_id FROM incidents WHERE id = ?').get(current.incident_id) as any;
+      const projectId = inc ? String(inc.project_id) : '';
+
+      const secret = getInstallationSecretKey();
+      const newSignature = computeProposalRowSignature(secret, {
+        id: current.id,
+        incident_id: current.incident_id,
+        project_id: projectId,
+        file_changes_json: current.file_changes_json,
+        verification_status: status,
+        created_at: current.created_at,
+      });
+
       const stmt = this.db.prepare(`
         UPDATE repair_proposals 
         SET verification_status = ?,
             verification_log = ?,
             approval_readiness = COALESCE(?, approval_readiness),
-            approval_block_reason = COALESCE(?, approval_block_reason)
+            approval_block_reason = COALESCE(?, approval_block_reason),
+            row_signature = ?
         WHERE id = ?
       `);
-      stmt.run(status, log, approvalReadiness || null, approvalBlockReason || null, id);
+      stmt.run(status, log, approvalReadiness || null, approvalBlockReason || null, newSignature, id);
     });
   }
 

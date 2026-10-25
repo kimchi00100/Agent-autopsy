@@ -11,6 +11,7 @@ import {
   getInstallationSecretKey,
   computeProposalRowSignature,
   verifyProposalRowSignature,
+  hashAuditPayload,
 } from '../utils/security.js';
 import {
   ApprovalReadiness,
@@ -165,6 +166,7 @@ import {
     const rowSignature = computeProposalRowSignature(secretKey, {
       id: proposalId,
       incident_id: incidentId,
+      project_id: project.id,
       file_changes_json: fileChangesJson,
       verification_status: verificationStatus,
       created_at: createdAt,
@@ -205,7 +207,8 @@ import {
   export function approveProposal(ctx: CoreContext, 
     proposalId: string,
     selectedFiles?: string[],
-    forceOverrideWithRiskAck: boolean = false
+    forceOverrideWithRiskAck: boolean = false,
+    repoPath?: string
   ): ApprovalFingerprint {
     const proposal = ctx.db.getRepairProposal(proposalId);
     if (!proposal) throw new Error(`Proposal "${proposalId}" not found.`);
@@ -213,6 +216,29 @@ import {
     if (!incident) throw new Error(`Incident not found.`);
     const project = ctx.db.getProject(incident.projectId);
     if (!project) throw new Error(`Project not found.`);
+
+    // HARD GATE 0: Project Affiliation Check (if repoPath provided)
+    if (repoPath) {
+      const callingProject = ctx.ensureProject(repoPath);
+      if (callingProject.id !== project.id) {
+        ctx.db.appendAuditLog({
+          kind: 'PROJECT_MISMATCH_BLOCKED',
+          entityType: 'PROPOSAL',
+          entityId: proposalId,
+          payloadHash: hashAuditPayload({
+            proposalId,
+            callingProjectId: callingProject.id,
+            expectedProjectId: project.id,
+            repoPath,
+          }),
+        });
+        const err: any = new Error(
+          `[PROJECT_MISMATCH]: 수정안 "${proposalId}"의 소속 프로젝트("${project.id}")와 승인 대상 저장소("${callingProject.id}", ${repoPath})가 일치하지 않습니다.`
+        );
+        err.code = 'PROJECT_MISMATCH';
+        throw err;
+      }
+    }
 
     // HARD GATE: Tampered proposal can never be approved
     if (proposal.approvalStatus === 'TAMPERED') {
@@ -237,6 +263,7 @@ import {
       {
         id: proposal.id,
         incident_id: proposal.incidentId,
+        project_id: project.id,
         file_changes_json: proposal.fileChangesJson,
         verification_status: proposal.verificationStatus,
         created_at: proposal.createdAt,
@@ -345,6 +372,38 @@ import {
     if (!proposal) {
       throw new Error(`Proposal with ID "${proposalId}" not found.`);
     }
+    const incident = ctx.db.getIncident(proposal.incidentId);
+    if (!incident) {
+      throw new Error(`Incident with ID "${proposal.incidentId}" not found.`);
+    }
+
+    // HARD SECURITY GATE 0: Project Affiliation Check (blocks applying Project A's patch to Project B)
+    if (incident.projectId !== project.id) {
+      ctx.recordAgentEvent(
+        project.rootPath,
+        'NOTE',
+        `[보안 경고] 프로젝트 불일치(PROJECT_MISMATCH) 감지`,
+        `수정안 "${proposalId}"(소속: ${incident.projectId})을 다른 프로젝트 "${project.id}"(${repoPath})에 적용하려는 시도가 차단되었습니다.`,
+        null,
+        'security-gate'
+      );
+      ctx.db.appendAuditLog({
+        kind: 'PROJECT_MISMATCH_BLOCKED',
+        entityType: 'PROPOSAL',
+        entityId: proposalId,
+        payloadHash: hashAuditPayload({
+          proposalId,
+          targetProjectId: project.id,
+          expectedProjectId: incident.projectId,
+          targetRepoPath: repoPath,
+        }),
+      });
+      const err: any = new Error(
+        `[PROJECT_MISMATCH]: 수정안 "${proposalId}"의 소속 프로젝트("${incident.projectId}")와 적용 대상 저장소("${project.id}", ${repoPath})가 일치하지 않습니다. 타 프로젝트 수정안 무단 적용이 차단되었습니다.`
+      );
+      err.code = 'PROJECT_MISMATCH';
+      throw err;
+    }
 
     // HARD SECURITY GATE 1: Status must be APPROVED
     if (proposal.approvalStatus !== 'APPROVED') {
@@ -361,6 +420,7 @@ import {
         {
           id: proposal.id,
           incident_id: proposal.incidentId,
+          project_id: incident.projectId,
           file_changes_json: proposal.fileChangesJson,
           verification_status: proposal.verificationStatus,
           created_at: proposal.createdAt,

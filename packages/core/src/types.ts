@@ -189,6 +189,9 @@ export interface ChangeScopeSummary {
   expansion?: ScopeExpansionInfo;
 }
 
+export type IncidentIntegrityStatus = '정상' | '서명 없음' | '변조 의심';
+export type IncidentIntegrityCode = 'VALID' | 'UNSIGNED' | 'TAMPERED';
+
 export interface Incident {
   id: string;
   projectId: string;
@@ -224,6 +227,9 @@ export interface Incident {
   threeLevelHealth?: ThreeLevelHealth;
   testExecutionNote?: string;
   changeScopeSummary?: ChangeScopeSummary | string;
+  rowSignature?: string | null;
+  integrityStatus?: IncidentIntegrityStatus;
+  integrityCode?: IncidentIntegrityCode;
   createdAt: string;
 }
 

@@ -444,9 +444,10 @@ export class CoreManager {
   public approveProposal(
     proposalId: string,
     selectedFiles?: string[],
-    forceOverrideWithRiskAck: boolean = false
+    forceOverrideWithRiskAck: boolean = false,
+    repoPath?: string
   ): ApprovalFingerprint {
-    return approveProposal(this.ctx, proposalId, selectedFiles, forceOverrideWithRiskAck);
+    return approveProposal(this.ctx, proposalId, selectedFiles, forceOverrideWithRiskAck, repoPath);
   }
 
   public rejectProposal(proposalId: string, reason?: string): void {

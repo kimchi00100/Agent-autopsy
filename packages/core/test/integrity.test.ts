@@ -639,9 +639,10 @@ console.log("ALL TESTS PASSED");
       const incId = process.argv[4];
       const changesJson = process.argv[5];
       const createdAt = process.argv[6];
+      const projId = process.argv[7];
 
-      // Sign with foreign secret
-      const payload = [propId, incId, changesJson, 'VERIFIED_PASS', createdAt].join('::');
+      // Sign with foreign secret (including project_id)
+      const payload = [propId, incId, projId, changesJson, 'VERIFIED_PASS', createdAt].join('::');
       const foreignSignature = crypto.createHmac('sha256', otherSecret).update(payload).digest('hex');
 
       // Insert directly into destination DB
@@ -680,6 +681,7 @@ console.log("ALL TESTS PASSED");
         incidentId,
         foreignChanges,
         foreignCreatedAt,
+        core.getDatabase().getIncident(incidentId)!.projectId,
       ],
       { env: { ...process.env, NODE_OPTIONS: '' } }
     );
@@ -795,5 +797,324 @@ console.log("ALL TESTS PASSED");
     assert.ok(stillExists, 'Legacy proposal row must remain intact in DB');
     assert.strictEqual(stillExists.approvalStatus, 'AWAITING_USER', 'Legacy proposal status must not be overwritten or deleted');
     assert.strictEqual(stillExists.rowSignature, null, 'rowSignature must remain null in DB');
+  });
+
+  test('5. updateProposalVerification 정상 경로 재서명 검증: 검증 상태 갱신 시 row_signature가 함께 재서명되어 승인 및 적용이 차단되지 않고 통과하는지', async () => {
+    // 1. Create a proposal that passes verification (with a real working patch)
+    const { proposal } = await core.proposeAndVerifyRepair(
+      repoPath,
+      incidentId,
+      'Valid fix for add function',
+      [
+        {
+          filePath: 'calculator.js',
+          replacements: [
+            {
+              search: 'return a - b;',
+              replace: 'return a + b;',
+            },
+          ],
+        },
+      ]
+    );
+
+    assert.strictEqual(proposal.verificationStatus, 'VERIFIED_PASS');
+    const oldSig = proposal.rowSignature;
+    assert.ok(oldSig, 'Must have initial rowSignature');
+
+    // 2. Normal path: update verification status using updateProposalVerification
+    core.getDatabase().updateProposalVerification(
+      proposal.id,
+      'VERIFIED_PASS',
+      'Re-verified after test re-run with clean isolation',
+      'READY_FOR_APPROVAL',
+      null
+    );
+
+    // 3. Confirm the row still has a valid row_signature in DB
+    const refreshed = core.getDatabase().getRepairProposal(proposal.id);
+    assert.ok(refreshed);
+    assert.strictEqual(refreshed.verificationStatus, 'VERIFIED_PASS');
+    assert.ok(refreshed.rowSignature, 'Re-signed rowSignature must exist');
+
+    // 4. Approve proposal -> must succeed without SECURITY_TAMPER_DETECTED
+    const approvedFp = core.approveProposal(proposal.id);
+    assert.ok(approvedFp);
+    const approvedProp = core.getDatabase().getRepairProposal(proposal.id);
+    assert.strictEqual(approvedProp?.approvalStatus, 'APPROVED');
+
+    // 5. Apply proposal -> must succeed without SECURITY_TAMPER_DETECTED
+    const applyResult = core.applyApprovedRepair(repoPath, proposal.id);
+    assert.strictEqual(applyResult.applied, true);
+    const appliedProp = core.getDatabase().getRepairProposal(proposal.id);
+    assert.strictEqual(appliedProp?.approvalStatus, 'APPLIED');
+
+    // Restore calculator.js back to bug state for subsequent tests
+    fs.writeFileSync(
+      path.join(repoPath, 'calculator.js'),
+      'export function add(a, b) { return a - b; }\n',
+      'utf8'
+    );
+  });
+
+  test('6. 사건(incidents) 행 서명 검증: 정상 등록은 VALID("정상"), 마이그레이션 전 서명 없는 행은 UNSIGNED("서명 없음"), 별도 프로세스로 user_report_text나 project_id 변조 시 TAMPERED("변조 의심") 반환 및 비차단 확인', async () => {
+    // 1. Check normal registered incident from before()
+    const normalInc = core.getDatabase().getIncident(incidentId);
+    assert.ok(normalInc);
+    assert.strictEqual(normalInc.integrityCode, 'VALID');
+    assert.strictEqual(normalInc.integrityStatus, '정상');
+    assert.ok(normalInc.rowSignature, 'Normal incident must have non-null rowSignature');
+
+    // 2. Register another incident specifically for legacy unsigned simulation
+    const legacyInc = await core.collectIncidentBundle(repoPath, {
+      title: 'Legacy unsigned incident test',
+      userReportText: 'Legacy incident report text without row signature',
+      expectedBehavior: 'Expect pass',
+      observedBehavior: 'Observed fail',
+      reproductionCondition: 'node test.js',
+      verificationMethod: 'Run node test.js',
+    });
+
+    // Strip signature using separate Node process to simulate pre-migration row
+    const stripScript = `
+      import { DatabaseSync } from 'node:sqlite';
+      const db = new DatabaseSync(process.argv[1]);
+      db.prepare('UPDATE incidents SET row_signature = NULL WHERE id = ?').run(process.argv[2]);
+      db.close();
+    `;
+    execFileSync(
+      'node',
+      ['--input-type=module', '-e', stripScript, dbPath, legacyInc.id],
+      { env: { ...process.env, NODE_OPTIONS: '' } }
+    );
+
+    // Query via getIncident: MUST return UNSIGNED / '서명 없음' AND NOT throw/block
+    const queriedLegacy = core.getDatabase().getIncident(legacyInc.id);
+    assert.ok(queriedLegacy);
+    assert.strictEqual(queriedLegacy.integrityCode, 'UNSIGNED');
+    assert.strictEqual(queriedLegacy.integrityStatus, '서명 없음');
+    assert.strictEqual(queriedLegacy.rowSignature, null);
+
+    // 3. Register incident and tamper user_report_text using separate Node process
+    const tamperTextInc = await core.collectIncidentBundle(repoPath, {
+      title: 'Tamper user_report_text test',
+      userReportText: 'Original pristine user report text',
+      expectedBehavior: 'Expect pass',
+      observedBehavior: 'Observed fail',
+      reproductionCondition: 'node test.js',
+      verificationMethod: 'Run node test.js',
+    });
+
+    const tamperTextScript = `
+      import { DatabaseSync } from 'node:sqlite';
+      const db = new DatabaseSync(process.argv[1]);
+      db.prepare("UPDATE incidents SET user_report_text = 'Tampered text by rogue unauthorized tool' WHERE id = ?").run(process.argv[2]);
+      db.close();
+    `;
+    execFileSync(
+      'node',
+      ['--input-type=module', '-e', tamperTextScript, dbPath, tamperTextInc.id],
+      { env: { ...process.env, NODE_OPTIONS: '' } }
+    );
+
+    // Query via getIncident: MUST return TAMPERED / '변조 의심' AND NOT throw/block (non-blocking)
+    const queriedTamperedText = core.getDatabase().getIncident(tamperTextInc.id);
+    assert.ok(queriedTamperedText, 'Incident lookup must succeed non-blockingly');
+    assert.strictEqual(queriedTamperedText.integrityCode, 'TAMPERED');
+    assert.strictEqual(queriedTamperedText.integrityStatus, '변조 의심');
+
+    // 4. Register incident and tamper project_id using separate Node process
+    const tamperProjInc = await core.collectIncidentBundle(repoPath, {
+      title: 'Tamper project_id test',
+      userReportText: 'Original text for project id tampering',
+      expectedBehavior: 'Expect pass',
+      observedBehavior: 'Observed fail',
+      reproductionCondition: 'node test.js',
+      verificationMethod: 'Run node test.js',
+    });
+
+    const tamperProjScript = `
+      import { DatabaseSync } from 'node:sqlite';
+      const db = new DatabaseSync(process.argv[1]);
+      db.exec('PRAGMA foreign_keys = OFF;');
+      db.prepare("UPDATE incidents SET project_id = 'proj_rogue_injected' WHERE id = ?").run(process.argv[2]);
+      db.close();
+    `;
+    execFileSync(
+      'node',
+      ['--input-type=module', '-e', tamperProjScript, dbPath, tamperProjInc.id],
+      { env: { ...process.env, NODE_OPTIONS: '' } }
+    );
+
+    const queriedTamperedProj = core.getDatabase().getIncident(tamperProjInc.id);
+    assert.ok(queriedTamperedProj, 'Incident lookup must succeed non-blockingly');
+    assert.strictEqual(queriedTamperedProj.integrityCode, 'TAMPERED');
+    assert.strictEqual(queriedTamperedProj.integrityStatus, '변조 의심');
+  });
+
+  test('7. 프로젝트 소속 확인(PROJECT_MISMATCH): 프로젝트 A의 승인된 수정안을 프로젝트 B에 적용 시도 시 PROJECT_MISMATCH로 거부되고 프로젝트 B 파일 미변경, audit_log에 PROJECT_MISMATCH_BLOCKED 기록', async () => {
+    // 1. Setup Project B in a separate directory
+    const repoPathB = path.join(tmpBase, 'sample_project_b');
+    fs.mkdirSync(repoPathB, { recursive: true });
+    execFileSync('git', ['init', '-b', 'main'], { cwd: repoPathB });
+    execFileSync('git', ['config', 'user.name', 'TesterB'], { cwd: repoPathB });
+    execFileSync('git', ['config', 'user.email', 'testerb@example.com'], { cwd: repoPathB });
+
+    const originalCalculatorB = 'export function add(a, b) { return "PROJECT_B_UNTOUCHED"; }\\n';
+    fs.writeFileSync(path.join(repoPathB, 'calculator.js'), originalCalculatorB, 'utf8');
+    fs.writeFileSync(
+      path.join(repoPathB, 'package.json'),
+      JSON.stringify({ name: 'calc-b', type: 'module' }),
+      'utf8'
+    );
+    execFileSync('git', ['add', '.'], { cwd: repoPathB });
+    execFileSync('git', ['commit', '-m', 'Initial commit in Project B'], { cwd: repoPathB });
+
+    core.confirmTestCommand(repoPathB, 'node -e "process.exit(0)"');
+    core.captureCheckpoint(repoPathB, 'Project B Initial', 'tester');
+
+    // 2. Create fresh incident and proposal for Project A
+    const inc7 = await core.collectIncidentBundle(repoPath, {
+      title: 'Project A cross-project incident',
+      userReportText: 'Report for cross project testing',
+      expectedBehavior: 'add(2, 3) === 5',
+      observedBehavior: 'add(2, 3) === -1',
+      reproductionCondition: 'node test.js',
+      verificationMethod: 'Run node test.js',
+    });
+
+    const { proposal: proposalA } = await core.proposeAndVerifyRepair(
+      repoPath,
+      inc7.id,
+      'Valid fix in Project A',
+      [
+        {
+          filePath: 'calculator.js',
+          replacements: [
+            {
+              search: 'return a - b;',
+              replace: 'return a + b;',
+            },
+          ],
+        },
+      ]
+    );
+
+    // 3. Attempt approveProposal with Project B's repoPath -> MUST throw PROJECT_MISMATCH
+    let approveErr: any = null;
+    try {
+      core.approveProposal(proposalA.id, undefined, true, repoPathB);
+    } catch (err: any) {
+      approveErr = err;
+    }
+    assert.ok(approveErr, 'Cross-project approval must throw');
+    assert.strictEqual(approveErr.code, 'PROJECT_MISMATCH');
+    assert.ok(approveErr.message.includes('[PROJECT_MISMATCH]'));
+
+    // Approve proposal for Project A legitimately (forceOverrideWithRiskAck = true)
+    core.approveProposal(proposalA.id, undefined, true, repoPath);
+
+    // 4. Attempt applyApprovedRepair targeting Project B -> MUST throw PROJECT_MISMATCH
+    let applyErr: any = null;
+    try {
+      core.applyApprovedRepair(repoPathB, proposalA.id);
+    } catch (err: any) {
+      applyErr = err;
+    }
+
+    assert.ok(applyErr, 'Cross-project repair application must be blocked');
+    assert.strictEqual(applyErr.code, 'PROJECT_MISMATCH');
+    assert.ok(applyErr.message.includes('[PROJECT_MISMATCH]'));
+    assert.ok(applyErr.message.includes('일치하지 않습니다'));
+
+    // 5. Verify Project B files remain completely untouched
+    const currentCalculatorB = fs.readFileSync(path.join(repoPathB, 'calculator.js'), 'utf8');
+    assert.strictEqual(currentCalculatorB, originalCalculatorB, 'Project B file must be completely untouched');
+
+    // 6. Verify audit_log recorded PROJECT_MISMATCH_BLOCKED
+    const logs = core.getDatabase().getAuditLogs(20);
+    const mismatchLog = logs.find((l) => l.kind === 'PROJECT_MISMATCH_BLOCKED' && l.entityId === proposalA.id);
+    assert.ok(mismatchLog, 'audit_log must record PROJECT_MISMATCH_BLOCKED');
+  });
+
+  test('8. SQLite로 사건의 project_id를 몰래 변경 후 적용 시도 시 차단 검증: 서명 불일치(SECURITY_TAMPER_DETECTED) 또는 소속 불일치(PROJECT_MISMATCH)로 파일 적용 원천 차단', async () => {
+    // 1. Create a fresh incident and clean proposal in Project A
+    const inc8 = await core.collectIncidentBundle(repoPath, {
+      title: 'Incident for project tampering check',
+      userReportText: 'Report for project tampering check',
+      expectedBehavior: 'add(2, 3) === 5',
+      observedBehavior: 'add(2, 3) === -1',
+      reproductionCondition: 'node test.js',
+      verificationMethod: 'Run node test.js',
+    });
+
+    const { proposal } = await core.proposeAndVerifyRepair(
+      repoPath,
+      inc8.id,
+      'Another valid fix in Project A',
+      [
+        {
+          filePath: 'calculator.js',
+          replacements: [
+            {
+              search: 'return a - b;',
+              replace: 'return a + b;',
+            },
+          ],
+        },
+      ]
+    );
+
+    // Approve legitimately
+    core.approveProposal(proposal.id, undefined, true);
+
+    // 2. Secretly modify incident's project_id in SQLite using separate Node process
+    const rogueProjectId = 'proj_rogue_forged';
+    const tamperScript = `
+      import { DatabaseSync } from 'node:sqlite';
+      const db = new DatabaseSync(process.argv[1]);
+      db.exec('PRAGMA foreign_keys = OFF;');
+      db.prepare('UPDATE incidents SET project_id = ? WHERE id = ?').run(process.argv[3], process.argv[2]);
+      db.close();
+    `;
+    execFileSync(
+      'node',
+      ['--input-type=module', '-e', tamperScript, dbPath, inc8.id, rogueProjectId],
+      { env: { ...process.env, NODE_OPTIONS: '' } }
+    );
+
+    // 3. Attempt to apply in Project A -> incident.projectId is now 'proj_rogue_forged',
+    // which differs from Project A's ID!
+    let caughtErr: any = null;
+    try {
+      core.applyApprovedRepair(repoPath, proposal.id);
+    } catch (err: any) {
+      caughtErr = err;
+    }
+
+    assert.ok(caughtErr, 'Tampered incident project_id must block repair application');
+    assert.ok(
+      caughtErr.code === 'PROJECT_MISMATCH' || caughtErr.code === 'SECURITY_TAMPER_DETECTED',
+      `Rejection code must be PROJECT_MISMATCH or SECURITY_TAMPER_DETECTED, got: ${caughtErr.code}`
+    );
+
+    // 4. Verify calculator.js was NOT modified
+    const currentCalc = fs.readFileSync(path.join(repoPath, 'calculator.js'), 'utf8');
+    assert.ok(currentCalc.includes('return a - b;'), 'calculator.js must NOT have received the patch');
+
+    // Restore original project_id in SQLite for cleanup
+    const restoreScript = `
+      import { DatabaseSync } from 'node:sqlite';
+      const db = new DatabaseSync(process.argv[1]);
+      db.exec('PRAGMA foreign_keys = OFF;');
+      db.prepare('UPDATE incidents SET project_id = ? WHERE id = ?').run(process.argv[3], process.argv[2]);
+      db.close();
+    `;
+    const projA = core.getDatabase().getProjectByPath(repoPath);
+    execFileSync(
+      'node',
+      ['--input-type=module', '-e', restoreScript, dbPath, inc8.id, projA!.id],
+      { env: { ...process.env, NODE_OPTIONS: '' } }
+    );
   });
 });

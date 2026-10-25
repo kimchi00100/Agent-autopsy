@@ -530,13 +530,14 @@ export class ApiServer {
         const fingerprint = this.coreManager.approveProposal(
           proposalId,
           body.selectedFiles,
-          body.forceOverrideWithRiskAck === true
+          body.forceOverrideWithRiskAck === true,
+          body.repoPath
         );
         const updated = db.getRepairProposal(proposalId);
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ success: true, proposal: updated, fingerprint }));
       } catch (err: any) {
-        const statusCode = err.code === 'LEGACY_UNSIGNED' ? 400 : (err.code === 'SECURITY_TAMPER_DETECTED' ? 403 : 500);
+        const statusCode = err.code === 'LEGACY_UNSIGNED' ? 400 : (err.code === 'SECURITY_TAMPER_DETECTED' || err.code === 'PROJECT_MISMATCH' ? 403 : 500);
         res.writeHead(statusCode, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ success: false, error: err.message, code: err.code || 'APPROVAL_FAILED' }));
       }
@@ -566,9 +567,15 @@ export class ApiServer {
       const proposalId = applyMatch[1];
       const body = await this.parseJsonBody(req);
       const repoPath = body.repoPath || process.cwd();
-      const result = this.coreManager.applyApprovedRepair(repoPath, proposalId, body.selectedFiles);
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ success: true, result }));
+      try {
+        const result = this.coreManager.applyApprovedRepair(repoPath, proposalId, body.selectedFiles);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: true, result }));
+      } catch (err: any) {
+        const statusCode = err.code === 'PROJECT_MISMATCH' || err.code === 'SECURITY_TAMPER_DETECTED' ? 403 : 500;
+        res.writeHead(statusCode, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: false, error: err.message, code: err.code || 'APPLY_FAILED' }));
+      }
       return;
     }
 

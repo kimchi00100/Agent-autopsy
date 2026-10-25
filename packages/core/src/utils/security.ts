@@ -148,11 +148,12 @@ export function computeAuditEntryHash(
 
 /**
  * Fixed list of fields included in the repair proposal row HMAC signature.
- * Prevents unauthorized SQLite modification of critical fields (code changes, verification status, timestamps).
+ * Prevents unauthorized SQLite modification of critical fields (code changes, verification status, timestamps, project affiliation).
  */
 export const PROPOSAL_SIGNATURE_FIELDS = [
   'id',
   'incident_id',
+  'project_id',
   'file_changes_json',
   'verification_status',
   'created_at',
@@ -161,6 +162,7 @@ export const PROPOSAL_SIGNATURE_FIELDS = [
 export interface ProposalSignaturePayload {
   id: string;
   incident_id: string;
+  project_id: string;
   file_changes_json: string;
   verification_status: string;
   created_at: string;
@@ -168,7 +170,7 @@ export interface ProposalSignaturePayload {
 
 /**
  * Computes deterministic HMAC-SHA256 signature for a repair proposal row.
- * Format: id:incident_id:file_changes_json:verification_status:created_at
+ * Format: id::incident_id::project_id::file_changes_json::verification_status::created_at
  * Delimiter: "::"
  */
 export function computeProposalRowSignature(
@@ -178,6 +180,7 @@ export function computeProposalRowSignature(
   const payload = [
     fields.id,
     fields.incident_id,
+    fields.project_id,
     fields.file_changes_json,
     fields.verification_status,
     fields.created_at,
@@ -195,6 +198,62 @@ export function verifyProposalRowSignature(
 ): boolean {
   if (!signature || typeof signature !== 'string') return false;
   const expected = computeProposalRowSignature(secretKey, fields);
+  try {
+    const a = Buffer.from(signature, 'hex');
+    const b = Buffer.from(expected, 'hex');
+    if (a.length !== b.length) return false;
+    return crypto.timingSafeEqual(a, b);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Fixed list of fields included in the incident row HMAC signature.
+ * Identity fields: id, project_id, user_report_text, created_at.
+ */
+export const INCIDENT_SIGNATURE_FIELDS = [
+  'id',
+  'project_id',
+  'user_report_text',
+  'created_at',
+] as const;
+
+export interface IncidentSignaturePayload {
+  id: string;
+  project_id: string;
+  user_report_text: string;
+  created_at: string;
+}
+
+/**
+ * Computes deterministic HMAC-SHA256 signature for an incident row.
+ * Format: id::project_id::user_report_text::created_at
+ * Delimiter: "::"
+ */
+export function computeIncidentRowSignature(
+  secretKey: string,
+  fields: IncidentSignaturePayload
+): string {
+  const payload = [
+    fields.id,
+    fields.project_id,
+    fields.user_report_text || '',
+    fields.created_at,
+  ].join('::');
+  return crypto.createHmac('sha256', secretKey).update(payload).digest('hex');
+}
+
+/**
+ * Verifies an incident row HMAC signature against a secret key using timing-safe comparison.
+ */
+export function verifyIncidentRowSignature(
+  secretKey: string,
+  fields: IncidentSignaturePayload,
+  signature?: string | null
+): boolean {
+  if (!signature || typeof signature !== 'string') return false;
+  const expected = computeIncidentRowSignature(secretKey, fields);
   try {
     const a = Buffer.from(signature, 'hex');
     const b = Buffer.from(expected, 'hex');

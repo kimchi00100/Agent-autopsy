@@ -283,12 +283,7 @@ import {
    * Ensures project is registered in DB and returns it.
    */
   export function ensureProject(ctx: CoreContext, repoPath: string, testCommand?: string): Project {
-    let rootPath: string;
-    try {
-      rootPath = ctx.gitEngine.getRepoRoot(repoPath);
-    } catch {
-      rootPath = path.resolve(repoPath);
-    }
+    const rootPath = ctx.gitEngine.getRepoRoot(repoPath);
     const deterministicId = generateDeterministicProjectId(rootPath);
     let project = ctx.db.getProjectByPath(rootPath);
 

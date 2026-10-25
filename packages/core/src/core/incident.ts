@@ -351,7 +351,6 @@ export async function collectIncidentBundle(ctx: CoreContext,
     }
 
     incident.changeScopeSummary = changeScopeSummary;
-    incident.change_scope_summary = changeScopeSummary;
     try {
       ctx.db.updateIncidentChangeScopeSummary(incident.id, changeScopeSummary);
     } catch {}

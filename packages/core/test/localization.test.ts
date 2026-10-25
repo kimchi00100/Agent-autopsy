@@ -4,6 +4,7 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import * as fs from 'node:fs';
 import { execSync } from 'node:child_process';
+import { DatabaseSync } from 'node:sqlite';
 import { fileURLToPath } from 'node:url';
 import { extractFunctions } from '../src/localization/function-extractor.js';
 import { locateChangeScope, locateCandidates } from '../src/localization/change-localizer.js';
@@ -2590,11 +2591,10 @@ describe('B-1d: Incident Flow Integration with Change Scope', () => {
         userConfirmedIntent: true,
       });
 
-      assert.ok(inc.change_scope_summary, 'change_scope_summary must exist on incident');
       assert.ok(inc.changeScopeSummary, 'changeScopeSummary must exist on incident');
-      assert.strictEqual(typeof inc.change_scope_summary, 'object');
+      assert.strictEqual(typeof inc.changeScopeSummary, 'object');
 
-      const summary = inc.change_scope_summary as any;
+      const summary = inc.changeScopeSummary as any;
       assert.ok(summary.baselineSha, 'baselineSha must exist');
       assert.ok(summary.baselineRule, 'baselineRule must exist');
       assert.ok(Array.isArray(summary.warnings), 'warnings must be an array');
@@ -2617,34 +2617,49 @@ describe('B-1d: Incident Flow Integration with Change Scope', () => {
     }
   });
 
-  test('2. Failure handling on non-git folder succeeds and leaves warning string in change_scope_summary', async () => {
+  test('2. Failure handling on invalid baseline checkpoint succeeds and leaves warning string in changeScopeSummary', async () => {
     const tempEnv = fs.mkdtempSync(path.join(os.tmpdir(), 'autopsy_flow_env_2_'));
     const oldData = process.env.AUTOPSY_DATA_DIR;
     const oldCache = process.env.AUTOPSY_CACHE_DIR;
     process.env.AUTOPSY_DATA_DIR = path.join(tempEnv, 'data');
     process.env.AUTOPSY_CACHE_DIR = path.join(tempEnv, 'cache');
 
-    const nonGitDir = fs.mkdtempSync(path.join(os.tmpdir(), 'autopsy_nongit_dir_'));
+    const repo = createTempGitRepo();
     let core: CoreManager | undefined;
     try {
-      fs.writeFileSync(path.join(nonGitDir, 'script.js'), 'console.log("hello");\n');
+      fs.writeFileSync(path.join(repo, 'script.js'), 'console.log("hello");\n');
+      execSync('git add . && git commit -m "init"', { cwd: repo, stdio: 'ignore' });
 
       core = new CoreManager();
-      const inc = await core.collectIncidentBundle(nonGitDir, {
-        title: 'Non-git project test',
-        userReportText: 'git이 아닌 폴더에서 사건 번들 수집 테스트',
+      core.ensureProject(repo);
+
+      // Create a baseline checkpoint, then corrupt its worktreeCommitSha in SQLite
+      const cp = core.captureCheckpoint(repo, 'initial-baseline');
+      const dbPath = path.join(tempEnv, 'data', 'autopsy.db');
+      const sqliteDb = new DatabaseSync(dbPath);
+      sqliteDb
+        .prepare("UPDATE checkpoints SET worktree_commit_sha = 'deadbeef00000000000000000000000000000000' WHERE id = ?")
+        .run(cp.id);
+      sqliteDb.close();
+
+      // Modify the file
+      fs.writeFileSync(path.join(repo, 'script.js'), 'console.log("world");\n');
+
+      const inc = await core.collectIncidentBundle(repo, {
+        title: 'Corrupted baseline checkpoint test',
+        userReportText: '기준 시점 커밋이 손상되었을 때의 사건 번들 수집 테스트',
         agentName: 'antigravity',
       });
 
       // Incident registration MUST succeed
       assert.ok(inc.id, 'Incident ID must be generated');
-      assert.strictEqual(inc.title, 'Non-git project test');
+      assert.strictEqual(inc.title, 'Corrupted baseline checkpoint test');
       assert.strictEqual(inc.status, 'OPEN');
 
-      // change_scope_summary must contain warning string
-      assert.ok(inc.change_scope_summary, 'change_scope_summary must exist');
-      assert.strictEqual(typeof inc.change_scope_summary, 'string', 'change_scope_summary should be a warning string');
-      const warningText = inc.change_scope_summary as string;
+      // changeScopeSummary must contain warning string
+      assert.ok(inc.changeScopeSummary, 'changeScopeSummary must exist');
+      assert.strictEqual(typeof inc.changeScopeSummary, 'string', 'changeScopeSummary should be a warning string');
+      const warningText = inc.changeScopeSummary as string;
       assert.ok(
         warningText.includes('경고') || warningText.includes('실패'),
         'Warning string should indicate failure'
@@ -2655,7 +2670,7 @@ describe('B-1d: Incident Flow Integration with Change Scope', () => {
       else delete process.env.AUTOPSY_DATA_DIR;
       if (oldCache) process.env.AUTOPSY_CACHE_DIR = oldCache;
       else delete process.env.AUTOPSY_CACHE_DIR;
-      fs.rmSync(nonGitDir, { recursive: true, force: true });
+      fs.rmSync(repo, { recursive: true, force: true });
       fs.rmSync(tempEnv, { recursive: true, force: true });
     }
   });
@@ -2694,8 +2709,8 @@ describe('B-1d: Incident Flow Integration with Change Scope', () => {
         agentName: 'antigravity',
       });
 
-      assert.ok(inc.change_scope_summary && typeof inc.change_scope_summary === 'object');
-      const summary = inc.change_scope_summary as any;
+      assert.ok(inc.changeScopeSummary && typeof inc.changeScopeSummary === 'object');
+      const summary = inc.changeScopeSummary as any;
 
       // Exactly 30 functions in changedFunctions
       assert.strictEqual(summary.changedFunctions.length, 30, 'Must cap at 30 functions');

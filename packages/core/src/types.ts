@@ -217,7 +217,6 @@ export interface Incident {
   threeLevelHealth?: ThreeLevelHealth;
   testExecutionNote?: string;
   changeScopeSummary?: ChangeScopeSummary | string;
-  change_scope_summary?: ChangeScopeSummary | string;
   createdAt: string;
 }
 

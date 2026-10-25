@@ -731,7 +731,7 @@ export class AutopsyDatabase {
         )
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `);
-      const rawScope = incident.changeScopeSummary || incident.change_scope_summary;
+      const rawScope = incident.changeScopeSummary;
       const scopeSummaryJson = rawScope ? (typeof rawScope === 'string' ? JSON.stringify(rawScope) : JSON.stringify(rawScope)) : null;
       stmt.run(
         incident.id,
@@ -810,15 +810,6 @@ export class AutopsyDatabase {
       intents: row.intents_json ? JSON.parse(row.intents_json) : undefined,
       missingIntents: row.missing_intents_json ? JSON.parse(row.missing_intents_json) : [],
       changeScopeSummary: row.change_scope_summary_json
-        ? (() => {
-            try {
-              return JSON.parse(row.change_scope_summary_json);
-            } catch {
-              return row.change_scope_summary_json;
-            }
-          })()
-        : undefined,
-      change_scope_summary: row.change_scope_summary_json
         ? (() => {
             try {
               return JSON.parse(row.change_scope_summary_json);
@@ -949,15 +940,6 @@ export class AutopsyDatabase {
       intents: row.intents_json ? JSON.parse(row.intents_json) : undefined,
       missingIntents: row.missing_intents_json ? JSON.parse(row.missing_intents_json) : [],
       changeScopeSummary: row.change_scope_summary_json
-        ? (() => {
-            try {
-              return JSON.parse(row.change_scope_summary_json);
-            } catch {
-              return row.change_scope_summary_json;
-            }
-          })()
-        : undefined,
-      change_scope_summary: row.change_scope_summary_json
         ? (() => {
             try {
               return JSON.parse(row.change_scope_summary_json);

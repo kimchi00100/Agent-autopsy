@@ -263,7 +263,7 @@ function createTempGitRepo(): string {
 describe('B-1b: Change-based Candidate Localizer (change-localizer)', () => {
   const gitEngine = new GitEngine();
 
-  test('12 Benchmark cases across Python, TypeScript, and C++ (4 bug types)', async () => {
+  test('기능 확인용(smoke): 12개 기본 예제', async () => {
     interface BenchmarkResult {
       name: string;
       lang: string;
@@ -510,7 +510,7 @@ describe('B-1b: Change-based Candidate Localizer (change-localizer)', () => {
       'processJob'
     );
 
-    console.log('\n=================== 12 Benchmark Results ===================');
+    console.log('\n=================== 기능 확인용(smoke) 12개 기본 예제 ===================');
     console.table(
       results.map((r) => ({
         예제: r.name,
@@ -522,15 +522,1693 @@ describe('B-1b: Change-based Candidate Localizer (change-localizer)', () => {
         'Top-5 포함': r.isTop5 ? 'O' : 'X',
       }))
     );
+    console.log(`기능 확인용(smoke) 예제 완료: ${results.length}개 (정확도 집계 제외)`);
+  });
+
+  test('현실적 정확도 벤치마크: 9개 예제 (언어별 3개, 파일 6개 이상, 함수 20개 이상)', async () => {
+    interface RealisticResult {
+      name: string;
+      lang: string;
+      type: string;
+      totalCandidates: number;
+      groundTruth: string;
+      top1Name: string;
+      groundTruthRank: number | string;
+      isTop1: boolean;
+      isTop5: boolean;
+      expectedRandomTop1: number;
+      expectedRandomTop5: number;
+    }
+
+    const results: RealisticResult[] = [];
+
+    async function runRealisticCase(
+      name: string,
+      lang: string,
+      type: string,
+      setupFn: (repo: string) => void,
+      modifyFn: (repo: string) => void,
+      expectedGroundTruth: string | string[]
+    ): Promise<void> {
+      const repo = createTempGitRepo();
+      try {
+        setupFn(repo);
+        execSync('git add . && git commit -m "initial baseline"', { cwd: repo, stdio: 'ignore' });
+        modifyFn(repo);
+
+        const res = await locateCandidates({ gitEngine }, { repoPath: repo, baselineSha: 'HEAD', maxCandidates: 25 });
+        const candidates = res.candidates;
+        const totalCandidates = candidates.length;
+
+        const top1Name = candidates[0]?.name || '(none)';
+
+        let groundTruthRank: number | string = '>5';
+        let isTop1 = false;
+        let isTop5 = false;
+
+        const targets = Array.isArray(expectedGroundTruth) ? expectedGroundTruth : [expectedGroundTruth];
+        for (let i = 0; i < candidates.length; i++) {
+          if (targets.includes(candidates[i].name)) {
+            groundTruthRank = i + 1;
+            break;
+          }
+        }
+
+        if (groundTruthRank === 1) isTop1 = true;
+        if (typeof groundTruthRank === 'number' && groundTruthRank >= 1 && groundTruthRank <= 5) isTop5 = true;
+
+        const expectedRandomTop1 = totalCandidates > 0 ? 1.0 / totalCandidates : 0;
+        const expectedRandomTop5 = totalCandidates > 0 ? Math.min(5, totalCandidates) / totalCandidates : 0;
+
+        results.push({
+          name,
+          lang,
+          type,
+          totalCandidates,
+          groundTruth: targets.join(' / '),
+          top1Name,
+          groundTruthRank,
+          isTop1,
+          isTop5,
+          expectedRandomTop1,
+          expectedRandomTop5,
+        });
+      } finally {
+        fs.rmSync(repo, { recursive: true, force: true });
+      }
+    }
+
+    // =========================================================================
+    // 1. Python Case 1: E-Commerce Order & Tier Discount
+    // =========================================================================
+    await runRealisticCase(
+      'Py-R1 (주문 할인 추가)', 'Python', '계산 착오',
+      (repo) => {
+        fs.writeFileSync(path.join(repo, 'models.py'), `
+def create_order(user_id, items):
+    return {"user_id": user_id, "items": items, "status": "PENDING"}
+
+def calculate_subtotal(items):
+    total = 0
+    for it in items:
+        total += it.get("price", 0) * it.get("qty", 1)
+    return total
+
+def apply_tax(subtotal, rate=0.08):
+    return round(subtotal * rate, 2)
+`);
+        fs.writeFileSync(path.join(repo, 'inventory.py'), `
+def check_stock(item_id, qty):
+    return qty <= 100
+
+def reserve_stock(order_id, items):
+    for it in items:
+        if not check_stock(it["id"], it["qty"]):
+            return False
+    return True
+
+def release_stock(order_id):
+    return True
+
+def update_reorder_level(item_id, min_qty):
+    return min_qty > 0
+`);
+        fs.writeFileSync(path.join(repo, 'discounts.py'), `
+def evaluate_promo_code(code, total):
+    if code == "SUMMER":
+        return total * 0.05
+    return 0.0
+
+def calculate_tier_discount(tier, total):
+    if tier == "GOLD":
+        return total * 0.15
+    elif tier == "SILVER":
+        return total * 0.08
+    return 0.0
+
+def validate_coupon_expiry(expiry_date, today):
+    return expiry_date >= today
+`);
+        fs.writeFileSync(path.join(repo, 'payment.py'), `
+def process_card_payment(card_token, amount):
+    if amount <= 0:
+        return False
+    return True
+
+def format_receipt(order_id, subtotal, discount, total):
+    lines = [f"Order: {order_id}", f"Subtotal: {subtotal}", f"Discount: {discount}", f"Total: {total}"]
+    return "\\n".join(lines)
+
+def record_transaction_log(tx_id, status, amount):
+    return {"tx_id": tx_id, "status": status, "amount": amount}
+`);
+        fs.writeFileSync(path.join(repo, 'notifications.py'), `
+def send_order_confirmation(email, order_id):
+    msg = f"Order {order_id} confirmed."
+    return True
+
+def format_sms_template(phone, order_id):
+    return f"Order {order_id} placed."
+
+def queue_email_job(email, subject, body):
+    return {"queued": True, "to": email}
+`);
+        fs.writeFileSync(path.join(repo, 'service.py'), `
+from models import create_order, calculate_subtotal, apply_tax
+from inventory import reserve_stock
+from discounts import evaluate_promo_code, calculate_tier_discount
+from payment import process_card_payment, format_receipt
+from notifications import send_order_confirmation
+
+def validate_order_request(req):
+    if not req.get("user_id"):
+        return False
+    if not req.get("items"):
+        return False
+    return True
+
+def checkout_workflow(req):
+    if not validate_order_request(req):
+        return {"error": "INVALID_REQUEST"}
+    subtotal = calculate_subtotal(req["items"])
+    disc = calculate_tier_discount(req.get("tier", "NORMAL"), subtotal)
+    tax = apply_tax(subtotal - disc)
+    net_total = subtotal - disc + tax
+    if not reserve_stock("ord-1", req["items"]):
+        return {"error": "OUT_OF_STOCK"}
+    if not process_card_payment(req.get("card_token"), net_total):
+        return {"error": "PAYMENT_FAILED"}
+    send_order_confirmation(req.get("email"), "ord-1")
+    return {"order_id": "ord-1", "total": net_total}
+
+def cancel_order_workflow(order_id):
+    return True
+`);
+      },
+      (repo) => {
+        fs.writeFileSync(path.join(repo, 'service.py'), `
+from models import create_order, calculate_subtotal, apply_tax
+from inventory import reserve_stock
+from discounts import evaluate_promo_code, calculate_tier_discount
+from payment import process_card_payment, format_receipt
+from notifications import send_order_confirmation
+
+def validate_order_request(req):
+    if not req.get("user_id"):
+        return False
+    if not req.get("items"):
+        return False
+    tier = req.get("tier", "NORMAL")
+    if tier not in ["NORMAL", "SILVER", "GOLD", "VIP"]:
+        return False
+    return True
+
+def checkout_workflow(req):
+    if not validate_order_request(req):
+        return {"error": "INVALID_REQUEST"}
+    subtotal = calculate_subtotal(req["items"])
+    tier = req.get("tier", "NORMAL")
+    promo_code = req.get("promo")
+    disc = calculate_tier_discount(tier, subtotal)
+    if promo_code:
+        disc += evaluate_promo_code(promo_code, subtotal)
+    tax = apply_tax(subtotal - disc)
+    net_total = max(0.0, subtotal - disc + tax)
+    if not reserve_stock("ord-1", req["items"]):
+        return {"error": "OUT_OF_STOCK"}
+    if not process_card_payment(req.get("card_token"), net_total, req.get("currency", "USD")):
+        return {"error": "PAYMENT_FAILED"}
+    receipt = format_receipt("ord-1", subtotal, disc, net_total, tier)
+    send_order_confirmation(req.get("email"), "ord-1", receipt)
+    return {"order_id": "ord-1", "total": net_total}
+
+def cancel_order_workflow(order_id):
+    return True
+`);
+        fs.writeFileSync(path.join(repo, 'discounts.py'), `
+def evaluate_promo_code(code, total):
+    if code == "SUMMER":
+        return total * 0.05
+    elif code == "WELCOME2026":
+        return min(25.0, total * 0.10)
+    return 0.0
+
+def calculate_tier_discount(tier, total):
+    if tier == "VIP":
+        return total - 0.20
+    elif tier == "GOLD":
+        return total * 0.15
+    elif tier == "SILVER":
+        return total * 0.08
+    return 0.0
+
+def validate_coupon_expiry(expiry_date, today):
+    return expiry_date >= today
+`);
+        fs.writeFileSync(path.join(repo, 'payment.py'), `
+def process_card_payment(card_token, amount, currency="USD"):
+    if amount <= 0:
+        return False
+    if not card_token or len(card_token) < 5:
+        return False
+    return True
+
+def format_receipt(order_id, subtotal, discount, total, tier="NORMAL"):
+    lines = [
+        f"Order: {order_id}",
+        f"Tier: {tier}",
+        f"Subtotal: {subtotal}",
+        f"Discount: {discount}",
+        f"Total: {total}"
+    ]
+    return "\\n".join(lines)
+
+def record_transaction_log(tx_id, status, amount):
+    return {"tx_id": tx_id, "status": status, "amount": amount}
+`);
+        fs.writeFileSync(path.join(repo, 'notifications.py'), `
+def send_order_confirmation(email, order_id, receipt=""):
+    msg = f"Order {order_id} confirmed."
+    if receipt:
+        msg += f"\\nReceipt details:\\n{receipt}"
+    return True
+
+def format_sms_template(phone, order_id):
+    return f"Order {order_id} placed."
+
+def queue_email_job(email, subject, body):
+    return {"queued": True, "to": email}
+`);
+      },
+      'calculate_tier_discount'
+    );
+
+    // =========================================================================
+    // 2. Python Case 2: Task Workflow & Exponential Backoff
+    // =========================================================================
+    await runRealisticCase(
+      'Py-R2 (작업 재시도 정책 추가)', 'Python', '경계 조건',
+      (repo) => {
+        fs.writeFileSync(path.join(repo, 'task.py'), `
+def create_task(task_id, payload):
+    return {"id": task_id, "payload": payload, "status": "READY"}
+
+def serialize_task(task):
+    import json
+    return json.dumps(task)
+
+def deserialize_task(raw_str):
+    import json
+    return json.loads(raw_str)
+
+def validate_task_payload(payload):
+    return isinstance(payload, dict) and "action" in payload
+`);
+        fs.writeFileSync(path.join(repo, 'queue_mgr.py'), `
+def enqueue_task(queue, task):
+    queue.append(task)
+    return len(queue)
+
+def dequeue_task(queue):
+    if not queue:
+        return None
+    return queue.pop(0)
+
+def peek_queue(queue):
+    return queue[0] if queue else None
+
+def purge_completed(tasks):
+    return [t for t in tasks if t.get("status") != "DONE"]
+`);
+        fs.writeFileSync(path.join(repo, 'executor.py'), `
+def execute_job(task):
+    if not task:
+        return False
+    return True
+
+def handle_failure(task, err, attempts):
+    return {"failed": True, "attempts": attempts, "error": str(err)}
+
+def record_metric(name, val):
+    return {name: val}
+
+def format_error_trace(err):
+    return f"ERROR: {err}"
+`);
+        fs.writeFileSync(path.join(repo, 'retry.py'), `
+def should_retry(attempts, max_attempts):
+    return attempts <= max_attempts
+
+def calculate_backoff(attempts, base_delay):
+    return base_delay * (2 ** attempts)
+
+def get_max_attempts(priority):
+    if priority == "HIGH":
+        return 5
+    return 3
+`);
+        fs.writeFileSync(path.join(repo, 'storage.py'), `
+def save_task_state(task_id, state):
+    return True
+
+def load_task_state(task_id):
+    return {"status": "READY"}
+
+def archive_old_tasks(days):
+    return 0
+`);
+        fs.writeFileSync(path.join(repo, 'coordinator.py'), `
+from task import create_task, serialize_task
+from queue_mgr import enqueue_task, dequeue_task
+from executor import execute_job, handle_failure
+from retry import should_retry, calculate_backoff
+
+def poll_cycle(queue):
+    task = dequeue_task(queue)
+    if not task:
+        return False
+    return True
+
+def dispatch_batch(batch, queue):
+    for item in batch:
+        enqueue_task(queue, item)
+    return len(batch)
+
+def drain_worker_pool(workers):
+    return True
+`);
+      },
+      (repo) => {
+        fs.writeFileSync(path.join(repo, 'task.py'), `
+def create_task(task_id, payload, priority="NORMAL", retry_policy=None):
+    return {
+        "id": task_id,
+        "payload": payload,
+        "priority": priority,
+        "retry_policy": retry_policy or {"max_retries": 3, "base_delay": 1.0},
+        "status": "READY"
+    }
+
+def serialize_task(task):
+    import json
+    data = {**task, "v": 2}
+    return json.dumps(data)
+
+def deserialize_task(raw_str):
+    import json
+    return json.loads(raw_str)
+
+def validate_task_payload(payload):
+    return isinstance(payload, dict) and "action" in payload
+`);
+        fs.writeFileSync(path.join(repo, 'queue_mgr.py'), `
+def enqueue_task(queue, task, front=False):
+    if front:
+        queue.insert(0, task)
+    else:
+        queue.append(task)
+    return len(queue)
+
+def dequeue_task(queue):
+    if not queue:
+        return None
+    return queue.pop(0)
+
+def peek_queue(queue):
+    return queue[0] if queue else None
+
+def purge_completed(tasks):
+    return [t for t in tasks if t.get("status") != "DONE"]
+`);
+        fs.writeFileSync(path.join(repo, 'coordinator.py'), `
+from task import create_task, serialize_task
+from queue_mgr import enqueue_task, dequeue_task
+from executor import execute_job, handle_failure
+from retry import should_retry, calculate_backoff
+
+def poll_cycle(queue, delay_queue=None):
+    task = dequeue_task(queue)
+    if not task:
+        return False
+    ok = execute_job(task, task.get("retry_policy"))
+    return ok
+
+def dispatch_batch(batch, queue, priority="NORMAL"):
+    count = 0
+    for item in batch:
+        t = create_task(item["id"], item, priority=priority)
+        enqueue_task(queue, t, front=(priority == "HIGH"))
+        count += 1
+    return count
+
+def drain_worker_pool(workers):
+    return True
+`);
+        fs.writeFileSync(path.join(repo, 'executor.py'), `
+def execute_job(task, policy=None):
+    if not task:
+        return False
+    task["status"] = "RUNNING"
+    task["attempts"] = task.get("attempts", 0) + 1
+    return True
+
+def handle_failure(task, err, attempts):
+    return {"failed": True, "attempts": attempts, "error": str(err)}
+
+def record_metric(name, val):
+    return {name: val}
+
+def format_error_trace(err):
+    return f"ERROR: {err}"
+`);
+        fs.writeFileSync(path.join(repo, 'retry.py'), `
+def should_retry(attempts, max_attempts):
+    if attempts < 0:
+        return False
+    return attempts < max_attempts - 1
+
+def calculate_backoff(attempts, base_delay, jitter=0.1):
+    delay = base_delay * (2 ** attempts)
+    return delay + (delay * jitter)
+
+def get_max_attempts(priority):
+    if priority == "HIGH":
+        return 5
+    return 3
+`);
+      },
+      'should_retry'
+    );
+
+    // =========================================================================
+    // 3. Python Case 3: Authentication & Multi-Role Permissions (Ripple)
+    // =========================================================================
+    await runRealisticCase(
+      'Py-R3 (다중 역할 권한 분기)', 'Python', '파급',
+      (repo) => {
+        fs.writeFileSync(path.join(repo, 'auth.py'), `
+def verify_password(plain, hashed):
+    return plain == hashed
+
+def hash_password(plain):
+    return f"hash:{plain}"
+
+def generate_session_token(user_id):
+    return f"token_{user_id}_standard"
+
+def validate_token_header(header):
+    if not header or not header.startswith("Bearer "):
+        return None
+    return header[7:]
+`);
+        fs.writeFileSync(path.join(repo, 'permissions.py'), `
+def get_user_roles(user_id):
+    return "USER"
+
+def check_role_access(user_id, required_role):
+    role = get_user_roles(user_id)
+    return role == required_role
+
+def assign_role(user_id, new_role):
+    return True
+
+def has_admin_flag(user_id):
+    return False
+`);
+        fs.writeFileSync(path.join(repo, 'user_store.py'), `
+def find_user_by_id(user_id):
+    return {"id": user_id, "name": "Alice"}
+
+def update_user_profile(user_id, data):
+    return True
+
+def record_login_timestamp(user_id, ts):
+    return ts
+`);
+        fs.writeFileSync(path.join(repo, 'session.py'), `
+def create_session_record(token, user_id):
+    return {"token": token, "uid": user_id}
+
+def get_active_session(token):
+    return {"token": token, "valid": True}
+
+def invalidate_session(token):
+    return True
+`);
+        fs.writeFileSync(path.join(repo, 'audit.py'), `
+def log_security_event(event_type, user_id):
+    return f"{event_type}:{user_id}"
+
+def format_audit_entry(event_type, details):
+    return f"AUDIT: {event_type} - {details}"
+
+def sanitize_log_data(data):
+    return str(data)
+`);
+        fs.writeFileSync(path.join(repo, 'api.py'), `
+from auth import generate_session_token, validate_token_header
+from permissions import check_role_access, get_user_roles
+from user_store import find_user_by_id
+from session import create_session_record
+from audit import log_security_event
+
+def login_endpoint(user_id, password):
+    token = generate_session_token(user_id)
+    create_session_record(token, user_id)
+    log_security_event("LOGIN", user_id)
+    return {"token": token}
+
+def profile_endpoint(header):
+    token = validate_token_header(header)
+    if not token:
+        return {"error": "UNAUTHORIZED"}
+    return find_user_by_id("uid-1")
+
+def logout_endpoint(token):
+    return {"ok": True}
+`);
+      },
+      (repo) => {
+        fs.writeFileSync(path.join(repo, 'permissions.py'), `
+def get_user_roles(user_id):
+    if user_id == "admin":
+        return ["ADMIN", "USER"]
+    return ["USER"]
+
+def check_role_access(user_id, required_role):
+    role = get_user_roles(user_id)
+    return role == required_role
+
+def assign_role(user_id, new_role):
+    roles = ["USER", new_role]
+    return roles
+
+def has_admin_flag(user_id):
+    return "ADMIN" in get_user_roles(user_id)
+`);
+        fs.writeFileSync(path.join(repo, 'auth.py'), `
+def verify_password(plain, hashed):
+    return plain == hashed
+
+def hash_password(plain):
+    return f"hash:{plain}"
+
+def generate_session_token(user_id, roles=None):
+    r_str = ",".join(roles or ["USER"])
+    return f"token_{user_id}_{r_str}"
+
+def validate_token_header(header, expected_scheme="Bearer "):
+    if not header or not header.startswith(expected_scheme):
+        return None
+    return header[len(expected_scheme):]
+`);
+        fs.writeFileSync(path.join(repo, 'user_store.py'), `
+def find_user_by_id(user_id):
+    return {"id": user_id, "name": "Alice"}
+
+def update_user_profile(user_id, data):
+    roles = data.get("roles", [])
+    return len(roles) > 0
+
+def record_login_timestamp(user_id, ts):
+    return ts
+`);
+        fs.writeFileSync(path.join(repo, 'audit.py'), `
+def log_security_event(event_type, user_id, extra=None):
+    entry = f"{event_type}:{user_id}"
+    if extra:
+        entry += f" metadata={extra}"
+    return entry
+
+def format_audit_entry(event_type, details):
+    return f"AUDIT: {event_type} - {details}"
+
+def sanitize_log_data(data):
+    return str(data)
+`);
+        fs.writeFileSync(path.join(repo, 'api.py'), `
+from auth import generate_session_token, validate_token_header
+from permissions import check_role_access, get_user_roles
+from user_store import find_user_by_id
+from session import create_session_record
+from audit import log_security_event
+
+def login_endpoint(user_id, password):
+    roles = get_user_roles(user_id)
+    token = generate_session_token(user_id, roles)
+    create_session_record(token, user_id)
+    log_security_event("LOGIN", user_id, {"roles": roles})
+    return {"token": token, "roles": roles}
+
+def profile_endpoint(header):
+    token = validate_token_header(header)
+    if not token:
+        return {"error": "UNAUTHORIZED"}
+    return find_user_by_id("uid-1")
+
+def logout_endpoint(token):
+    return {"ok": True}
+`);
+      },
+      ['get_user_roles', 'check_role_access']
+    );
+
+    // =========================================================================
+    // 4. TypeScript Case 1: Subscription Billing Proration
+    // =========================================================================
+    await runRealisticCase(
+      'TS-R1 (구독 일할 계산 추가)', 'TypeScript', '계산 착오',
+      (repo) => {
+        fs.writeFileSync(path.join(repo, 'subscription.ts'), `
+export function createSubscription(userId: string, plan: string): any {
+  return { userId, plan, status: 'ACTIVE', startDate: Date.now() };
+}
+export function renewSubscription(subId: string): boolean {
+  return true;
+}
+export function cancelSubscription(subId: string): boolean {
+  return true;
+}
+export function getPlanDetails(plan: string): { price: number; interval: string } {
+  if (plan === 'PRO') return { price: 30, interval: 'month' };
+  return { price: 10, interval: 'month' };
+}
+`);
+        fs.writeFileSync(path.join(repo, 'pricing.ts'), `
+export function calculateProration(oldPrice: number, newPrice: number, daysUsed: number, totalDays: number): number {
+  const unusedRatio = Math.max(0, (totalDays - daysUsed) / totalDays);
+  const credit = oldPrice * unusedRatio;
+  const charge = newPrice * unusedRatio;
+  return Math.round((charge - credit) * 100) / 100;
+}
+export function applySeasonalDiscount(amount: number, code: string): number {
+  if (code === 'FALL') return amount * 0.9;
+  return amount;
+}
+export function calculateVat(netAmount: number, rate = 0.2): number {
+  return Math.round(netAmount * rate * 100) / 100;
+}
+export function getTierMultiplier(tier: string): number {
+  return tier === 'ENTERPRISE' ? 0.85 : 1.0;
+}
+`);
+        fs.writeFileSync(path.join(repo, 'invoice.ts'), `
+export function generateInvoice(subId: string, amount: number, items: any[]): any {
+  return { invoiceId: 'inv-1', subId, amount, items };
+}
+export function formatInvoicePdf(invoice: any): string {
+  return 'PDF_BUFFER';
+}
+export function recordInvoiceHistory(invoiceId: string): boolean {
+  return true;
+}
+`);
+        fs.writeFileSync(path.join(repo, 'customer.ts'), `
+export function getCustomer(customerId: string): any {
+  return { id: customerId, balance: 100, tier: 'STANDARD' };
+}
+export function updateCustomerBalance(customerId: string, delta: number): boolean {
+  return true;
+}
+export function checkCreditLimit(customerId: string): boolean {
+  return true;
+}
+export function sendNotification(customerId: string, message: string): boolean {
+  return true;
+}
+`);
+        fs.writeFileSync(path.join(repo, 'paymentGateway.ts'), `
+export function chargeCard(token: string, amount: number): boolean {
+  return amount > 0;
+}
+export function refundCharge(chargeId: string, amount: number): boolean {
+  return true;
+}
+export function verifyWebhookSignature(sig: string, body: string): boolean {
+  return true;
+}
+`);
+        fs.writeFileSync(path.join(repo, 'billingService.ts'), `
+import { createSubscription, getPlanDetails } from './subscription.js';
+import { calculateProration, calculateVat } from './pricing.js';
+import { generateInvoice } from './invoice.js';
+import { getCustomer, updateCustomerBalance } from './customer.js';
+import { chargeCard } from './paymentGateway.js';
+
+export function validateBillingRequest(req: any): boolean {
+  return Boolean(req.userId && req.plan);
+}
+
+export function processMonthlyBilling(req: any): any {
+  if (!validateBillingRequest(req)) return { error: 'INVALID' };
+  const plan = getPlanDetails(req.plan);
+  const vat = calculateVat(plan.price);
+  const total = plan.price + vat;
+  chargeCard(req.paymentToken, total);
+  const inv = generateInvoice('sub-1', total, [{ plan: req.plan, price: plan.price }]);
+  updateCustomerBalance(req.userId, -total);
+  return inv;
+}
+
+export function handlePaymentFailure(subId: string, err: string): void {
+  console.error(subId, err);
+}
+`);
+      },
+      (repo) => {
+        fs.writeFileSync(path.join(repo, 'billingService.ts'), `
+import { createSubscription, getPlanDetails } from './subscription.js';
+import { calculateProration, calculateVat } from './pricing.js';
+import { generateInvoice } from './invoice.js';
+import { getCustomer, updateCustomerBalance } from './customer.js';
+import { chargeCard } from './paymentGateway.js';
+
+export function validateBillingRequest(req: any): boolean {
+  if (!req.userId || !req.plan) return false;
+  if (req.isUpgrade && (!req.oldPlan || req.daysUsed === undefined)) return false;
+  return true;
+}
+
+export function processMonthlyBilling(req: any): any {
+  if (!validateBillingRequest(req)) return { error: 'INVALID' };
+  const newPlan = getPlanDetails(req.plan);
+  let amountToCharge = newPlan.price;
+  if (req.isUpgrade) {
+    const oldPlan = getPlanDetails(req.oldPlan);
+    const proration = calculateProration(oldPlan.price, newPlan.price, req.daysUsed, 30);
+    amountToCharge = Math.max(0, proration);
+  }
+  const vat = calculateVat(amountToCharge, req.vatRate || 0.2);
+  const total = amountToCharge + vat;
+  chargeCard(req.paymentToken, total);
+  const inv = generateInvoice('sub-1', total, [{ plan: req.plan, price: amountToCharge }], req.isUpgrade);
+  updateCustomerBalance(req.userId, -total, req.isUpgrade ? 'UPGRADE' : 'RENEWAL');
+  return inv;
+}
+
+export function handlePaymentFailure(subId: string, err: string): void {
+  console.error(subId, err);
+}
+`);
+        fs.writeFileSync(path.join(repo, 'pricing.ts'), `
+export function calculateProration(oldPrice: number, newPrice: number, daysUsed: number, totalDays: number): number {
+  const unusedRatio = Math.max(0, (365 - daysUsed) / 365);
+  const credit = oldPrice * unusedRatio;
+  const charge = newPrice * unusedRatio;
+  return Math.round((charge - credit) * 100) / 100;
+}
+export function applySeasonalDiscount(amount: number, code: string): number {
+  if (code === 'FALL') return amount * 0.9;
+  return amount;
+}
+export function calculateVat(netAmount: number, rate = 0.2): number {
+  const clampedRate = Math.min(0.3, Math.max(0, rate));
+  return Math.round(netAmount * clampedRate * 100) / 100;
+}
+export function getTierMultiplier(tier: string): number {
+  return tier === 'ENTERPRISE' ? 0.85 : 1.0;
+}
+`);
+        fs.writeFileSync(path.join(repo, 'subscription.ts'), `
+export function createSubscription(userId: string, plan: string, options: any = {}): any {
+  return { userId, plan, status: 'ACTIVE', startDate: Date.now(), metadata: options };
+}
+export function renewSubscription(subId: string, nextCycleMonths = 1): boolean {
+  return nextCycleMonths > 0;
+}
+export function cancelSubscription(subId: string): boolean {
+  return true;
+}
+export function getPlanDetails(plan: string): { price: number; interval: string } {
+  if (plan === 'PRO') return { price: 30, interval: 'month' };
+  return { price: 10, interval: 'month' };
+}
+`);
+        fs.writeFileSync(path.join(repo, 'invoice.ts'), `
+export function generateInvoice(subId: string, amount: number, items: any[], isUpgrade = false): any {
+  return { invoiceId: 'inv-1', subId, amount, items, tag: isUpgrade ? 'PRORATED' : 'STANDARD' };
+}
+export function formatInvoicePdf(invoice: any): string {
+  return 'PDF_BUFFER';
+}
+export function recordInvoiceHistory(invoiceId: string): boolean {
+  return true;
+}
+`);
+        fs.writeFileSync(path.join(repo, 'customer.ts'), `
+export function getCustomer(customerId: string): any {
+  return { id: customerId, balance: 100, tier: 'STANDARD' };
+}
+export function updateCustomerBalance(customerId: string, delta: number, reason = 'PAYMENT'): boolean {
+  return Boolean(customerId && reason);
+}
+export function checkCreditLimit(customerId: string): boolean {
+  return true;
+}
+export function sendNotification(customerId: string, message: string): boolean {
+  return true;
+}
+`);
+      },
+      'calculateProration'
+    );
+
+    // =========================================================================
+    // 5. TypeScript Case 2: Chat & Mention Notification
+    // =========================================================================
+    await runRealisticCase(
+      'TS-R2 (멘션 푸시 필터링)', 'TypeScript', '경계 조건',
+      (repo) => {
+        fs.writeFileSync(path.join(repo, 'message.ts'), `
+export function createMessage(senderId: string, text: string): any {
+  return { senderId, text, timestamp: Date.now() };
+}
+export function sanitizeMessage(raw: string): string {
+  return raw.trim();
+}
+export function formatMessagePayload(msg: any): string {
+  return JSON.stringify(msg);
+}
+export function extractMentions(text: string): string[] {
+  const matches = text.match(/@(\\w+)/g);
+  return matches ? matches.map(m => m.slice(1)) : [];
+}
+`);
+        fs.writeFileSync(path.join(repo, 'channel.ts'), `
+export function joinChannel(channelId: string, userId: string): boolean {
+  return true;
+}
+export function leaveChannel(channelId: string, userId: string): boolean {
+  return true;
+}
+export function getChannelMembers(channelId: string): string[] {
+  return ['user1', 'user2', 'user3'];
+}
+export function isUserMuted(channelId: string, userId: string): boolean {
+  return false;
+}
+`);
+        fs.writeFileSync(path.join(repo, 'presence.ts'), `
+export function updateUserPresence(userId: string, status: string): void {}
+export function getUserStatus(userId: string): string {
+  return 'ONLINE';
+}
+export function broadcastPresenceChange(userId: string): boolean {
+  return true;
+}
+`);
+        fs.writeFileSync(path.join(repo, 'pushService.ts'), `
+export function sendPushNotification(targetUserId: string, title: string, body: string): boolean {
+  return Boolean(targetUserId && body);
+}
+export function formatPushBadge(unreadCount: number): number {
+  return Math.max(0, unreadCount);
+}
+export function filterSilentHours(hour: number, startHour: number, endHour: number): boolean {
+  return hour >= startHour && hour <= endHour;
+}
+`);
+        fs.writeFileSync(path.join(repo, 'rateLimiter.ts'), `
+export function checkRateLimit(userId: string): boolean {
+  return true;
+}
+export function recordUserAction(userId: string): void {}
+export function resetLimits(userId: string): void {}
+`);
+        fs.writeFileSync(path.join(repo, 'chatRouter.ts'), `
+import { createMessage, extractMentions, formatMessagePayload } from './message.js';
+import { getChannelMembers, isUserMuted } from './channel.js';
+import { sendPushNotification, filterSilentHours } from './pushService.js';
+import { checkRateLimit, recordUserAction } from './rateLimiter.js';
+
+export function handleIncomingMessage(sender: string, text: string, channel: string): any {
+  if (!checkRateLimit(sender)) return { error: 'RATE_LIMIT' };
+  recordUserAction(sender);
+  const msg = createMessage(sender, text);
+  return msg;
+}
+
+export function dispatchToChannel(channel: string, msg: any): number {
+  const members = getChannelMembers(channel);
+  return members.length;
+}
+
+export function handleDirectMessage(sender: string, target: string, text: string): boolean {
+  return true;
+}
+`);
+      },
+      (repo) => {
+        fs.writeFileSync(path.join(repo, 'message.ts'), `
+export function createMessage(senderId: string, text: string, options: any = {}): any {
+  const mentions = extractMentions(text);
+  return { senderId, text, timestamp: Date.now(), mentions, priority: options.priority || 'NORMAL' };
+}
+export function sanitizeMessage(raw: string): string {
+  return raw.trim();
+}
+export function formatMessagePayload(msg: any): string {
+  const payload = { ...msg, formatted: true, mentionCount: msg.mentions?.length || 0 };
+  return JSON.stringify(payload);
+}
+export function extractMentions(text: string): string[] {
+  const matches = text.match(/@(\\w+)/g);
+  return matches ? matches.map(m => m.slice(1)) : [];
+}
+`);
+        fs.writeFileSync(path.join(repo, 'chatRouter.ts'), `
+import { createMessage, extractMentions, formatMessagePayload } from './message.js';
+import { getChannelMembers, isUserMuted } from './channel.js';
+import { sendPushNotification, filterSilentHours } from './pushService.js';
+import { checkRateLimit, recordUserAction } from './rateLimiter.js';
+
+export function handleIncomingMessage(sender: string, text: string, channel: string): any {
+  if (!checkRateLimit(sender)) return { error: 'RATE_LIMIT' };
+  recordUserAction(sender, 'MESSAGE');
+  const msg = createMessage(sender, text, { priority: 'NORMAL' });
+  dispatchToChannel(channel, msg);
+  return msg;
+}
+
+export function dispatchToChannel(channel: string, msg: any): number {
+  const members = getChannelMembers(channel);
+  let notified = 0;
+  for (const m of members) {
+    if (m !== msg.senderId && !isUserMuted(channel, m)) {
+      if (msg.mentions?.includes(m)) {
+        const isSilent = filterSilentHours(23, 22, 7);
+        if (!isSilent) {
+          sendPushNotification(m, 'Mentioned in ' + channel, msg.text, 'MENTION');
+          notified++;
+        }
+      }
+    }
+  }
+  return notified;
+}
+
+export function handleDirectMessage(sender: string, target: string, text: string): boolean {
+  return true;
+}
+`);
+        fs.writeFileSync(path.join(repo, 'pushService.ts'), `
+export function sendPushNotification(targetUserId: string, title: string, body: string, category = 'DEFAULT'): boolean {
+  return Boolean(targetUserId && body && category);
+}
+export function formatPushBadge(unreadCount: number): number {
+  return Math.max(0, unreadCount);
+}
+export function filterSilentHours(hour: number, startHour: number, endHour: number): boolean {
+  if (startHour > endHour) {
+    return hour > startHour && hour < endHour;
+  }
+  return hour >= startHour && hour <= endHour;
+}
+`);
+        fs.writeFileSync(path.join(repo, 'rateLimiter.ts'), `
+export function checkRateLimit(userId: string): boolean {
+  return true;
+}
+export function recordUserAction(userId: string, actionType = 'DEFAULT'): void {
+  const key = userId + ':' + actionType;
+}
+export function resetLimits(userId: string): void {}
+`);
+      },
+      'filterSilentHours'
+    );
+
+    // =========================================================================
+    // 6. TypeScript Case 3: Export Pipeline & Transformation (Ripple)
+    // =========================================================================
+    await runRealisticCase(
+      'TS-R3 (데이터 파이프라인 정규화)', 'TypeScript', '파급',
+      (repo) => {
+        fs.writeFileSync(path.join(repo, 'parser.ts'), `
+export function parseCsvRows(raw: string): string[][] {
+  return raw.split('\\n').map(r => r.split(','));
+}
+export function parseJsonPayload(raw: string): any {
+  return JSON.parse(raw);
+}
+export function validateSchema(records: any[]): boolean {
+  return records.length > 0;
+}
+export function inferColumnTypes(headers: string[]): Record<string, string> {
+  return {};
+}
+`);
+        fs.writeFileSync(path.join(repo, 'transform.ts'), `
+export function normalizeDates(dateStr: string): string {
+  return dateStr.slice(0, 10);
+}
+export function cleanStrings(val: string): string {
+  return val.trim();
+}
+export function maskSensitivePii(val: string): string {
+  return '***';
+}
+export function aggregateMetrics(records: any[]): { count: number } {
+  return { count: records.length };
+}
+`);
+        fs.writeFileSync(path.join(repo, 'filter.ts'), `
+import { normalizeDates } from './transform.js';
+
+export function applyDateRangeFilter(records: any[], start: string, end: string): any[] {
+  return records.filter(r => {
+    const d = normalizeDates(r.date);
+    return d >= start && d <= end;
+  });
+}
+export function filterByStatus(records: any[], status: string): any[] {
+  return records.filter(r => r.status === status);
+}
+export function deduplicateRecords(records: any[]): any[] {
+  return records;
+}
+`);
+        fs.writeFileSync(path.join(repo, 'exporter.ts'), `
+export function exportToParquet(records: any[]): string {
+  return 'PARQUET_BLOB';
+}
+export function exportToCsv(records: any[]): string {
+  return 'csv_data';
+}
+export function generateExportHeader(cols: string[]): string {
+  return cols.join(',');
+}
+`);
+        fs.writeFileSync(path.join(repo, 'storage.ts'), `
+export function uploadToBucket(bucket: string, key: string, data: string): boolean {
+  return true;
+}
+export function generateSignedUrl(key: string): string {
+  return 'https://storage/' + key;
+}
+export function cleanupTempFiles(files: string[]): void {}
+`);
+        fs.writeFileSync(path.join(repo, 'pipeline.ts'), `
+import { parseCsvRows, validateSchema } from './parser.js';
+import { normalizeDates, cleanStrings } from './transform.js';
+import { applyDateRangeFilter } from './filter.js';
+import { exportToCsv } from './exporter.js';
+import { uploadToBucket } from './storage.js';
+
+export function runExportPipeline(rawCsv: string, start: string, end: string): any {
+  const rows = parseCsvRows(rawCsv);
+  if (!validateSchema(rows)) return { error: 'EMPTY' };
+  const records = rows.map(r => ({ date: r[0], name: cleanStrings(r[1] || '') }));
+  const filtered = applyDateRangeFilter(records, start, end);
+  const csvOut = exportToCsv(filtered);
+  uploadToBucket('exports', 'report.csv', csvOut);
+  return { count: filtered.length };
+}
+
+export function buildExportContext(jobId: string): any {
+  return { jobId, ts: Date.now() };
+}
+
+export function notifyExportComplete(jobId: string): boolean {
+  return true;
+}
+`);
+      },
+      (repo) => {
+        fs.writeFileSync(path.join(repo, 'pipeline.ts'), `
+import { parseCsvRows, validateSchema } from './parser.js';
+import { normalizeDates, cleanStrings, maskSensitivePii } from './transform.js';
+import { applyDateRangeFilter } from './filter.js';
+import { exportToCsv } from './exporter.js';
+import { uploadToBucket } from './storage.js';
+
+export function runExportPipeline(rawCsv: string, start: string, end: string, options: any = {}): any {
+  const rows = parseCsvRows(rawCsv, options.delimiter || ',');
+  if (!validateSchema(rows)) return { error: 'EMPTY' };
+  const records = rows.map(r => ({
+    date: r[0],
+    name: cleanStrings(r[1] || ''),
+    ssn: options.maskPii ? maskSensitivePii(r[2] || '') : r[2]
+  }));
+  const filtered = applyDateRangeFilter(records, start, end);
+  const csvOut = exportToCsv(filtered, options.includeHeaders ?? true);
+  uploadToBucket('exports', 'report_' + Date.now() + '.csv', csvOut, options.compression);
+  return { count: filtered.length, exported: true };
+}
+
+export function buildExportContext(jobId: string, initiator = 'SYSTEM'): any {
+  return { jobId, initiator, ts: Date.now(), mode: 'STREAM' };
+}
+
+export function notifyExportComplete(jobId: string): boolean {
+  return true;
+}
+`);
+        fs.writeFileSync(path.join(repo, 'transform.ts'), `
+export function normalizeDates(dateStr: string): string {
+  const d = new Date(dateStr);
+  return isNaN(d.getTime()) ? '' : d.toISOString().replace(/T/, ' @ ');
+}
+export function cleanStrings(val: string): string {
+  return val.trim();
+}
+export function maskSensitivePii(val: string): string {
+  if (val.length < 4) return '***';
+  return '***-' + val.slice(-4);
+}
+export function aggregateMetrics(records: any[]): { count: number } {
+  return { count: records.length };
+}
+`);
+        fs.writeFileSync(path.join(repo, 'parser.ts'), `
+export function parseCsvRows(raw: string, delim = ','): string[][] {
+  return raw.split('\\n').filter(Boolean).map(r => r.split(delim));
+}
+export function parseJsonPayload(raw: string): any {
+  return JSON.parse(raw);
+}
+export function validateSchema(records: any[]): boolean {
+  return records.length > 0;
+}
+export function inferColumnTypes(headers: string[]): Record<string, string> {
+  return {};
+}
+`);
+        fs.writeFileSync(path.join(repo, 'exporter.ts'), `
+export function exportToParquet(records: any[]): string {
+  return 'PARQUET_BLOB';
+}
+export function exportToCsv(records: any[], includeHeaders = true): string {
+  const header = includeHeaders ? 'date,name,ssn\\n' : '';
+  return header + 'csv_data';
+}
+export function generateExportHeader(cols: string[]): string {
+  return cols.join(',');
+}
+`);
+        fs.writeFileSync(path.join(repo, 'storage.ts'), `
+export function uploadToBucket(bucket: string, key: string, data: string, compression = 'NONE'): boolean {
+  return Boolean(bucket && key && data && compression);
+}
+export function generateSignedUrl(key: string): string {
+  return 'https://storage/' + key;
+}
+export function cleanupTempFiles(files: string[]): void {}
+`);
+      },
+      ['normalizeDates', 'applyDateRangeFilter']
+    );
+
+    // =========================================================================
+    // 7. C++ Case 1: Physics Simulation & Spatial Collision
+    // =========================================================================
+    await runRealisticCase(
+      'C++-R1 (물리 충돌 서브스텝 추가)', 'C++', '계산 착오',
+      (repo) => {
+        fs.writeFileSync(path.join(repo, 'math_utils.cpp'), `
+float vecDistance(float x1, float y1, float x2, float y2) {
+  float dx = x2 - x1;
+  float dy = y2 - y1;
+  return sqrtf(dx*dx + dy*dy);
+}
+void vecNormalize(float* x, float* y) {
+  float len = sqrtf((*x)*(*x) + (*y)*(*y));
+  if (len > 0.0001f) { *x /= len; *y /= len; }
+}
+float clampFloat(float v, float minV, float maxV) {
+  if (v < minV) return minV;
+  if (v > maxV) return maxV;
+  return v;
+}
+`);
+        fs.writeFileSync(path.join(repo, 'collider.cpp'), `
+bool checkAABBOverlap(float minA_x, float maxA_x, float minB_x, float maxB_x) {
+  return (minA_x <= maxB_x && maxA_x >= minB_x);
+}
+float computeBoundingRadius(float w, float h) {
+  return sqrtf(w*w + h*h) * 0.5f;
+}
+void resolvePenetration(float* vx, float* vy, float nx, float ny, float restitution) {
+  float dot = (*vx) * nx + (*vy) * ny;
+  float impulse = -(1.0f + restitution) * dot;
+  *vx += impulse * nx;
+  *vy += impulse * ny;
+}
+`);
+        fs.writeFileSync(path.join(repo, 'grid.cpp'), `
+void insertEntity(int entityId, int cellX, int cellY) {}
+void removeEntity(int entityId) {}
+int queryNearbyEntities(int cellX, int cellY, int* outIds, int maxOut) {
+  return 0;
+}
+void rebuildGridCells() {}
+`);
+        fs.writeFileSync(path.join(repo, 'rigidbody.cpp'), `
+void integrateVelocity(float* x, float* y, float vx, float vy, float dt) {
+  *x += vx * dt;
+  *y += vy * dt;
+}
+void applyForce(float* fx, float* fy, float ax, float ay) {
+  *fx += ax;
+  *fy += ay;
+}
+void dampVelocity(float* vx, float* vy, float damping) {
+  *vx *= damping;
+  *vy *= damping;
+}
+`);
+        fs.writeFileSync(path.join(repo, 'broadphase.cpp'), `
+int findPotentialPairs(int* pairsA, int* pairsB, int maxPairs) {
+  return 0;
+}
+void sortGridEntries() {}
+void clearGridPairs() {}
+`);
+        fs.writeFileSync(path.join(repo, 'world.cpp'), `
+#include "collider.cpp"
+#include "rigidbody.cpp"
+#include "grid.cpp"
+
+void stepSimulation(float dt) {
+  float x = 0.0f, y = 0.0f, vx = 5.0f, vy = -2.0f;
+  integrateVelocity(&x, &y, vx, vy, dt);
+  resolvePenetration(&vx, &vy, 0.0f, 1.0f, 0.5f);
+}
+void updateWorldTransforms() {}
+void cullInactiveBodies() {}
+`);
+      },
+      (repo) => {
+        fs.writeFileSync(path.join(repo, 'world.cpp'), `
+#include "collider.cpp"
+#include "rigidbody.cpp"
+#include "grid.cpp"
+
+void stepSimulation(float dt) {
+  const int SUBSTEPS = 4;
+  float subDt = dt / (float)SUBSTEPS;
+  float x = 0.0f, y = 0.0f, vx = 5.0f, vy = -2.0f;
+  for (int i = 0; i < SUBSTEPS; i++) {
+    integrateVelocity(&x, &y, vx, vy, subDt);
+    resolvePenetration(&vx, &vy, 0.0f, 1.0f, 0.5f);
+  }
+}
+void updateWorldTransforms(int activeFlags) {
+  if (activeFlags > 0) cullInactiveBodies();
+}
+void cullInactiveBodies() {}
+`);
+        fs.writeFileSync(path.join(repo, 'collider.cpp'), `
+bool checkAABBOverlap(float minA_x, float maxA_x, float minB_x, float maxB_x) {
+  return (minA_x <= maxB_x && maxA_x >= minB_x);
+}
+float computeBoundingRadius(float w, float h) {
+  return sqrtf(w*w + h*h) * 0.5f;
+}
+void resolvePenetration(float* vx, float* vy, float nx, float ny, float restitution) {
+  float dot = (*vx) * nx + (*vy) * ny;
+  float impulse = (1.0f - restitution) * dot;
+  *vx += impulse * nx;
+  *vy += impulse * ny;
+}
+`);
+        fs.writeFileSync(path.join(repo, 'rigidbody.cpp'), `
+void integrateVelocity(float* x, float* y, float vx, float vy, float dt) {
+  *x += vx * dt;
+  *y += vy * dt;
+}
+void applyForce(float* fx, float* fy, float ax, float ay, float mass) {
+  if (mass > 0.001f) {
+    *fx += ax / mass;
+    *fy += ay / mass;
+  }
+}
+void dampVelocity(float* vx, float* vy, float damping) {
+  *vx *= damping;
+  *vy *= damping;
+}
+`);
+        fs.writeFileSync(path.join(repo, 'grid.cpp'), `
+void insertEntity(int entityId, int cellX, int cellY) {}
+void removeEntity(int entityId) {}
+int queryNearbyEntities(int cellX, int cellY, int* outIds, int maxOut, float radius) {
+  if (radius > 10.0f) return 0;
+  return maxOut > 0 ? 1 : 0;
+}
+void rebuildGridCells() {}
+`);
+        fs.writeFileSync(path.join(repo, 'broadphase.cpp'), `
+int findPotentialPairs(int* pairsA, int* pairsB, int maxPairs, int maxDistance) {
+  sortGridEntries();
+  return maxPairs > 10 ? 10 : maxPairs;
+}
+void sortGridEntries() {}
+void clearGridPairs() {}
+`);
+      },
+      'resolvePenetration'
+    );
+
+    // =========================================================================
+    // 8. C++ Case 2: Network Protocol & CRC Buffer Validation
+    // =========================================================================
+    await runRealisticCase(
+      'C++-R2 (패킷 버퍼 경계 검증)', 'C++', '경계 조건',
+      (repo) => {
+        fs.writeFileSync(path.join(repo, 'buffer.cpp'), `
+char* allocateChunk(int size) { return (char*)malloc(size); }
+void freeChunk(char* ptr) { free(ptr); }
+void writeUint32(char* buf, int* offset, unsigned int val) {
+  memcpy(buf + *offset, &val, 4);
+  *offset += 4;
+}
+unsigned int readUint32(const char* buf, int* offset) {
+  unsigned int val;
+  memcpy(&val, buf + *offset, 4);
+  *offset += 4;
+  return val;
+}
+`);
+        fs.writeFileSync(path.join(repo, 'packet.cpp'), `
+void serializeHeader(char* outBuf, int* offset, unsigned short type, unsigned short len) {
+  memcpy(outBuf + *offset, &type, 2);
+  *offset += 2;
+  memcpy(outBuf + *offset, &len, 2);
+  *offset += 2;
+}
+bool deserializeHeader(const char* inBuf, int* offset, unsigned short* type, unsigned short* len) {
+  memcpy(type, inBuf + *offset, 2);
+  *offset += 2;
+  memcpy(len, inBuf + *offset, 2);
+  *offset += 2;
+  return true;
+}
+bool validatePacketCrc(const char* buf, int bufLen) {
+  if (bufLen <= 4) return false;
+  return true;
+}
+void setPacketFlags(char* header, unsigned char flags) {}
+`);
+        fs.writeFileSync(path.join(repo, 'crypto.cpp'), `
+unsigned int computePacketChecksum(const char* data, int len) {
+  unsigned int sum = 0;
+  for (int i = 0; i < len; i++) sum += (unsigned char)data[i];
+  return sum;
+}
+void xorMaskPayload(char* payload, int len, unsigned char key) {}
+bool verifySessionHmac(const char* sig, int len) { return len == 32; }
+`);
+        fs.writeFileSync(path.join(repo, 'pool.cpp'), `
+char* acquireBuffer(int minSize) { return allocateChunk(minSize); }
+void releaseBuffer(char* buf) { freeChunk(buf); }
+int getPoolCapacity() { return 64; }
+void shrinkPool() {}
+`);
+        fs.writeFileSync(path.join(repo, 'socket.cpp'), `
+int sendRawBytes(int sock, const char* data, int len) { return len; }
+int receiveRawBytes(int sock, char* outBuf, int maxLen) { return 0; }
+void flushSocketQueue(int sock) {}
+`);
+        fs.writeFileSync(path.join(repo, 'session.cpp'), `
+#include "packet.cpp"
+#include "buffer.cpp"
+#include "socket.cpp"
+
+bool handleIncomingPacket(int sock, const char* raw, int len) {
+  if (!validatePacketCrc(raw, len)) return false;
+  int offset = 0;
+  unsigned short type, plen;
+  deserializeHeader(raw, &offset, &type, &plen);
+  return true;
+}
+bool queueOutgoingPacket(int sock, unsigned short type, const char* data, int len) {
+  char* buf = allocateChunk(len + 8);
+  int offset = 0;
+  serializeHeader(buf, &offset, type, (unsigned short)len);
+  sendRawBytes(sock, buf, offset + len);
+  freeChunk(buf);
+  return true;
+}
+void closeSession(int sock) {}
+`);
+      },
+      (repo) => {
+        fs.writeFileSync(path.join(repo, 'session.cpp'), `
+#include "packet.cpp"
+#include "buffer.cpp"
+#include "socket.cpp"
+
+bool handleIncomingPacket(int sock, const char* raw, int len) {
+  if (!validatePacketCrc(raw, len, true)) return false;
+  int offset = 0;
+  unsigned short type, plen;
+  deserializeHeader(raw, &offset, &type, &plen, 2);
+  return true;
+}
+bool queueOutgoingPacket(int sock, unsigned short type, const char* data, int len, unsigned char flags = 0) {
+  char* buf = allocateChunk(len + 12);
+  int offset = 0;
+  serializeHeader(buf, &offset, type, (unsigned short)len, flags);
+  sendRawBytes(sock, buf, offset + len);
+  freeChunk(buf);
+  return true;
+}
+void closeSession(int sock) {}
+`);
+        fs.writeFileSync(path.join(repo, 'packet.cpp'), `
+void serializeHeader(char* outBuf, int* offset, unsigned short type, unsigned short len, unsigned char flags = 0) {
+  memcpy(outBuf + *offset, &type, 2);
+  *offset += 2;
+  memcpy(outBuf + *offset, &len, 2);
+  *offset += 2;
+  outBuf[*offset] = flags;
+  *offset += 1;
+}
+bool deserializeHeader(const char* inBuf, int* offset, unsigned short* type, unsigned short* len, int version = 1) {
+  memcpy(type, inBuf + *offset, 2);
+  *offset += 2;
+  memcpy(len, inBuf + *offset, 2);
+  *offset += 2;
+  if (version >= 2) *offset += 1;
+  return true;
+}
+bool validatePacketCrc(const char* buf, int bufLen, bool checkExtended = false) {
+  if (bufLen < 4) return false;
+  if (checkExtended && bufLen < 8) return false;
+  return true;
+}
+void setPacketFlags(char* header, unsigned char flags) {}
+`);
+        fs.writeFileSync(path.join(repo, 'buffer.cpp'), `
+char* allocateChunk(int size) { return (char*)malloc(size); }
+void freeChunk(char* ptr) { free(ptr); }
+void writeUint32(char* buf, int* offset, unsigned int val, bool bigEndian = false) {
+  memcpy(buf + *offset, &val, 4);
+  *offset += 4;
+}
+unsigned int readUint32(const char* buf, int* offset) {
+  unsigned int val;
+  memcpy(&val, buf + *offset, 4);
+  *offset += 4;
+  return val;
+}
+`);
+        fs.writeFileSync(path.join(repo, 'pool.cpp'), `
+char* acquireBuffer(int minSize, bool zeroInit = false) {
+  char* p = allocateChunk(minSize);
+  if (zeroInit && p) memset(p, 0, minSize);
+  return p;
+}
+void releaseBuffer(char* buf) { freeChunk(buf); }
+int getPoolCapacity() { return 64; }
+void shrinkPool() {}
+`);
+        fs.writeFileSync(path.join(repo, 'crypto.cpp'), `
+unsigned int computePacketChecksum(const char* data, int len, unsigned int seed = 0) {
+  unsigned int sum = seed;
+  for (int i = 0; i < len; i++) sum = (sum * 31) + (unsigned char)data[i];
+  return sum;
+}
+void xorMaskPayload(char* payload, int len, unsigned char key) {}
+bool verifySessionHmac(const char* sig, int len) { return len == 32; }
+`);
+      },
+      'validatePacketCrc'
+    );
+
+    // =========================================================================
+    // 9. C++ Case 3: Audio DSP Mixer & Decibel Scale (Ripple)
+    // =========================================================================
+    await runRealisticCase(
+      'C++-R3 (오디오 게인 스케일 변경)', 'C++', '파급',
+      (repo) => {
+        fs.writeFileSync(path.join(repo, 'dsp_math.cpp'), `
+float dbToLinear(float db) {
+  return powf(10.0f, db / 20.0f);
+}
+float linearToDb(float lin) {
+  return lin > 0.00001f ? 20.0f * log10f(lin) : -100.0f;
+}
+float clampSample(float s) {
+  if (s > 1.0f) return 1.0f;
+  if (s < -1.0f) return -1.0f;
+  return s;
+}
+float softClipSample(float s) {
+  return tanhf(s);
+}
+`);
+        fs.writeFileSync(path.join(repo, 'filter.cpp'), `
+void processBiquad(float* buffer, int frames) {}
+void computeFilterCoeffs(float cutoff, float q) {}
+void resetFilterState() {}
+`);
+        fs.writeFileSync(path.join(repo, 'voice.cpp'), `
+#include "dsp_math.cpp"
+
+void renderVoiceFrame(float* outBuffer, int frames, float gainDb) {
+  float linGain = dbToLinear(gainDb);
+  for (int i = 0; i < frames; i++) {
+    outBuffer[i] *= linGain;
+  }
+}
+void setVoicePitch(float pitch) {}
+void setVoiceVolume(float vol) {}
+bool isVoiceActive() { return true; }
+`);
+        fs.writeFileSync(path.join(repo, 'bus.cpp'), `
+void mixAudioBuffers(float* dest, const float* src, int frames) {
+  for (int i = 0; i < frames; i++) dest[i] += src[i];
+}
+void applyBusVolume(float* buffer, int frames, float volume) {
+  for (int i = 0; i < frames; i++) buffer[i] *= volume;
+}
+void clearBusBuffer(float* buffer, int frames) {
+  memset(buffer, 0, frames * sizeof(float));
+}
+`);
+        fs.writeFileSync(path.join(repo, 'limiter.cpp'), `
+void processLimiterFrame(float* buffer, int frames, float threshold) {
+  for (int i = 0; i < frames; i++) {
+    if (buffer[i] > threshold) buffer[i] = threshold;
+  }
+}
+void updateEnvelopePeak(float current) {}
+void releaseEnvelope() {}
+`);
+        fs.writeFileSync(path.join(repo, 'mixer.cpp'), `
+#include "bus.cpp"
+#include "limiter.cpp"
+#include "voice.cpp"
+
+void renderMainOutput(float* masterOut, int frames) {
+  clearBusBuffer(masterOut, frames);
+  renderVoiceFrame(masterOut, frames, -3.0f);
+  processLimiterFrame(masterOut, frames, 0.95f);
+}
+void routeVoiceToBus(int voiceId, int busId) {}
+void configureSampleRate(int sampleRate) {}
+`);
+      },
+      (repo) => {
+        fs.writeFileSync(path.join(repo, 'mixer.cpp'), `
+#include "bus.cpp"
+#include "limiter.cpp"
+#include "voice.cpp"
+
+void renderMainOutput(float* masterOut, int frames, bool enableLimiter = true) {
+  clearBusBuffer(masterOut, frames);
+  renderVoiceFrame(masterOut, frames, -3.0f);
+  if (enableLimiter) {
+    processLimiterFrame(masterOut, frames, 0.95f, 0.1f);
+  }
+}
+void routeVoiceToBus(int voiceId, int busId) {}
+void configureSampleRate(int sampleRate, int bufferBlockSize = 512) {}
+`);
+        fs.writeFileSync(path.join(repo, 'dsp_math.cpp'), `
+float dbToLinear(float db) {
+  return powf(10.0f, db / 10.0f);
+}
+float linearToDb(float lin) {
+  return lin > 0.00001f ? 20.0f * log10f(lin) : -100.0f;
+}
+float clampSample(float s) {
+  if (s > 1.0f) return 1.0f;
+  if (s < -1.0f) return -1.0f;
+  return s;
+}
+float softClipSample(float s) {
+  return tanhf(s);
+}
+`);
+        fs.writeFileSync(path.join(repo, 'bus.cpp'), `
+void mixAudioBuffers(float* dest, const float* src, int frames, float mixGain = 1.0f) {
+  for (int i = 0; i < frames; i++) dest[i] += src[i] * mixGain;
+}
+void applyBusVolume(float* buffer, int frames, float volume, bool mute = false) {
+  if (mute) return;
+  for (int i = 0; i < frames; i++) buffer[i] *= volume;
+}
+void clearBusBuffer(float* buffer, int frames) {
+  memset(buffer, 0, frames * sizeof(float));
+}
+`);
+        fs.writeFileSync(path.join(repo, 'limiter.cpp'), `
+void processLimiterFrame(float* buffer, int frames, float threshold, float knee = 0.0f) {
+  for (int i = 0; i < frames; i++) {
+    if (buffer[i] > threshold) buffer[i] = threshold;
+  }
+}
+void updateEnvelopePeak(float current) {}
+void releaseEnvelope() {}
+`);
+        fs.writeFileSync(path.join(repo, 'voice.cpp'), `
+#include "dsp_math.cpp"
+
+void renderVoiceFrame(float* outBuffer, int frames, float gainDb) {
+  float linGain = dbToLinear(gainDb);
+  for (int i = 0; i < frames; i++) {
+    outBuffer[i] *= linGain;
+  }
+}
+void setVoicePitch(float pitch) {}
+void setVoiceVolume(float vol, bool immediate = false) {}
+bool isVoiceActive() { return true; }
+`);
+      },
+      ['dbToLinear', 'renderVoiceFrame']
+    );
+
+    console.log('\n=================== 9 Realistic Benchmark Results ===================');
+    console.table(
+      results.map((r) => ({
+        예제: r.name,
+        언어: r.lang,
+        유형: r.type,
+        '후보 수': r.totalCandidates,
+        '기대 정답': r.groundTruth,
+        '1위 후보': r.top1Name,
+        '정답 순위': r.groundTruthRank,
+        'Top-1': r.isTop1 ? 'O' : 'X',
+        'Top-5': r.isTop5 ? 'O' : 'X',
+        '무작위 Top-1': `${(r.expectedRandomTop1 * 100).toFixed(1)}%`,
+        '무작위 Top-5': `${(r.expectedRandomTop5 * 100).toFixed(1)}%`,
+      }))
+    );
 
     const top1Count = results.filter((r) => r.isTop1).length;
     const top5Count = results.filter((r) => r.isTop5).length;
-    const top1Ratio = ((top1Count / results.length) * 100).toFixed(1);
-    const top5Ratio = ((top5Count / results.length) * 100).toFixed(1);
+    const avgRandomTop1 = ((results.reduce((a, b) => a + b.expectedRandomTop1, 0) / results.length) * 100).toFixed(1);
+    const avgRandomTop5 = ((results.reduce((a, b) => a + b.expectedRandomTop5, 0) / results.length) * 100).toFixed(1);
 
-    console.log(`총 예제: ${results.length}개`);
-    console.log(`Top-1 성공률: ${top1Count}/${results.length} (${top1Ratio}%)`);
-    console.log(`Top-5 성공률: ${top5Count}/${results.length} (${top5Ratio}%)`);
+    console.log(`총 현실적 예제: ${results.length}개`);
+    console.log(
+      `실제 Top-1 성공률: ${top1Count}/${results.length} (${((top1Count / results.length) * 100).toFixed(1)}%) vs 무작위 기대값: ${avgRandomTop1}%`
+    );
+    console.log(
+      `실제 Top-5 성공률: ${top5Count}/${results.length} (${((top5Count / results.length) * 100).toFixed(1)}%) vs 무작위 기대값: ${avgRandomTop5}%`
+    );
   });
 
   test('Edge case 1: Untracked new file is discovered and localized', async () => {

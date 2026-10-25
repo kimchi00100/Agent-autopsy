@@ -526,14 +526,20 @@ export class ApiServer {
       }
       const proposalId = approveMatch[1];
       const body = await this.parseJsonBody(req);
-      const fingerprint = this.coreManager.approveProposal(
-        proposalId,
-        body.selectedFiles,
-        body.forceOverrideWithRiskAck === true
-      );
-      const updated = db.getRepairProposal(proposalId);
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ success: true, proposal: updated, fingerprint }));
+      try {
+        const fingerprint = this.coreManager.approveProposal(
+          proposalId,
+          body.selectedFiles,
+          body.forceOverrideWithRiskAck === true
+        );
+        const updated = db.getRepairProposal(proposalId);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: true, proposal: updated, fingerprint }));
+      } catch (err: any) {
+        const statusCode = err.code === 'LEGACY_UNSIGNED' ? 400 : (err.code === 'SECURITY_TAMPER_DETECTED' ? 403 : 500);
+        res.writeHead(statusCode, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: false, error: err.message, code: err.code || 'APPROVAL_FAILED' }));
+      }
       return;
     }
 

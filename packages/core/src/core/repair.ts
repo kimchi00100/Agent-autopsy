@@ -8,6 +8,9 @@ import {
   verifyApprovalSignature,
   hashFileChanges,
   verifyTestCommandSignature,
+  getInstallationSecretKey,
+  computeProposalRowSignature,
+  verifyProposalRowSignature,
 } from '../utils/security.js';
 import {
   ApprovalReadiness,
@@ -156,6 +159,17 @@ import {
       );
     }
 
+    const createdAt = new Date().toISOString();
+    const fileChangesJson = JSON.stringify(fileChanges);
+    const secretKey = getInstallationSecretKey();
+    const rowSignature = computeProposalRowSignature(secretKey, {
+      id: proposalId,
+      incident_id: incidentId,
+      file_changes_json: fileChangesJson,
+      verification_status: verificationStatus,
+      created_at: createdAt,
+    });
+
     const proposal: RepairProposal = {
       id: proposalId,
       incidentId,
@@ -166,7 +180,7 @@ import {
       riskEvidence: decision.riskSignals,
       selfReviewChecklist: decision.selfReviewChecklist,
       touchedFiles: prepared.touchedFiles,
-      fileChangesJson: JSON.stringify(fileChanges),
+      fileChangesJson,
       verificationStatus,
       verificationLog: executionResult.output,
       approvalStatus: 'AWAITING_USER',
@@ -178,7 +192,8 @@ import {
       approvalFingerprintJson: null,
       approvedAt: null,
       appliedAt: null,
-      createdAt: new Date().toISOString(),
+      rowSignature,
+      createdAt,
     };
 
     ctx.db.insertRepairProposal(proposal);
@@ -198,6 +213,49 @@ import {
     if (!incident) throw new Error(`Incident not found.`);
     const project = ctx.db.getProject(incident.projectId);
     if (!project) throw new Error(`Project not found.`);
+
+    // HARD GATE: Tampered proposal can never be approved
+    if (proposal.approvalStatus === 'TAMPERED') {
+      const err: any = new Error(`[SECURITY_TAMPER_DETECTED]: 변조가 감지된 수정안은 승인할 수 없습니다.`);
+      err.code = 'SECURITY_TAMPER_DETECTED';
+      throw err;
+    }
+
+    // HARD GATE: Legacy unsigned proposals cannot be approved
+    if (!proposal.rowSignature || proposal.rowSignature.trim() === '') {
+      const err: any = new Error(
+        `[LEGACY_UNSIGNED]: 서명 없는 기존 수정안은 승인할 수 없습니다. 다시 제안을 생성하세요.`
+      );
+      err.code = 'LEGACY_UNSIGNED';
+      throw err;
+    }
+
+    // HARD GATE: Row HMAC signature verification (detects DB modification of code, status, or cross-DB copy)
+    const secretKey = getInstallationSecretKey();
+    const isRowSigValid = verifyProposalRowSignature(
+      secretKey,
+      {
+        id: proposal.id,
+        incident_id: proposal.incidentId,
+        file_changes_json: proposal.fileChangesJson,
+        verification_status: proposal.verificationStatus,
+        created_at: proposal.createdAt,
+      },
+      proposal.rowSignature
+    );
+
+    if (!isRowSigValid) {
+      ctx.recordTamperIncident(
+        project.rootPath,
+        proposalId,
+        '수정안 행 전자서명(row_signature) 불일치 감지. SQLite 직접 수정(file_changes_json 또는 verification_status 변조) 또는 다른 DB에서 복사된 행입니다.'
+      );
+      const err: any = new Error(
+        `[SECURITY_TAMPER_DETECTED]: 수정안 행 전자서명 검증 실패. 데이터베이스 직접 변조 또는 유효하지 않은 서명이 감지되어 승인이 차단되고 보안 사건이 기록되었습니다.`
+      );
+      err.code = 'SECURITY_TAMPER_DETECTED';
+      throw err;
+    }
 
     // Risk-Adaptive Gate Check: Block unreviewed high risk proposals unless explicitly force-approved with acknowledgment
     if (proposal.approvalReadiness === 'BLOCKED_AWAITING_REVIEW' && !forceOverrideWithRiskAck) {
@@ -293,6 +351,32 @@ import {
       throw new Error(
         `[SECURITY GATE VIOLATION]: Repair proposal "${proposalId}" cannot be applied because its status is "${proposal.approvalStatus}". It must be explicitly approved by the user in Agent Autopsy first.`
       );
+    }
+
+    // HARD SECURITY GATE 1.5: Proposal row HMAC signature check
+    if (proposal.rowSignature) {
+      const secretKey = getInstallationSecretKey();
+      const isRowSigValid = verifyProposalRowSignature(
+        secretKey,
+        {
+          id: proposal.id,
+          incident_id: proposal.incidentId,
+          file_changes_json: proposal.fileChangesJson,
+          verification_status: proposal.verificationStatus,
+          created_at: proposal.createdAt,
+        },
+        proposal.rowSignature
+      );
+      if (!isRowSigValid) {
+        ctx.recordTamperIncident(
+          project.rootPath,
+          proposalId,
+          '수정안 행 전자서명(row_signature) 불일치 감지 (적용 단계)'
+        );
+        throw new Error(
+          `[SECURITY_TAMPER_DETECTED]: 수정안 행 전자서명 검증 실패. 적용이 거부되었습니다.`
+        );
+      }
     }
 
     // HARD SECURITY GATE 2: Cryptographic fingerprint presence and signature check (Bypass / Tamper Defense)

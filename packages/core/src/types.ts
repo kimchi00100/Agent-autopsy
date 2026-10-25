@@ -17,7 +17,8 @@ export type ApprovalReadiness =
   | 'READY_FOR_APPROVAL'
   | 'BLOCKED_AWAITING_REVIEW'
   | 'BLOCKED_TEST_FAILED'
-  | 'APPROVABLE_WITH_RISK_WARNING';
+  | 'APPROVABLE_WITH_RISK_WARNING'
+  | 'LEGACY_UNSIGNED';
 export type HostEnvironment = 'antigravity' | 'claude-code' | 'codex' | 'generic-mcp';
 
 export interface ReviewChallenge {
@@ -386,6 +387,7 @@ export interface RepairProposal {
   stages?: StageResult[];
   threeLevelHealth?: ThreeLevelHealth;
   verifiedWithCommand?: string;
+  rowSignature?: string | null;
 }
 
 export type EvidenceStrength = 'HIGH' | 'MEDIUM' | 'LOW' | 'UNKNOWN';

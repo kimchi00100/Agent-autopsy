@@ -34,6 +34,7 @@ import {
   computeAuditEntryHash,
   hashAuditPayload,
   getInstallationSecretKey,
+  computeProposalRowSignature,
 } from '../utils/security.js';
 
 export class AutopsyDatabase {
@@ -173,6 +174,7 @@ export class AutopsyDatabase {
         verified_with_command TEXT,
         risk_evidence_json TEXT DEFAULT '[]',
         self_review_checklist_json TEXT DEFAULT '[]',
+        row_signature TEXT,
         created_at TEXT NOT NULL,
         FOREIGN KEY (incident_id) REFERENCES incidents(id) ON DELETE CASCADE
       );
@@ -328,6 +330,7 @@ export class AutopsyDatabase {
       `ALTER TABLE incidents ADD COLUMN missing_intents_json TEXT DEFAULT '[]';`,
       `ALTER TABLE incidents ADD COLUMN change_scope_summary_json TEXT;`,
       `ALTER TABLE repair_proposals ADD COLUMN rejection_reason TEXT;`,
+      `ALTER TABLE repair_proposals ADD COLUMN row_signature TEXT;`,
     ];
 
     for (const sql of migrations) {
@@ -1074,6 +1077,19 @@ export class AutopsyDatabase {
   // Repair Proposals
   public insertRepairProposal(proposal: RepairProposal): void {
     this.runInImmediateTransaction(() => {
+      let rowSig = proposal.rowSignature;
+      if (rowSig === undefined) {
+        const secret = getInstallationSecretKey();
+        rowSig = computeProposalRowSignature(secret, {
+          id: proposal.id,
+          incident_id: proposal.incidentId,
+          file_changes_json: proposal.fileChangesJson,
+          verification_status: proposal.verificationStatus,
+          created_at: proposal.createdAt,
+        });
+        proposal.rowSignature = rowSig;
+      }
+
       const stmt = this.db.prepare(`
         INSERT INTO repair_proposals (
           id, incident_id, root_cause_analysis, patch_diff, touched_files_json,
@@ -1083,8 +1099,8 @@ export class AutopsyDatabase {
           patch_hash, risk_level, risk_evidence_json, self_review_checklist_json,
           orchestration_review_json, approval_readiness, approval_block_reason,
           stages_json, three_level_health_json, verified_with_command,
-          created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          row_signature, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `);
       stmt.run(
         proposal.id,
@@ -1110,6 +1126,7 @@ export class AutopsyDatabase {
         proposal.stages ? JSON.stringify(proposal.stages) : null,
         proposal.threeLevelHealth ? JSON.stringify(proposal.threeLevelHealth) : null,
         proposal.verifiedWithCommand || null,
+        rowSig || null,
         proposal.createdAt
       );
 
@@ -1129,10 +1146,16 @@ export class AutopsyDatabase {
     });
   }
 
-  public getRepairProposal(id: string): RepairProposal | null {
-    const stmt = this.db.prepare(`SELECT * FROM repair_proposals WHERE id = ?`);
-    const row = stmt.get(id) as any;
-    if (!row) return null;
+  private mapProposalRow(row: any): RepairProposal {
+    const isLegacyUnsigned = !row.row_signature || String(row.row_signature).trim() === '';
+    let approvalReadiness = (row.approval_readiness as ApprovalReadiness) || undefined;
+    let approvalBlockReason = row.approval_block_reason || undefined;
+
+    if (isLegacyUnsigned && row.approval_status === 'AWAITING_USER') {
+      approvalReadiness = 'LEGACY_UNSIGNED';
+      approvalBlockReason = '서명 없는 기존 수정안은 승인할 수 없습니다. 다시 제안을 생성하세요.';
+    }
+
     return {
       id: row.id,
       incidentId: row.incident_id,
@@ -1148,8 +1171,8 @@ export class AutopsyDatabase {
       verificationLog: row.verification_log,
       approvalStatus: row.approval_status as ApprovalStatus,
       rejectionReason: row.rejection_reason || undefined,
-      approvalReadiness: (row.approval_readiness as ApprovalReadiness) || undefined,
-      approvalBlockReason: row.approval_block_reason || undefined,
+      approvalReadiness,
+      approvalBlockReason,
       orchestrationReview: row.orchestration_review_json ? JSON.parse(row.orchestration_review_json) : undefined,
       approvalFingerprintJson: row.approval_fingerprint_json || null,
       approvedAt: row.approved_at,
@@ -1157,8 +1180,16 @@ export class AutopsyDatabase {
       stages: row.stages_json ? JSON.parse(row.stages_json) : undefined,
       threeLevelHealth: row.three_level_health_json ? JSON.parse(row.three_level_health_json) : undefined,
       verifiedWithCommand: row.verified_with_command || undefined,
+      rowSignature: row.row_signature || null,
       createdAt: row.created_at,
     };
+  }
+
+  public getRepairProposal(id: string): RepairProposal | null {
+    const stmt = this.db.prepare(`SELECT * FROM repair_proposals WHERE id = ?`);
+    const row = stmt.get(id) as any;
+    if (!row) return null;
+    return this.mapProposalRow(row);
   }
 
   public updateProposalOrchestrationReview(
@@ -1280,7 +1311,7 @@ export class AutopsyDatabase {
         stmt.run(status, id);
 
         this.appendAuditLog({
-          kind: 'TAMPERED_DETECTED',
+          kind: 'TAMPER_DETECTED',
           entityType: 'PROPOSAL',
           entityId: id,
           payloadHash: hashAuditPayload({
@@ -1308,32 +1339,7 @@ export class AutopsyDatabase {
       ORDER BY created_at DESC
     `);
     const rows = stmt.all(incidentId) as any[];
-    return rows.map((row) => ({
-      id: row.id,
-      incidentId: row.incident_id,
-      rootCauseAnalysis: row.root_cause_analysis,
-      patchDiff: row.patch_diff,
-      patchHash: row.patch_hash || undefined,
-      riskLevel: (row.risk_level as RiskLevel) || undefined,
-      riskEvidence: row.risk_evidence_json ? JSON.parse(row.risk_evidence_json) : [],
-      selfReviewChecklist: row.self_review_checklist_json ? JSON.parse(row.self_review_checklist_json) : [],
-      touchedFiles: JSON.parse(row.touched_files_json),
-      fileChangesJson: row.file_changes_json,
-      verificationStatus: row.verification_status as VerificationStatus,
-      verificationLog: row.verification_log,
-      approvalStatus: row.approval_status as ApprovalStatus,
-      rejectionReason: row.rejection_reason || undefined,
-      approvalReadiness: (row.approval_readiness as ApprovalReadiness) || undefined,
-      approvalBlockReason: row.approval_block_reason || undefined,
-      orchestrationReview: row.orchestration_review_json ? JSON.parse(row.orchestration_review_json) : undefined,
-      approvalFingerprintJson: row.approval_fingerprint_json || null,
-      approvedAt: row.approved_at,
-      appliedAt: row.applied_at,
-      stages: row.stages_json ? JSON.parse(row.stages_json) : undefined,
-      threeLevelHealth: row.three_level_health_json ? JSON.parse(row.three_level_health_json) : undefined,
-      verifiedWithCommand: row.verified_with_command || undefined,
-      createdAt: row.created_at,
-    }));
+    return rows.map((row) => this.mapProposalRow(row));
   }
 
   public listProposalsForProject(projectId: string, limit: number = 100): RepairProposal[] {
@@ -1345,32 +1351,7 @@ export class AutopsyDatabase {
       LIMIT ?
     `);
     const rows = stmt.all(projectId, limit) as any[];
-    return rows.map((row) => ({
-      id: row.id,
-      incidentId: row.incident_id,
-      rootCauseAnalysis: row.root_cause_analysis,
-      patchDiff: row.patch_diff,
-      patchHash: row.patch_hash || undefined,
-      riskLevel: (row.risk_level as RiskLevel) || undefined,
-      riskEvidence: row.risk_evidence_json ? JSON.parse(row.risk_evidence_json) : [],
-      selfReviewChecklist: row.self_review_checklist_json ? JSON.parse(row.self_review_checklist_json) : [],
-      touchedFiles: JSON.parse(row.touched_files_json),
-      fileChangesJson: row.file_changes_json,
-      verificationStatus: row.verification_status as VerificationStatus,
-      verificationLog: row.verification_log,
-      approvalStatus: row.approval_status as ApprovalStatus,
-      rejectionReason: row.rejection_reason || undefined,
-      approvalReadiness: (row.approval_readiness as ApprovalReadiness) || undefined,
-      approvalBlockReason: row.approval_block_reason || undefined,
-      orchestrationReview: row.orchestration_review_json ? JSON.parse(row.orchestration_review_json) : undefined,
-      approvalFingerprintJson: row.approval_fingerprint_json || null,
-      approvedAt: row.approved_at,
-      appliedAt: row.applied_at,
-      stages: row.stages_json ? JSON.parse(row.stages_json) : undefined,
-      threeLevelHealth: row.three_level_health_json ? JSON.parse(row.three_level_health_json) : undefined,
-      verifiedWithCommand: row.verified_with_command || undefined,
-      createdAt: row.created_at,
-    }));
+    return rows.map((row) => this.mapProposalRow(row));
   }
 
   // Agent events

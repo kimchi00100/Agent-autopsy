@@ -403,3 +403,397 @@ console.log(JSON.stringify({
     emptyDb.close();
   });
 });
+
+describe('C-2: Proposal Row Signature & Approval Block (Tamper-Evident Integrity Tests)', () => {
+  const tmpBase = fs.mkdtempSync(path.join(os.tmpdir(), 'autopsy-integrity-c2-'));
+  const repoPath = path.join(tmpBase, 'sample_project');
+  const dbPath = path.join(tmpBase, 'c2_autopsy.db');
+
+  let core: CoreManager;
+  let incidentId: string;
+
+  before(async () => {
+    fs.mkdirSync(repoPath, { recursive: true });
+
+    execFileSync('git', ['init', '-b', 'main'], { cwd: repoPath });
+    execFileSync('git', ['config', 'user.name', 'Tester'], { cwd: repoPath });
+    execFileSync('git', ['config', 'user.email', 'tester@example.com'], { cwd: repoPath });
+
+    fs.writeFileSync(
+      path.join(repoPath, 'calculator.js'),
+      'export function add(a, b) { return a - b; }\n',
+      'utf8'
+    );
+    fs.writeFileSync(
+      path.join(repoPath, 'test.js'),
+      `import { add } from './calculator.js';
+if (add(2, 3) !== 5) {
+  console.error("Test failed: add(2, 3) !== 5");
+  process.exit(1);
+}
+console.log("ALL TESTS PASSED");
+`,
+      'utf8'
+    );
+    fs.writeFileSync(
+      path.join(repoPath, 'package.json'),
+      JSON.stringify({ name: 'calc', type: 'module', scripts: { test: 'node test.js' } }),
+      'utf8'
+    );
+
+    execFileSync('git', ['add', '.'], { cwd: repoPath });
+    execFileSync('git', ['commit', '-m', 'Initial commit with bug'], { cwd: repoPath });
+
+    core = new CoreManager({ customDbPath: dbPath });
+    core.confirmTestCommand(repoPath, 'node test.js');
+    core.captureCheckpoint(repoPath, 'Initial Checkpoint', 'tester');
+
+    let errorOutput = '';
+    try {
+      execFileSync('node', ['test.js'], { cwd: repoPath, stdio: 'pipe' });
+    } catch (err: any) {
+      errorOutput = err.stderr ? err.stderr.toString() : err.message;
+    }
+
+    const inc = await core.collectIncidentBundle(repoPath, {
+      title: 'Calculator add returns subtraction',
+      errorOutput,
+      expectedBehavior: 'add(2, 3) === 5',
+      observedBehavior: 'add(2, 3) === -1',
+      reproductionCondition: 'node test.js',
+      verificationMethod: 'Run node test.js',
+    });
+    incidentId = inc.id;
+  });
+
+  after(async () => {
+    await core.shutdown();
+    try {
+      fs.rmSync(tmpBase, { recursive: true, force: true });
+    } catch {}
+  });
+
+  test('1. 변조 시험 ①: 제안 생성 후 별도 프로세스(node:sqlite)로 file_changes_json 직접 수정 -> 승인 시도 -> 서명 불일치로 차단 및 TAMPERED 전이', async () => {
+    // 1. Create a valid proposal
+    const { proposal } = await core.proposeAndVerifyRepair(
+      repoPath,
+      incidentId,
+      'Change minus to plus in add function',
+      [
+        {
+          filePath: 'calculator.js',
+          replacements: [
+            {
+              search: 'return a - b;',
+              replace: 'return a + b;',
+            },
+          ],
+        },
+      ]
+    );
+
+    assert.strictEqual(proposal.verificationStatus, 'VERIFIED_PASS');
+    assert.ok(proposal.rowSignature, 'Proposal must have rowSignature generated');
+
+    // 2. Separate Node process tampers file_changes_json directly in SQLite
+    const tamperedChanges = JSON.stringify([
+      {
+        filePath: 'calculator.js',
+        replacements: [
+          {
+            search: 'return a - b;',
+            replace: 'return a * b; // rogue backdoor injected directly in DB',
+          },
+        ],
+      },
+    ]);
+
+    const tamperScript = `
+      import { DatabaseSync } from 'node:sqlite';
+      const db = new DatabaseSync(process.argv[1]);
+      db.prepare('UPDATE repair_proposals SET file_changes_json = ? WHERE id = ?').run(process.argv[3], process.argv[2]);
+      db.close();
+    `;
+
+    execFileSync(
+      'node',
+      ['--input-type=module', '-e', tamperScript, dbPath, proposal.id, tamperedChanges],
+      { env: { ...process.env, NODE_OPTIONS: '' } }
+    );
+
+    // 3. Main process attempts approval -> MUST be blocked with SECURITY_TAMPER_DETECTED
+    let caughtErr: any = null;
+    try {
+      core.approveProposal(proposal.id);
+    } catch (err: any) {
+      caughtErr = err;
+    }
+
+    assert.ok(caughtErr, 'Tampered proposal must be blocked from approval');
+    assert.strictEqual(caughtErr.code, 'SECURITY_TAMPER_DETECTED', 'Rejection code must be SECURITY_TAMPER_DETECTED');
+    assert.ok(
+      caughtErr.message.includes('[SECURITY_TAMPER_DETECTED]'),
+      `Error message must contain [SECURITY_TAMPER_DETECTED], got: ${caughtErr.message}`
+    );
+    assert.ok(
+      caughtErr.message.includes('전자서명') || caughtErr.message.includes('변조'),
+      'Error message must state signature verification failure or tampering'
+    );
+
+    // 4. Verify DB state transitioned to TAMPERED
+    const updated = core.getDatabase().getRepairProposal(proposal.id);
+    assert.strictEqual(updated?.approvalStatus, 'TAMPERED', 'Proposal approval_status must be marked TAMPERED');
+
+    // 5. Verify TAMPER_DETECTED was appended to audit_log
+    const logs = core.getDatabase().getAuditLogs(10);
+    const tamperLog = logs.find((l) => l.kind === 'TAMPER_DETECTED' && l.entityId === proposal.id);
+    assert.ok(tamperLog, 'audit_log must record TAMPER_DETECTED entry for tampered proposal');
+  });
+
+  test('2. 변조 시험 ②: 제안 생성 후 별도 프로세스(node:sqlite)로 verification_status를 FAILED에서 VERIFIED_PASS로 직접 수정 -> 승인 시도 -> 서명 불일치로 차단 및 TAMPERED 전이', async () => {
+    // 1. Create a failing proposal
+    const { proposal } = await core.proposeAndVerifyRepair(
+      repoPath,
+      incidentId,
+      'Wrong replacement that still fails the test',
+      [
+        {
+          filePath: 'calculator.js',
+          replacements: [
+            {
+              search: 'return a - b;',
+              replace: 'return a - b - 1;',
+            },
+          ],
+        },
+      ]
+    );
+
+    assert.strictEqual(proposal.verificationStatus, 'VERIFIED_FAIL');
+    assert.ok(proposal.rowSignature, 'Proposal must have rowSignature generated');
+
+    // 2. Separate Node process alters verification_status to VERIFIED_PASS directly in SQLite
+    const tamperScript = `
+      import { DatabaseSync } from 'node:sqlite';
+      const db = new DatabaseSync(process.argv[1]);
+      db.prepare("UPDATE repair_proposals SET verification_status = 'VERIFIED_PASS' WHERE id = ?").run(process.argv[2]);
+      db.close();
+    `;
+
+    execFileSync(
+      'node',
+      ['--input-type=module', '-e', tamperScript, dbPath, proposal.id],
+      { env: { ...process.env, NODE_OPTIONS: '' } }
+    );
+
+    // 3. Main process attempts approval -> MUST be blocked specifically by signature mismatch (SECURITY_TAMPER_DETECTED),
+    // NOT by TEST_GATE_VIOLATION (since verification_status in DB is now VERIFIED_PASS)
+    let caughtErr: any = null;
+    try {
+      core.approveProposal(proposal.id);
+    } catch (err: any) {
+      caughtErr = err;
+    }
+
+    assert.ok(caughtErr, 'Status-tampered proposal must be blocked from approval');
+    assert.strictEqual(
+      caughtErr.code,
+      'SECURITY_TAMPER_DETECTED',
+      'Rejection code must specifically be SECURITY_TAMPER_DETECTED (not TEST_GATE_VIOLATION)'
+    );
+    assert.ok(caughtErr.message.includes('[SECURITY_TAMPER_DETECTED]'));
+
+    // 4. Verify DB state transitioned to TAMPERED
+    const updated = core.getDatabase().getRepairProposal(proposal.id);
+    assert.strictEqual(updated?.approvalStatus, 'TAMPERED', 'Proposal status must be marked TAMPERED');
+
+    // 5. Verify audit_log records TAMPER_DETECTED
+    const logs = core.getDatabase().getAuditLogs(10);
+    const tamperLog = logs.find((l) => l.kind === 'TAMPER_DETECTED' && l.entityId === proposal.id);
+    assert.ok(tamperLog, 'audit_log must record TAMPER_DETECTED entry for verification_status tampering');
+  });
+
+  test('3. 변조 시험 ③: 다른 설치 키(.auth_secret)로 서명된 repair_proposals 행을 별도 프로세스로 현재 DB에 INSERT -> 승인 시도 -> 서명 불일치로 자동 차단 및 TAMPERED 전이', async () => {
+    // 1. Create a separate installation environment with a distinct secret key
+    const otherDataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'autopsy-other-install-'));
+    const otherSecret = 'ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff';
+    fs.writeFileSync(path.join(otherDataDir, '.auth_secret'), otherSecret, 'utf8');
+
+    const foreignPropId = `prop_foreign_${Date.now().toString(36)}`;
+    const foreignCreatedAt = new Date().toISOString();
+    const foreignChanges = JSON.stringify([
+      {
+        filePath: 'calculator.js',
+        replacements: [{ search: 'return a - b;', replace: 'return a + b;' }],
+      },
+    ]);
+
+    // Compute signature using the foreign installation key
+    const foreignScript = `
+      import * as crypto from 'node:crypto';
+      import { DatabaseSync } from 'node:sqlite';
+
+      const dbPath = process.argv[1];
+      const otherSecret = process.argv[2];
+      const propId = process.argv[3];
+      const incId = process.argv[4];
+      const changesJson = process.argv[5];
+      const createdAt = process.argv[6];
+
+      // Sign with foreign secret
+      const payload = [propId, incId, changesJson, 'VERIFIED_PASS', createdAt].join('::');
+      const foreignSignature = crypto.createHmac('sha256', otherSecret).update(payload).digest('hex');
+
+      // Insert directly into destination DB
+      const db = new DatabaseSync(dbPath);
+      db.prepare(\`
+        INSERT INTO repair_proposals (
+          id, incident_id, root_cause_analysis, patch_diff, touched_files_json,
+          file_changes_json, verification_status, verification_log, approval_status,
+          created_at, row_signature
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      \`).run(
+        propId,
+        incId,
+        'Foreign proposal copied from another database',
+        'diff',
+        JSON.stringify(['calculator.js']),
+        changesJson,
+        'VERIFIED_PASS',
+        'log',
+        'AWAITING_USER',
+        createdAt,
+        foreignSignature
+      );
+      db.close();
+    `;
+
+    execFileSync(
+      'node',
+      [
+        '--input-type=module',
+        '-e',
+        foreignScript,
+        dbPath,
+        otherSecret,
+        foreignPropId,
+        incidentId,
+        foreignChanges,
+        foreignCreatedAt,
+      ],
+      { env: { ...process.env, NODE_OPTIONS: '' } }
+    );
+
+    // Cleanup other data dir
+    try {
+      fs.rmSync(otherDataDir, { recursive: true, force: true });
+    } catch {}
+
+    // 2. Main process attempts approval -> MUST fail because foreign signature fails HMAC under main secret key
+    let caughtErr: any = null;
+    try {
+      core.approveProposal(foreignPropId);
+    } catch (err: any) {
+      caughtErr = err;
+    }
+
+    assert.ok(caughtErr, 'Foreign-signed proposal must be rejected');
+    assert.strictEqual(
+      caughtErr.code,
+      'SECURITY_TAMPER_DETECTED',
+      'Rejection code must be SECURITY_TAMPER_DETECTED due to foreign key mismatch'
+    );
+    assert.ok(caughtErr.message.includes('[SECURITY_TAMPER_DETECTED]'));
+
+    // 3. Verify DB state transitioned to TAMPERED
+    const updated = core.getDatabase().getRepairProposal(foreignPropId);
+    assert.strictEqual(updated?.approvalStatus, 'TAMPERED', 'Foreign proposal status must be marked TAMPERED');
+
+    // 4. Verify audit_log
+    const logs = core.getDatabase().getAuditLogs(10);
+    const tamperLog = logs.find((l) => l.kind === 'TAMPER_DETECTED' && l.entityId === foreignPropId);
+    assert.ok(tamperLog, 'audit_log must record TAMPER_DETECTED for foreign proposal insertion');
+  });
+
+  test('4. 서명 없는 과거 행(마이그레이션 전 데이터) 승인 시도 -> LEGACY_UNSIGNED로 차단되고 기존 행 보존', () => {
+    const legacyPropId = `prop_legacy_${Date.now().toString(36)}`;
+    const legacyCreatedAt = new Date().toISOString();
+    const legacyChanges = JSON.stringify([
+      {
+        filePath: 'calculator.js',
+        replacements: [{ search: 'return a - b;', replace: 'return a + b;' }],
+      },
+    ]);
+
+    // Insert legacy row with row_signature = NULL directly in DB
+    const insertLegacyScript = `
+      import { DatabaseSync } from 'node:sqlite';
+      const db = new DatabaseSync(process.argv[1]);
+      db.prepare(\`
+        INSERT INTO repair_proposals (
+          id, incident_id, root_cause_analysis, patch_diff, touched_files_json,
+          file_changes_json, verification_status, verification_log, approval_status,
+          created_at, row_signature
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+      \`).run(
+        process.argv[2],
+        process.argv[3],
+        'Legacy proposal created before row signature migration',
+        'diff',
+        JSON.stringify(['calculator.js']),
+        process.argv[4],
+        'VERIFIED_PASS',
+        'log',
+        'AWAITING_USER',
+        process.argv[5]
+      );
+      db.close();
+    `;
+
+    execFileSync(
+      'node',
+      [
+        '--input-type=module',
+        '-e',
+        insertLegacyScript,
+        dbPath,
+        legacyPropId,
+        incidentId,
+        legacyChanges,
+        legacyCreatedAt,
+      ],
+      { env: { ...process.env, NODE_OPTIONS: '' } }
+    );
+
+    // 1. Verify getRepairProposal returns approvalReadiness: 'LEGACY_UNSIGNED'
+    const legacyProp = core.getDatabase().getRepairProposal(legacyPropId);
+    assert.ok(legacyProp, 'Legacy proposal must be queryable');
+    assert.strictEqual(legacyProp.rowSignature, null, 'Legacy proposal rowSignature must be null');
+    assert.strictEqual(legacyProp.approvalReadiness, 'LEGACY_UNSIGNED', 'approvalReadiness must present as LEGACY_UNSIGNED');
+    assert.ok(
+      legacyProp.approvalBlockReason?.includes('서명 없는 기존 수정안은 승인할 수 없습니다. 다시 제안을 생성하세요'),
+      `approvalBlockReason must contain exact user guide: ${legacyProp.approvalBlockReason}`
+    );
+
+    // 2. Attempt to approve legacy proposal -> MUST throw LEGACY_UNSIGNED error
+    let caughtErr: any = null;
+    try {
+      core.approveProposal(legacyPropId);
+    } catch (err: any) {
+      caughtErr = err;
+    }
+
+    assert.ok(caughtErr, 'Unsigned legacy proposal must be blocked from approval');
+    assert.strictEqual(caughtErr.code, 'LEGACY_UNSIGNED', 'Error code must be LEGACY_UNSIGNED');
+    assert.ok(
+      caughtErr.message.includes('서명 없는 기존 수정안은 승인할 수 없습니다. 다시 제안을 생성하세요'),
+      `Error message must contain guide text, got: ${caughtErr.message}`
+    );
+
+    // 3. Verify existing DB row was NOT deleted or altered
+    const stillExists = core.getDatabase().getRepairProposal(legacyPropId);
+    assert.ok(stillExists, 'Legacy proposal row must remain intact in DB');
+    assert.strictEqual(stillExists.approvalStatus, 'AWAITING_USER', 'Legacy proposal status must not be overwritten or deleted');
+    assert.strictEqual(stillExists.rowSignature, null, 'rowSignature must remain null in DB');
+  });
+});

@@ -2326,24 +2326,7 @@ AssertionError: 20.0 != 10.0`;
     assert.strictEqual(analysis.causeVerdict, 'LIKELY');
   });
 
-  test('51. Step-3-Fixture 3: C++ project known bug localization and cause certainty check', async (t) => {
-    // Check if a C++ compiler exists on the host machine
-    let cppCompiler: string | null = null;
-    for (const bin of ['g++', 'clang++', 'cl']) {
-      try {
-        const checkCmd = process.platform === 'win32' ? `where.exe ${bin}` : `which ${bin}`;
-        execSync(checkCmd, { stdio: 'pipe' });
-        cppCompiler = bin;
-        break;
-      } catch {}
-    }
-
-    if (!cppCompiler) {
-      t.skip('C++ 컴파일러(g++, clang++, cl)가 호스트 환경에 없어 건너뜀');
-      return;
-    }
-
-    // If compiler is available:
+  test('51. Step-3-Fixture 3: C++(GoogleTest) error output parsing - localization and cause certainty check', async () => {
     const fixtureRepo = path.join(testRoot, 'fixture_cpp_known_bug');
     fs.mkdirSync(path.join(fixtureRepo, 'src'), { recursive: true });
     execFileSync('git', ['init', '-b', 'main'], { cwd: fixtureRepo });

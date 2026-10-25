@@ -38,6 +38,8 @@ git commit -m "Initial commit: cart with WELCOME10 coupon bug"
    `<procject 경로>\apps\desktop\release\win-unpacked\`
 2. `AgentAutopsy.exe`를 더블 클릭하여 실행합니다.
 
+> ⚠️ **주의 (실행 경로)**: 최신 빌드 결과물은 반드시 `<procject 경로>\apps\desktop\release\win-unpacked\AgentAutopsy.exe`에 생성됩니다. 이전 배포 폴더나 바탕화면의 이전 바로가기를 실행할 경우 최신 UI와 기능이 반영되지 않은 구버전 화면이 표시될 수 있으므로, 반드시 위 경로의 최신 실행 파일을 직접 실행하세요.
+
 ### 1.2 무엇이 보이면 성공인가?
 - ✅ **즉각적인 창 로딩**: 1초 이내에 독립된 Electron 애플리케이션 창이 정상적으로 표시됩니다.
 - ✅ **로컬 백엔드 서버 연결 상태**:
@@ -88,18 +90,36 @@ git commit -m "Initial commit: cart with WELCOME10 coupon bug"
       "command": "node",
       "args": [
         "<procject 경로>\\apps\\desktop\\release\\win-unpacked\\resources\\bundled\\mcp-server.cjs"
-      ],
-      "env": {
-        "AUTOPSY_DATA_DIR": "%APPDATA%\\AgentAutopsy"
-      }
+      ]
     }
   }
 }
 ```
 
-> 💡 **참고**: `AgentAutopsy.exe` 앱의 좌측 사이드바 하단에 있는 **`로컬 MCP (실행 중)`** 카드를 클릭하면 **`코딩 에이전트 연결 (MCP)`** 팝업 창이 열립니다. 여기서 `Antigravity` 탭을 선택하고 **`[설정 복사]`** 버튼을 클릭하여 복사할 수도 있습니다.
+> ⚠️ **참고 (데이터 경로)**: DB 저장 경로는 기본값(`%APPDATA%\AgentAutopsy`)으로 자동 감지되므로 `AUTOPSY_DATA_DIR` 환경 변수를 별도로 지정할 필요가 없습니다. 만약 환경 변수로 직접 지정하려면 `%APPDATA%` 대신 실제 절대 경로(예: `C:\\Users\\<사용자명>\\AppData\\Roaming\\AgentAutopsy`)를 입력해야 합니다.
 
-### 3.3 무엇이 보이면 성공인가?
+> 💡 **참고**: `AgentAutopsy.exe` 앱의 좌측 사이드바 하단에 있는 **`로컬 MCP (실행 중)`** 카드를 클릭하면 **`코딩 에이전트 연결 및 규칙 설정`** 팝업 창이 열립니다. 여기서 `Antigravity` 탭을 선택하고 **`[설정 복사]`** 버튼을 클릭하여 복사할 수도 있습니다.
+
+### 3.3 에이전트 권장 규칙 설정 (프롬프트 / 시스템 규칙용)
+
+MCP 도구 연결만으로는 에이전트가 문제를 조사하기 전에 코드를 먼저 열람하거나 임의로 수정할 수 있습니다. 아래의 **권장 운영 규칙**을 에이전트의 커스텀 지침(System Instructions)이나 새 대화의 첫 프롬프트에 추가하세요:
+
+```markdown
+# Agent Autopsy 에이전트 필수 운영 규칙
+1. [작업 전 기준점] 작업 시작 전 반드시 capture_checkpoint를 호출하여 기준점을 기록하라.
+2. [사전 코드 조사 금지] 버그나 기능 오작동 신고 시 코드를 읽거나 조사하기 전에 먼저 collect_incident_bundle을 호출하라.
+   - userReportText에 사용자 원문을 그대로 넣고, 4대 의도는 원문에서 알 수 있는 것만 채워라.
+   - 누락 항목은 안내되는 next_action(CLARIFY_INTENT)에 따라 사용자에게 질문하라. 의도 정리를 위한 사전 코드 조사는 금지된다.
+3. [변경 범위 확인] 사건 등록 직후 get_change_scope로 변경 범위를 먼저 확인하라(원인 확정 아님).
+4. [지침 준수] 모든 도구 응답의 next_action 구조화 지침을 엄격히 준수하라.
+5. [직접 수정 금지] 소스 코드를 직접 수정하지 마라. 반드시 propose_and_verify_repair로 격리 검증을 수행하라.
+6. [승인 착각 방지] 서브에이전트 독립 검토(submit_orchestration_review) 완료는 사용자 승인이 아니다.
+7. [인간 승인 대기] 사용자가 앱 대시보드(http://localhost:3847)에서 직접 승인할 때까지 대기하라(await_user_decision). 사용자 승인 없이 apply_approved_repair를 호출하지 마라.
+```
+
+> 💡 **참고**: `AgentAutopsy.exe` 앱의 **`코딩 에이전트 연결 및 규칙 설정`** 팝업 창에서도 위 권장 규칙을 확인하고 **`[규칙 복사]`** 버튼으로 간편하게 복사할 수 있습니다.
+
+### 3.4 무엇이 보이면 성공인가?
 - ✅ 안티그래비티 대화 세션에서 MCP 서버 목록을 조회할 때 `agent-autopsy`가 정상 로드됩니다.
 - ✅ 사용 가능한 MCP 도구 목록에 아래 17개 Agent Autopsy 공식 도구가 활성화됩니다:
   `capture_checkpoint`, `inspect_project_state`, `collect_incident_bundle`, `propose_test_command`, `propose_and_verify_repair`, `apply_approved_repair`, `rollback_to_checkpoint`, `record_agent_event`, `submit_orchestration_review`, `request_review_challenge`, `await_user_decision`, `get_pending_directives`, `acknowledge_directive`, `run_reproduction`, `search_history`, `get_incident_attempts`, `get_changes_since_good_checkpoint`
@@ -138,7 +158,7 @@ git commit -m "Initial commit: cart with WELCOME10 coupon bug"
 3. (선택적 보안 검증) 만약 에이전트가 사용자 승인 없이 `apply_approved_repair`를 미리 호출하는 경우:
    - 서버는 즉시 차단하며 아래의 실제 보안 위반 오류를 반환합니다:
      ```
-     [SECURITY GATE VIOLATION]: Repair proposal "prop_xxxx" cannot be applied because its status is "UNAPPROVED". It must be explicitly approved by the user in Agent Autopsy first.
+     [SECURITY GATE VIOLATION]: Repair proposal "prop_xxxx" cannot be applied because its status is "AWAITING_USER". It must be explicitly approved by the user in Agent Autopsy first.
      ```
    - (외부에서 HTTP API를 직접 조작하려는 경우에도 유효한 세션 토큰이 없어 `401 Unauthorized`로 차단됩니다.)
 4. `AgentAutopsy.exe` 좌측 사이드바에서 **`복구 센터`** 메뉴로 이동합니다:

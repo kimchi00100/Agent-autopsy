@@ -12,7 +12,8 @@
    * 작업 시작 전 `search_history`, `get_incident_attempts`, `get_changes_since_good_checkpoint` 도구를 활용하여 과거 유사 버그 해결 기록, 이전 실패 원인, 최근 변경 사항을 확인하세요.
 
 2. **오류 및 기능 오작동 발생 시 포렌식 수집 및 되묻기 흐름 (Incident Forensics & Intent Clarification)**
-   * 빌드/테스트 에러(`AssertionError`, `TypeError` 등)가 발생하거나, **코드는 정상인데 사용자가 의도한 기능이 작동하지 않는 경우(기능 불일치)** 즉시 `collect_incident_bundle` 도구를 호출하세요.
+   * 사용자가 버그나 기능 오작동을 신고하면, 코드를 읽거나 조사하기 전에 먼저 `collect_incident_bundle`을 호출하라.
+   * `userReportText`에 사용자 원문을 그대로 넣고, 4가지 의도 중 원문에서 알 수 있는 것만 채워라. 빠진 항목은 `next_action`(`CLARIFY_INTENT`)에 따라 그 항목만 사용자에게 되물어라. 의도를 정리하려고 먼저 코드를 조사하지 마라.
    * **사용자 신고 원문 및 구조화된 의도 전달**:
      * 사용자의 말을 자의적으로 짐작해 코드를 바로 고쳐서는 안 됩니다.
      * `userReportText`: 사용자가 채팅이나 지시서에 작성한 원문을 그대로 넘기세요. 원문이 누락되면 출처 판정이 불가능하므로 `action: 'PROVIDE_USER_REPORT'`가 안내됩니다.

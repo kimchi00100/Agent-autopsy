@@ -1,13 +1,15 @@
-import { Overview } from '../api';
+import { Overview, AuditChainVerificationResult } from '../api';
 import { relativeTime } from '../diff';
 import { Badge, Card, Empty, PageHeader } from '../ui';
-import { CheckCircle2, XCircle, HelpCircle, GitBranch, AlertTriangle, History } from 'lucide-react';
+import { CheckCircle2, XCircle, HelpCircle, GitBranch, AlertTriangle, History, ShieldCheck, ShieldAlert } from 'lucide-react';
 
 export default function Dashboard({
   overview,
+  auditChain,
   onOpenIncident,
 }: {
   overview: Overview;
+  auditChain?: AuditChainVerificationResult | null;
   onOpenIncident: (incidentId: string) => void;
 }) {
   const { stats, health } = overview;
@@ -119,7 +121,7 @@ export default function Dashboard({
           </Card>
         </div>
 
-        <div className="col-span-2">
+        <div className="col-span-2 space-y-4">
           <Card className="p-5">
             <div className="mb-3.5 flex items-center gap-2 text-xs font-semibold text-slate-900">
               <GitBranch className="h-4 w-4 text-blue-600" />
@@ -152,6 +154,46 @@ export default function Dashboard({
                 </div>
               ))}
               {health.recentCommits.length === 0 && <div className="text-xs text-slate-400">Commit 기록이 없습니다.</div>}
+            </div>
+          </Card>
+
+          {/* Audit Log Hash Chain Status Card */}
+          <Card className="p-4">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                {auditChain ? (
+                  auditChain.valid ? (
+                    <ShieldCheck className="h-4 w-4 text-emerald-600" />
+                  ) : (
+                    <ShieldAlert className="h-4 w-4 text-rose-600" />
+                  )
+                ) : (
+                  <ShieldCheck className="h-4 w-4 text-slate-400" />
+                )}
+                <span className="text-xs font-semibold text-slate-900">감사 기록 해시 체인</span>
+              </div>
+              {auditChain ? (
+                auditChain.valid ? (
+                  <Badge tone="green">정상 확인됨</Badge>
+                ) : (
+                  <Badge tone="red">손상 의심</Badge>
+                )
+              ) : (
+                <Badge tone="gray">확인 대기</Badge>
+              )}
+            </div>
+            <div className="mt-2 text-[11px] text-slate-500">
+              {auditChain ? (
+                auditChain.valid ? (
+                  <span>기록 {auditChain.totalCount}개 항목 무결성 확인됨</span>
+                ) : (
+                  <span className="text-rose-600 font-medium">
+                    처음 깨진 위치 seq #{auditChain.brokenSeq} ({auditChain.reason || auditChain.message || '체인 불일치'})
+                  </span>
+                )
+              ) : (
+                <span>감사 기록 체인 상태를 확인하고 있습니다...</span>
+              )}
             </div>
           </Card>
         </div>

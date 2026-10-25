@@ -11,6 +11,7 @@ import {
   HostEnvironment,
   ProjectDiagnostics,
   BackendStatus,
+  AuditChainVerificationResult,
 } from '../api';
 import { STORAGE_KEY, View } from '../constants';
 
@@ -39,6 +40,23 @@ export function useAppData({ view, notify }: UseAppDataOptions) {
   const [diagnosing, setDiagnosing] = useState(false);
   const [onboarding, setOnboarding] = useState(false);
   const [testCommandInput, setTestCommandInput] = useState('');
+  const [auditChain, setAuditChain] = useState<AuditChainVerificationResult | null>(null);
+
+  const checkAuditChain = useCallback(async () => {
+    try {
+      const res = await api.auditChainStatus();
+      if (res && res.result) {
+        setAuditChain(res.result);
+        return res.result;
+      }
+    } catch {}
+    return null;
+  }, []);
+
+  // Check audit chain once on initial app load (NOT on periodic 2.5s polling)
+  useEffect(() => {
+    checkAuditChain();
+  }, [checkAuditChain]);
 
   const runDiagnostics = useCallback(async (projId?: string) => {
     const id = projId || overview?.project?.id;
@@ -240,6 +258,8 @@ export function useAppData({ view, notify }: UseAppDataOptions) {
     chooseFolder,
     activeIncident,
     pendingCount,
+    auditChain,
+    checkAuditChain,
   };
 }
 

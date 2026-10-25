@@ -27,6 +27,8 @@ import {
   AuditLogKind,
   AuditEntityType,
   AuditChainVerificationResult,
+  ProposalIntegrityStatus,
+  ProposalIntegrityCode,
 } from '../types.js';
 import { generateDeterministicProjectId, normalizeRepoPath } from '../utils/paths.js';
 import {
@@ -1258,9 +1260,44 @@ export class AutopsyDatabase {
     let approvalReadiness = (row.approval_readiness as ApprovalReadiness) || undefined;
     let approvalBlockReason = row.approval_block_reason || undefined;
 
-    if (isLegacyUnsigned && row.approval_status === 'AWAITING_USER') {
-      approvalReadiness = 'LEGACY_UNSIGNED';
-      approvalBlockReason = '서명 없는 기존 수정안은 승인할 수 없습니다. 다시 제안을 생성하세요.';
+    let integrityStatus: ProposalIntegrityStatus = '정상';
+    let integrityCode: ProposalIntegrityCode = 'VALID';
+
+    if (row.approval_status === 'TAMPERED') {
+      integrityStatus = '변조 의심';
+      integrityCode = 'TAMPERED';
+    } else if (isLegacyUnsigned) {
+      integrityStatus = '서명 없음 - 다시 검증 필요';
+      integrityCode = 'UNSIGNED';
+      if (row.approval_status === 'AWAITING_USER') {
+        approvalReadiness = 'LEGACY_UNSIGNED';
+        approvalBlockReason = '서명 없는 기존 수정안은 승인할 수 없습니다. 다시 제안을 생성하세요.';
+      }
+    } else {
+      try {
+        const inc = this.db.prepare('SELECT project_id FROM incidents WHERE id = ?').get(row.incident_id) as any;
+        const projectId = inc ? String(inc.project_id) : '';
+        const secret = getInstallationSecretKey();
+        const isValid = verifyProposalRowSignature(
+          secret,
+          {
+            id: row.id,
+            incident_id: row.incident_id,
+            project_id: projectId,
+            file_changes_json: row.file_changes_json,
+            verification_status: row.verification_status,
+            created_at: row.created_at,
+          },
+          row.row_signature
+        );
+        if (!isValid) {
+          integrityStatus = '변조 의심';
+          integrityCode = 'TAMPERED';
+        }
+      } catch {
+        integrityStatus = '변조 의심';
+        integrityCode = 'TAMPERED';
+      }
     }
 
     return {
@@ -1288,6 +1325,8 @@ export class AutopsyDatabase {
       threeLevelHealth: row.three_level_health_json ? JSON.parse(row.three_level_health_json) : undefined,
       verifiedWithCommand: row.verified_with_command || undefined,
       rowSignature: row.row_signature || null,
+      integrityStatus,
+      integrityCode,
       createdAt: row.created_at,
     };
   }

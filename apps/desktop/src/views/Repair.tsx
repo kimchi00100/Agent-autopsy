@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
-import { api, Checkpoint, Incident, Proposal, Directive } from '../api';
+import { api, Checkpoint, Incident, Proposal, Directive, AuditChainVerificationResult, ProposalIntegrityResult } from '../api';
 import { parseSideBySide, relativeTime } from '../diff';
 import { Badge, Button, Card, CodeBlock, Empty, PageHeader } from '../ui';
 import {
@@ -89,6 +89,7 @@ export default function Repair({
   checkpoints,
   onChanged,
   notify,
+  checkAuditChain,
   onOpenCompare,
 }: {
   incidents: Incident[];
@@ -98,6 +99,7 @@ export default function Repair({
   checkpoints: Checkpoint[];
   onChanged: () => void;
   notify: (kind: 'ok' | 'error', msg: string) => void;
+  checkAuditChain?: () => Promise<AuditChainVerificationResult | null>;
   onOpenCompare?: (proposalId?: string) => void;
 }) {
   const incident = incidents.find((i) => i.id === incidentId) ?? null;
@@ -111,6 +113,27 @@ export default function Repair({
   const [rejectModalOpen, setRejectModalOpen] = useState(false);
   const [rejectFeedback, setRejectFeedback] = useState('');
   const [copiedId, setCopiedId] = useState<string | null>(null);
+  const [integrityResult, setIntegrityResult] = useState<ProposalIntegrityResult | null>(null);
+
+  useEffect(() => {
+    if (!proposalId) {
+      setIntegrityResult(null);
+      return;
+    }
+    const current = proposals.find((p) => p.id === proposalId);
+    if (current) {
+      setIntegrityResult({
+        proposalId: current.id,
+        valid: (current.integrityStatus ?? '정상') === '정상',
+        integrityStatus: current.integrityStatus ?? '정상',
+        integrityCode: current.integrityCode ?? 'VALID',
+        reason: '',
+      });
+    }
+    api.proposalIntegrity(proposalId, repoPath)
+      .then((res) => setIntegrityResult(res.result))
+      .catch(() => {});
+  }, [proposalId, repoPath, proposals]);
 
   const loadDirectives = () => {
     if (incident?.projectId) {
@@ -135,6 +158,8 @@ export default function Repair({
   }, [incident?.projectId, proposalId]);
 
   const proposal = proposals.find((p) => p.id === proposalId) ?? null;
+  const currentIntegrityStatus = integrityResult?.integrityStatus ?? proposal?.integrityStatus ?? '정상';
+  const isIntegrityNormal = currentIntegrityStatus === '정상';
   const files = useMemo(() => (proposal ? parseSideBySide(proposal.patchDiff) : []), [proposal]);
   const userQuotes = useMemo(() => {
     if (!incident?.intents) return [];
@@ -175,6 +200,26 @@ export default function Repair({
 
   async function approveAndApply() {
     if (!proposal) return;
+
+    // Immediately before approval: refresh audit chain and verify proposal integrity
+    setBusy(true);
+    try {
+      if (checkAuditChain) {
+        await checkAuditChain();
+      }
+      const integrityRes = await api.proposalIntegrity(proposal.id, repoPath);
+      const integrityCheck = integrityRes.result;
+      setIntegrityResult(integrityCheck);
+      if (!integrityCheck.valid || integrityCheck.integrityStatus !== '정상') {
+        notify('error', `수정안 무결성 확인 실패 (${integrityCheck.integrityStatus}): ${integrityCheck.reason || '승인할 수 없습니다.'}`);
+        return;
+      }
+    } catch (e: any) {
+      notify('error', `무결성 확인 중 오류 발생: ${e.message}`);
+      return;
+    } finally {
+      setBusy(false);
+    }
 
     if (proposal.approvalReadiness === 'BLOCKED_AWAITING_REVIEW' && !forceAck) {
       alert('고위험 변경사항으로 독립 서브에이전트 검토가 필요합니다. 강제 승인하려면 "위험 감수 강제 승인"에 체크해 주세요.');
@@ -463,6 +508,17 @@ export default function Repair({
                     신뢰도 주의 (위험 경고)
                   </span>
                 )}
+                {/* Proposal Integrity Badge */}
+                <span className={`rounded px-2 py-0.5 text-[10px] font-semibold border flex items-center gap-1 ${
+                  isIntegrityNormal
+                    ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
+                    : currentIntegrityStatus === '서명 없음 - 다시 검증 필요'
+                    ? 'bg-amber-50 text-amber-700 border-amber-200'
+                    : 'bg-rose-50 text-rose-700 border-rose-200'
+                }`}>
+                  {isIntegrityNormal ? <ShieldCheck className="h-3 w-3" /> : <ShieldAlert className="h-3 w-3" />}
+                  무결성: {currentIntegrityStatus}
+                </span>
               </div>
               <span className="mono text-[11px] text-slate-400">
                 Patch Hash: {proposal.patchHash ? proposal.patchHash.slice(0, 10) : 'none'}
@@ -852,14 +908,29 @@ export default function Repair({
                   🚨 변조가 감지되어 적용이 영구 차단된 수정안입니다.
                 </span>
               )}
-              {!finished && verifyFailed && '격리 검증에 실패한 수정안은 적용할 수 없습니다.'}
-              {!finished && !verifyFailed && proposal.approvalReadiness === 'BLOCKED_AWAITING_REVIEW' && !forceAck && (
+              {!finished && !isIntegrityNormal && (
+                <span className="font-semibold text-rose-600 flex items-center gap-1">
+                  <ShieldAlert className="h-4 w-4 shrink-0" />
+                  {currentIntegrityStatus === '서명 없음 - 다시 검증 필요' && '무결성 서명 없음: 이전 버전 수정안이므로 격리 환경에서 다시 검증해야 승인할 수 있습니다.'}
+                  {currentIntegrityStatus === '변조 의심' && '무결성 변조 의심: 수정안 내용 또는 서명이 변조되어 승인할 수 없습니다.'}
+                  {currentIntegrityStatus === '프로젝트 불일치' && '무결성 프로젝트 불일치: 현재 열린 저장소의 프로젝트와 일치하지 않아 승인할 수 없습니다.'}
+                </span>
+              )}
+              {!finished && isIntegrityNormal && verifyFailed && '격리 검증에 실패한 수정안은 적용할 수 없습니다.'}
+              {!finished && isIntegrityNormal && !verifyFailed && proposal.approvalReadiness === 'BLOCKED_AWAITING_REVIEW' && !forceAck && (
                 <span className="text-rose-600 font-medium">
                   ⚠️ 고위험 변경: 독립 서브에이전트 검토가 필요합니다 (위험 감수 강제 승인 체크 시 승인 가능).
                 </span>
               )}
-              {!finished && !verifyFailed && (proposal.approvalReadiness !== 'BLOCKED_AWAITING_REVIEW' || forceAck) && (
-                `선택한 파일 ${selected.length}/${files.length}개${partial ? ' · 일부만 선택됨(미검증 조합)' : ''}`
+              {!finished && isIntegrityNormal && !verifyFailed && (proposal.approvalReadiness !== 'BLOCKED_AWAITING_REVIEW' || forceAck) && (
+                <span className="flex items-center gap-2">
+                  <span className="inline-flex items-center gap-1 text-emerald-700 font-medium">
+                    <ShieldCheck className="h-3.5 w-3.5" />
+                    무결성 정상 확인됨
+                  </span>
+                  <span>·</span>
+                  <span>{`선택한 파일 ${selected.length}/${files.length}개${partial ? ' · 일부만 선택됨(미검증 조합)' : ''}`}</span>
+                </span>
               )}
             </div>
             <div className="flex gap-2">
@@ -885,6 +956,7 @@ export default function Repair({
                   finished ||
                   verifyFailed ||
                   selected.length === 0 ||
+                  !isIntegrityNormal ||
                   (proposal.approvalReadiness === 'BLOCKED_AWAITING_REVIEW' && !forceAck)
                 }
                 onClick={approveAndApply}

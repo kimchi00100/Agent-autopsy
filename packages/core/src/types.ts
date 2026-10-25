@@ -394,6 +394,30 @@ export interface RepairProposal {
   threeLevelHealth?: ThreeLevelHealth;
   verifiedWithCommand?: string;
   rowSignature?: string | null;
+  integrityStatus?: ProposalIntegrityStatus;
+  integrityCode?: ProposalIntegrityCode;
+}
+
+export type ProposalIntegrityStatus =
+  | '정상'
+  | '서명 없음 - 다시 검증 필요'
+  | '변조 의심'
+  | '프로젝트 불일치';
+
+export type ProposalIntegrityCode =
+  | 'VALID'
+  | 'UNSIGNED'
+  | 'TAMPERED'
+  | 'PROJECT_MISMATCH';
+
+export interface ProposalIntegrityResult {
+  proposalId: string;
+  integrityStatus: ProposalIntegrityStatus;
+  integrityCode: ProposalIntegrityCode;
+  valid: boolean;
+  reason: string;
+  status?: ProposalIntegrityStatus;
+  code?: ProposalIntegrityCode;
 }
 
 export type EvidenceStrength = 'HIGH' | 'MEDIUM' | 'LOW' | 'UNKNOWN';

@@ -6,8 +6,10 @@ import * as os from 'node:os';
 import { execFileSync, spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { DatabaseSync } from 'node:sqlite';
+import * as http from 'node:http';
 import { CoreManager } from '../src/core-manager.js';
 import { AutopsyDatabase } from '../src/db/database.js';
+import { ApiServer } from '../src/server/api-server.js';
 import { GENESIS_PREV_HASH, getInstallationSecretKey } from '../src/utils/security.js';
 
 describe('C-1: Audit Log Hash Chain (Tamper-Evident Integrity Tests)', () => {
@@ -1317,5 +1319,147 @@ console.log("ALL TESTS PASSED");
       'export function add(a, b) { return a - b; }\n',
       'utf8'
     );
+  });
+
+  test('10. C-3: API-Level Integrity Verification & Tampered Proposal Approval Rejection', async () => {
+    const apiServer = new ApiServer(core);
+    const port = await apiServer.start(3880);
+    const token = apiServer.getSessionToken();
+    assert.ok(token && token.length >= 32, 'Session token must be present');
+
+    const makeRequest = (pathStr: string, method: string, headers: Record<string, string>, body?: any): Promise<{ status: number; body: any }> => {
+      return new Promise((resolve, reject) => {
+        const payload = body ? JSON.stringify(body) : undefined;
+        const req = http.request(
+          {
+            hostname: '127.0.0.1',
+            port,
+            path: pathStr,
+            method,
+            headers: {
+              'Content-Type': 'application/json',
+              ...(payload ? { 'Content-Length': Buffer.byteLength(payload) } : {}),
+              ...headers,
+            },
+          },
+          (res) => {
+            let resBody = '';
+            res.on('data', (c) => (resBody += c));
+            res.on('end', () => {
+              try {
+                resolve({ status: res.statusCode || 500, body: JSON.parse(resBody) });
+              } catch {
+                resolve({ status: res.statusCode || 500, body: resBody });
+              }
+            });
+          }
+        );
+        req.on('error', reject);
+        if (payload) req.write(payload);
+        req.end();
+      });
+    };
+
+    try {
+      // 1. Check GET /api/audit-chain/status
+      // Unauthenticated: 401
+      const unauthChain = await makeRequest('/api/audit-chain/status', 'GET', {});
+      assert.strictEqual(unauthChain.status, 401, 'Unauthenticated audit chain request must return 401');
+
+      // Authenticated: 200 with valid audit chain
+      const chainRes = await makeRequest('/api/audit-chain/status', 'GET', { 'X-Autopsy-Token': token });
+      assert.strictEqual(chainRes.status, 200);
+      assert.strictEqual(chainRes.body.success, true);
+      assert.strictEqual(chainRes.body.result.valid, true);
+      assert.ok(chainRes.body.result.totalCount > 0);
+
+      // 2. Create an incident and a verified repair proposal
+      const inc = await core.collectIncidentBundle(repoPath, 'API 무결성 시험용 사건', 'Error: api integrity');
+      const { proposal } = await core.proposeAndVerifyRepair(repoPath, inc.id, 'fix add function', [
+        {
+          filePath: 'calculator.js',
+          replacements: [
+            {
+              search: 'export function add(a, b) { return a - b; }',
+              replace: 'export function add(a, b) { return a + b; }',
+            },
+          ],
+        },
+      ]);
+      assert.ok(proposal);
+
+      // 3. Query GET /api/proposals/:id/integrity for the valid proposal
+      const validIntegRes = await makeRequest(
+        `/api/proposals/${proposal.id}/integrity?repoPath=${encodeURIComponent(repoPath)}`,
+        'GET',
+        { 'X-Autopsy-Token': token }
+      );
+      assert.strictEqual(validIntegRes.status, 200);
+      assert.strictEqual(validIntegRes.body.result.valid, true);
+      assert.strictEqual(validIntegRes.body.result.status, '정상');
+      assert.strictEqual(validIntegRes.body.result.code, 'VALID');
+
+      // 4. Test PROJECT_MISMATCH with a different project path
+      const fakeOtherRepo = path.join(tmpBase, 'another_project');
+      fs.mkdirSync(fakeOtherRepo, { recursive: true });
+      execFileSync('git', ['init', '-b', 'main'], { cwd: fakeOtherRepo });
+      core.ensureProject(fakeOtherRepo);
+
+      const mismatchRes = await makeRequest(
+        `/api/proposals/${proposal.id}/integrity?repoPath=${encodeURIComponent(fakeOtherRepo)}`,
+        'GET',
+        { 'X-Autopsy-Token': token }
+      );
+      assert.strictEqual(mismatchRes.status, 200);
+      assert.strictEqual(mismatchRes.body.result.valid, false);
+      assert.strictEqual(mismatchRes.body.result.status, '프로젝트 불일치');
+      assert.strictEqual(mismatchRes.body.result.code, 'PROJECT_MISMATCH');
+
+      // 5. Tamper with the proposal via external process (direct DB update)
+      const tamperScript = `
+        import { DatabaseSync } from 'node:sqlite';
+        const db = new DatabaseSync(process.argv[1]);
+        db.exec("UPDATE repair_proposals SET file_changes_json = '{\\\"tampered\\\":true}' WHERE id = '" + process.argv[2] + "'");
+        db.close();
+      `;
+      execFileSync(
+        'node',
+        ['--input-type=module', '-e', tamperScript, dbPath, proposal.id],
+        { env: { ...process.env, NODE_OPTIONS: '' } }
+      );
+
+      // 6. Query GET /api/proposals/:id/integrity for the tampered proposal -> Must return '변조 의심'
+      const tamperedIntegRes = await makeRequest(
+        `/api/proposals/${proposal.id}/integrity?repoPath=${encodeURIComponent(repoPath)}`,
+        'GET',
+        { 'X-Autopsy-Token': token }
+      );
+      assert.strictEqual(tamperedIntegRes.status, 200);
+      assert.strictEqual(tamperedIntegRes.body.result.valid, false);
+      assert.strictEqual(tamperedIntegRes.body.result.status, '변조 의심');
+      assert.strictEqual(tamperedIntegRes.body.result.code, 'TAMPERED');
+
+      // 7. Attempt POST /api/proposals/:id/approve on the tampered proposal -> Must be rejected with HTTP 403 and SECURITY_TAMPER_DETECTED
+      const approveRes = await makeRequest(
+        `/api/proposals/${proposal.id}/approve`,
+        'POST',
+        { 'X-Autopsy-Token': token },
+        { repoPath }
+      );
+      assert.strictEqual(approveRes.status, 403, 'Tampered proposal approval must be rejected with HTTP 403');
+      assert.strictEqual(approveRes.body.code, 'SECURITY_TAMPER_DETECTED');
+
+      // Proposal status must now be marked TAMPERED in DB
+      const dbProp = core.getDatabase().getRepairProposal(proposal.id);
+      assert.strictEqual(dbProp?.approvalStatus, 'TAMPERED');
+    } finally {
+      await apiServer.stop();
+      // Restore calculator.js
+      fs.writeFileSync(
+        path.join(repoPath, 'calculator.js'),
+        'export function add(a, b) { return a - b; }\n',
+        'utf8'
+      );
+    }
   });
 });

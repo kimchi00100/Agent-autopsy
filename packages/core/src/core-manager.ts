@@ -10,6 +10,7 @@ import {
   rejectProposal,
   recordTamperIncident,
   applyApprovedRepair,
+  getProposalIntegrity,
 } from './core/repair.js';
 import {
   collectIncidentBundle,
@@ -115,6 +116,7 @@ import {
   CheckpointChangesSummary,
   AuditLogEntry,
   AuditChainVerificationResult,
+  ProposalIntegrityResult,
 } from './types.js';
 import { analyzeIncident, IncidentAnalysis, parseUnifiedDiff, parseStackFrames } from './analysis/analyzer.js';
 
@@ -464,6 +466,10 @@ export class CoreManager {
     selectedFiles?: string[]
   ): { applied: boolean; touchedFiles: string[]; diff: string } {
     return applyApprovedRepair(this.ctx, repoPath, proposalId, selectedFiles);
+  }
+
+  public getProposalIntegrity(proposalId: string, repoPath?: string): ProposalIntegrityResult {
+    return getProposalIntegrity(this.ctx, proposalId, repoPath);
   }
 
   /**

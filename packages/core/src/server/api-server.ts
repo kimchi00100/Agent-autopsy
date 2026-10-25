@@ -516,6 +516,39 @@ export class ApiServer {
       return;
     }
 
+    // GET /api/audit-chain/status
+    if (req.method === 'GET' && pathname === '/api/audit-chain/status') {
+      if (!this.verifySessionToken(req)) {
+        res.writeHead(401, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Unauthorized: Valid X-Autopsy-Token is required.' }));
+        return;
+      }
+      const result = this.coreManager.verifyAuditChain();
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ success: true, result }));
+      return;
+    }
+
+    // GET / POST /api/proposals/:proposalId/integrity
+    const propIntegrityMatch = pathname.match(/^\/api\/proposals\/([^\/]+)\/integrity$/);
+    if ((req.method === 'GET' || req.method === 'POST') && propIntegrityMatch) {
+      if (!this.verifySessionToken(req)) {
+        res.writeHead(401, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Unauthorized: Valid X-Autopsy-Token is required.' }));
+        return;
+      }
+      const proposalId = propIntegrityMatch[1];
+      let repoPath = url.searchParams.get('repoPath') || undefined;
+      if (req.method === 'POST') {
+        const body = await this.parseJsonBody(req);
+        if (body.repoPath) repoPath = body.repoPath;
+      }
+      const result = this.coreManager.getProposalIntegrity(proposalId, repoPath);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ success: true, result }));
+      return;
+    }
+
     // POST /api/proposals/:proposalId/approve
     const approveMatch = pathname.match(/^\/api\/proposals\/([^\/]+)\/approve$/);
     if (req.method === 'POST' && approveMatch) {

@@ -132,6 +132,8 @@ export default function App() {
     chooseFolder,
     activeIncident,
     pendingCount,
+    auditChain,
+    checkAuditChain,
   } = useAppData({ view, notify });
 
   // Real-time Global Search Index
@@ -642,7 +644,7 @@ export default function App() {
           )}
 
           {overview && view === 'dashboard' && (
-            <Dashboard overview={overview} onOpenIncident={(id) => { setIncidentId(id); setView('analysis'); }} />
+            <Dashboard overview={overview} auditChain={auditChain} onOpenIncident={(id) => { setIncidentId(id); setView('analysis'); }} />
           )}
 
           {overview && view === 'timeline' && (
@@ -671,6 +673,7 @@ export default function App() {
               checkpoints={checkpoints}
               onChanged={load}
               notify={notify}
+              checkAuditChain={checkAuditChain}
               onOpenCompare={(pId) => {
                 setCompareMode('proposal');
                 setView('compare');

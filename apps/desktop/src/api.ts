@@ -294,7 +294,45 @@ export interface Incident {
   riskLevel?: RiskLevel;
   riskSignals?: string[];
   orchestrationDecision?: OrchestrationDecision;
+  rowSignature?: string | null;
+  integrityStatus?: IncidentIntegrityStatus;
+  integrityCode?: IncidentIntegrityCode;
   createdAt: string;
+}
+
+export type IncidentIntegrityStatus = '정상' | '서명 없음' | '변조 의심';
+export type IncidentIntegrityCode = 'VALID' | 'UNSIGNED' | 'TAMPERED';
+
+export type ProposalIntegrityStatus =
+  | '정상'
+  | '서명 없음 - 다시 검증 필요'
+  | '변조 의심'
+  | '프로젝트 불일치';
+
+export type ProposalIntegrityCode =
+  | 'VALID'
+  | 'UNSIGNED'
+  | 'TAMPERED'
+  | 'PROJECT_MISMATCH';
+
+export interface ProposalIntegrityResult {
+  proposalId: string;
+  integrityStatus: ProposalIntegrityStatus;
+  integrityCode: ProposalIntegrityCode;
+  valid: boolean;
+  reason: string;
+  status?: ProposalIntegrityStatus;
+  code?: ProposalIntegrityCode;
+}
+
+export interface AuditChainVerificationResult {
+  valid: boolean;
+  status: 'OK' | 'BROKEN';
+  totalCount: number;
+  brokenSeq?: number;
+  reason?: '값 변경' | '항목 삭제/순서 변경' | '키 불일치';
+  reasonCode?: 'VALUE_MODIFIED' | 'ORDER_OR_DELETION' | 'KEY_MISMATCH';
+  message: string;
 }
 
 export interface ApprovalFingerprint {
@@ -328,6 +366,9 @@ export interface Proposal {
   stages?: StageResult[];
   threeLevelHealth?: ThreeLevelHealth;
   verifiedWithCommand?: string;
+  rowSignature?: string | null;
+  integrityStatus?: ProposalIntegrityStatus;
+  integrityCode?: ProposalIntegrityCode;
 }
 
 export interface Overview {
@@ -692,6 +733,13 @@ export const api = {
     request<{ success: boolean; reproduction: ReproductionResult }>(
       `/api/incidents/${incidentId}/reproduce`,
       post({ testCommandOrFile })
+    ),
+  auditChainStatus: () =>
+    request<{ success: boolean; result: AuditChainVerificationResult }>('/api/audit-chain/status'),
+  proposalIntegrity: (proposalId: string, repoPath?: string) =>
+    request<{ success: boolean; result: ProposalIntegrityResult }>(
+      `/api/proposals/${proposalId}/integrity`,
+      post({ repoPath })
     ),
   subscribeStream: (onEvent: (event: any) => void): (() => void) => {
     try {

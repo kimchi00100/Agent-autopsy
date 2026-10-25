@@ -21,6 +21,7 @@ import {
   FileChange,
   ApprovalFingerprint,
   RepairProposal,
+  ProposalIntegrityResult,
 } from '../types.js';
 
   export async function proposeAndVerifyRepair(ctx: CoreContext, 
@@ -543,4 +544,111 @@ import {
     } finally {
       ctx.isApplyingApprovedPatch = false;
     }
+  }
+
+  export function getProposalIntegrity(
+    ctx: CoreContext,
+    proposalId: string,
+    repoPath?: string
+  ): ProposalIntegrityResult {
+    const proposal = ctx.db.getRepairProposal(proposalId);
+    if (!proposal) {
+      return {
+        proposalId,
+        integrityStatus: '변조 의심',
+        integrityCode: 'TAMPERED',
+        valid: false,
+        reason: `수정안 "${proposalId}"을(를) 찾을 수 없습니다.`,
+      };
+    }
+
+    const incident = ctx.db.getIncident(proposal.incidentId);
+    if (!incident) {
+      return {
+        proposalId,
+        integrityStatus: '변조 의심',
+        integrityCode: 'TAMPERED',
+        valid: false,
+        reason: '연관된 사건 정보를 찾을 수 없습니다.',
+      };
+    }
+
+    // 1. Unsigned legacy check
+    if (!proposal.rowSignature || proposal.rowSignature.trim() === '') {
+      return {
+        proposalId,
+        integrityStatus: '서명 없음 - 다시 검증 필요',
+        integrityCode: 'UNSIGNED',
+        status: '서명 없음 - 다시 검증 필요',
+        code: 'UNSIGNED',
+        valid: false,
+        reason: '전자서명이 확인되지 않았습니다. 다시 격리 검증을 실행해 주세요.',
+      };
+    }
+
+    // 2. Project mismatch check (if repoPath provided)
+    if (repoPath) {
+      const callingProject = ctx.ensureProject(repoPath);
+      if (callingProject.id !== incident.projectId) {
+        return {
+          proposalId,
+          integrityStatus: '프로젝트 불일치',
+          integrityCode: 'PROJECT_MISMATCH',
+          status: '프로젝트 불일치',
+          code: 'PROJECT_MISMATCH',
+          valid: false,
+          reason: `수정안의 소속 프로젝트("${incident.projectId}")와 현재 작업 중인 저장소("${callingProject.id}")가 일치하지 않는 것으로 확인되었습니다.`,
+        };
+      }
+    }
+
+    // 3. Status TAMPERED check
+    if (proposal.approvalStatus === 'TAMPERED') {
+      return {
+        proposalId,
+        integrityStatus: '변조 의심',
+        integrityCode: 'TAMPERED',
+        status: '변조 의심',
+        code: 'TAMPERED',
+        valid: false,
+        reason: '외부 직접 변경 등으로 인한 변조가 확인되어 차단되었습니다.',
+      };
+    }
+
+    // 4. Cryptographic signature check
+    const secretKey = getInstallationSecretKey();
+    const isValid = verifyProposalRowSignature(
+      secretKey,
+      {
+        id: proposal.id,
+        incident_id: proposal.incidentId,
+        project_id: incident.projectId,
+        file_changes_json: proposal.fileChangesJson,
+        verification_status: proposal.verificationStatus,
+        created_at: proposal.createdAt,
+      },
+      proposal.rowSignature
+    );
+
+    if (!isValid) {
+      return {
+        proposalId,
+        integrityStatus: '변조 의심',
+        integrityCode: 'TAMPERED',
+        status: '변조 의심',
+        code: 'TAMPERED',
+        valid: false,
+        reason: '전자서명이 일치하지 않아 데이터 변조가 의심됩니다.',
+      };
+    }
+
+    return {
+      proposalId,
+      integrityStatus: '정상',
+      integrityCode: 'VALID',
+      status: '정상',
+      code: 'VALID',
+      valid: true,
+      reason: '전자서명이 정상 확인되었습니다.',
+    };
   }

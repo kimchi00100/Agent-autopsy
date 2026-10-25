@@ -158,6 +158,10 @@ export default function IncidentAnalysisView({
                       : '위험도: 낮음'}
                   </Badge>
                 )}
+                {/* Incident Integrity Badge (Informational) */}
+                <Badge tone={(incident.integrityStatus ?? '정상') === '정상' ? 'green' : incident.integrityStatus === '서명 없음' ? 'amber' : 'red'}>
+                  {(incident.integrityStatus ?? '정상') === '정상' ? '사건 무결성: 정상 확인됨' : incident.integrityStatus === '서명 없음' ? '사건 무결성: 서명 없음' : '사건 무결성: 변조 의심'}
+                </Badge>
               </div>
               <p className="mt-1 text-xs text-slate-500 font-medium">{incident.title}</p>
             </div>

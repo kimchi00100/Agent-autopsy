@@ -16,18 +16,10 @@ import {
   HealthLevelStatus,
   CauseVerdict,
 } from '../types.js';
-import { analyzeIncident, IncidentAnalysis, parseUnifiedDiff } from '../analysis/analyzer.js';
+import { analyzeIncident, IncidentAnalysis } from '../analysis/analyzer.js';
+import { parseUnifiedDiffFiles, firstMeaningfulLine } from './helpers.js';
 
-function parseUnifiedDiffFiles(diff: string): string[] {
-  return parseUnifiedDiff(diff).map((f) => f.filePath);
-}
-
-function firstMeaningfulLine(text: string): string {
-  const line = (text || '').split(/\r?\n/).map((l) => l.trim()).find((l) => l.length > 0);
-  return (line ?? '').slice(0, 140);
-}
-
-  export async function collectIncidentBundle(ctx: CoreContext, 
+export async function collectIncidentBundle(ctx: CoreContext, 
     repoPath: string,
     titleOrOptions:
       | string

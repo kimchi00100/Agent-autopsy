@@ -8,18 +8,9 @@ import {
   RuntimeInfo,
   WorkspaceComparison,
 } from '../types.js';
-import { parseUnifiedDiff } from '../analysis/analyzer.js';
+import { parseUnifiedDiffFiles, firstMeaningfulLine } from './helpers.js';
 
-function parseUnifiedDiffFiles(diff: string): string[] {
-  return parseUnifiedDiff(diff).map((f) => f.filePath);
-}
-
-function firstMeaningfulLine(text: string): string {
-  const line = (text || '').split(/\r?\n/).map((l) => l.trim()).find((l) => l.length > 0);
-  return (line ?? '').slice(0, 140);
-}
-
-  export function getOverview(ctx: CoreContext, repoPath: string): ProjectOverview {
+export function getOverview(ctx: CoreContext, repoPath: string): ProjectOverview {
     const project = ctx.ensureProject(repoPath);
     const health = ctx.inspectProjectState(project.rootPath);
     const incidents = ctx.db.listIncidents(project.id, 200);

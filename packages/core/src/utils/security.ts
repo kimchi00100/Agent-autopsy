@@ -110,3 +110,38 @@ export function verifyTestCommandSignature(
     return false;
   }
 }
+
+/**
+ * Genesis block prev_hash for the audit_log hash chain.
+ */
+export const GENESIS_PREV_HASH = '0000000000000000000000000000000000000000000000000000000000000000';
+
+/**
+ * Computes deterministic SHA-256 hash of an audit log event payload.
+ */
+export function hashAuditPayload(payload: any): string {
+  if (typeof payload === 'string') {
+    return crypto.createHash('sha256').update(payload).digest('hex');
+  }
+  return crypto.createHash('sha256').update(JSON.stringify(payload)).digest('hex');
+}
+
+/**
+ * Computes HMAC-SHA256 entry_hash for an audit_log entry using the installation secret key.
+ * Formats: prev_hash + 나머지 필드 (seq, created_at, kind, entity_type, entity_id, payload_hash).
+ */
+export function computeAuditEntryHash(
+  secretKey: string,
+  entry: {
+    prev_hash: string;
+    seq: number;
+    created_at: string;
+    kind: string;
+    entity_type: string;
+    entity_id: string;
+    payload_hash: string;
+  }
+): string {
+  const content = `${entry.prev_hash}:${entry.seq}:${entry.created_at}:${entry.kind}:${entry.entity_type}:${entry.entity_id}:${entry.payload_hash}`;
+  return crypto.createHmac('sha256', secretKey).update(content).digest('hex');
+}

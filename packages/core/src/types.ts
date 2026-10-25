@@ -597,3 +597,36 @@ export interface WorkspaceComparison {
   selectedCommitSha?: string;
 }
 
+export type AuditLogKind =
+  | 'INCIDENT_REGISTERED'
+  | 'PROPOSAL_CREATED'
+  | 'TEST_COMMAND_CONFIRMED'
+  | 'PROPOSAL_APPROVED'
+  | 'PROPOSAL_REJECTED'
+  | 'REPAIR_APPLIED'
+  | 'TAMPERED_DETECTED'
+  | 'ROLLBACK_EXECUTED';
+
+export type AuditEntityType = 'INCIDENT' | 'PROPOSAL' | 'PROJECT' | 'CHECKPOINT';
+
+export interface AuditLogEntry {
+  seq: number;
+  createdAt: string;
+  kind: AuditLogKind | string;
+  entityType: AuditEntityType | string;
+  entityId: string;
+  payloadHash: string;
+  prevHash: string;
+  entryHash: string;
+}
+
+export interface AuditChainVerificationResult {
+  valid: boolean;
+  status: 'OK' | 'BROKEN';
+  totalCount: number;
+  brokenSeq?: number;
+  reason?: '값 변경' | '항목 삭제/순서 변경' | '키 불일치';
+  reasonCode?: 'VALUE_MODIFIED' | 'ORDER_OR_DELETION' | 'KEY_MISMATCH';
+  message: string;
+}
+

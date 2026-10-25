@@ -1,5 +1,6 @@
 import { CoreContext } from './context.js';
 import { Checkpoint } from '../types.js';
+import { hashAuditPayload } from '../utils/security.js';
 
 export function captureCheckpoint(
   ctx: CoreContext,
@@ -62,6 +63,18 @@ export function rollbackToCheckpoint(
 
   ctx.quarantineCache.delete(project.id);
   ctx.db.updateProjectQuarantine(project.id, null, null);
+
+  ctx.db.appendAuditLog({
+    kind: 'ROLLBACK_EXECUTED',
+    entityType: 'CHECKPOINT',
+    entityId: cp.id,
+    payloadHash: hashAuditPayload({
+      checkpointId: cp.id,
+      gitHeadSha: cp.gitHeadSha,
+      restoredAt: new Date().toISOString(),
+    }),
+  });
+
   ctx.emitChange('checkpoint_rolled_back', { checkpointId, backupRef });
 
   return {

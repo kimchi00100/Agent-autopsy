@@ -113,6 +113,8 @@ import {
   HistorySearchItem,
   IncidentAttemptItem,
   CheckpointChangesSummary,
+  AuditLogEntry,
+  AuditChainVerificationResult,
 } from './types.js';
 import { analyzeIncident, IncidentAnalysis, parseUnifiedDiff, parseStackFrames } from './analysis/analyzer.js';
 
@@ -585,6 +587,14 @@ export class CoreManager {
     options?: PackChangeScopeOptions
   ): Promise<PackagedChangeScope> {
     return packChangeScope(this.ctx, incidentId, options);
+  }
+
+  public verifyAuditChain(overrideSecret?: string): AuditChainVerificationResult {
+    return this.db.verifyAuditChain(overrideSecret);
+  }
+
+  public getAuditLogs(limit?: number): AuditLogEntry[] {
+    return this.db.getAuditLogs(limit);
   }
 
   public async shutdown(): Promise<void> {

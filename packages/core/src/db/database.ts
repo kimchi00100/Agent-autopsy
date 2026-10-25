@@ -23,11 +23,22 @@ import {
   ConfirmedIntentData,
   ReproductionResult,
   CauseVerdict,
+  AuditLogEntry,
+  AuditLogKind,
+  AuditEntityType,
+  AuditChainVerificationResult,
 } from '../types.js';
 import { generateDeterministicProjectId, normalizeRepoPath } from '../utils/paths.js';
+import {
+  GENESIS_PREV_HASH,
+  computeAuditEntryHash,
+  hashAuditPayload,
+  getInstallationSecretKey,
+} from '../utils/security.js';
 
 export class AutopsyDatabase {
   private db: DatabaseSync;
+  private inTransaction: boolean = false;
   public status: 'READY' | 'MIGRATED' | 'ERROR' = 'READY';
   public initError?: string;
   public recoveryGuide?: string;
@@ -206,17 +217,42 @@ export class AutopsyDatabase {
         FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE
       );
 
+      CREATE TABLE IF NOT EXISTS audit_log (
+        seq INTEGER PRIMARY KEY,
+        created_at TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        entity_type TEXT NOT NULL,
+        entity_id TEXT NOT NULL,
+        payload_hash TEXT NOT NULL,
+        prev_hash TEXT NOT NULL,
+        entry_hash TEXT NOT NULL
+      );
+
       CREATE INDEX IF NOT EXISTS idx_events_project ON agent_events(project_id, created_at DESC);
       CREATE INDEX IF NOT EXISTS idx_checkpoints_project ON checkpoints(project_id, created_at DESC);
       CREATE INDEX IF NOT EXISTS idx_incidents_project ON incidents(project_id, created_at DESC);
       CREATE INDEX IF NOT EXISTS idx_proposals_incident ON repair_proposals(incident_id, created_at DESC);
       CREATE INDEX IF NOT EXISTS idx_directives_project ON directives(project_id, created_at DESC);
       CREATE INDEX IF NOT EXISTS idx_directives_status ON directives(delivery_status);
+      CREATE INDEX IF NOT EXISTS idx_audit_log_kind ON audit_log(kind, created_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_audit_log_entity ON audit_log(entity_type, entity_id);
     `);
   }
 
   private migrateColumns(): void {
     const migrations = [
+      `CREATE TABLE IF NOT EXISTS audit_log (
+        seq INTEGER PRIMARY KEY,
+        created_at TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        entity_type TEXT NOT NULL,
+        entity_id TEXT NOT NULL,
+        payload_hash TEXT NOT NULL,
+        prev_hash TEXT NOT NULL,
+        entry_hash TEXT NOT NULL
+      );`,
+      `CREATE INDEX IF NOT EXISTS idx_audit_log_kind ON audit_log(kind, created_at DESC);`,
+      `CREATE INDEX IF NOT EXISTS idx_audit_log_entity ON audit_log(entity_type, entity_id);`,
       `CREATE TABLE IF NOT EXISTS directives (
         id TEXT PRIMARY KEY,
         project_id TEXT NOT NULL,
@@ -337,14 +373,20 @@ export class AutopsyDatabase {
    * Executes a write function inside BEGIN IMMEDIATE with exponential backoff on SQLITE_BUSY.
    */
   public runInImmediateTransaction<T>(fn: () => T, maxRetries: number = 5): T {
+    if (this.inTransaction) {
+      return fn();
+    }
     let attempt = 0;
     while (attempt < maxRetries) {
       try {
+        this.inTransaction = true;
         this.db.exec('BEGIN IMMEDIATE;');
         const result = fn();
         this.db.exec('COMMIT;');
+        this.inTransaction = false;
         return result;
       } catch (err: any) {
+        this.inTransaction = false;
         try {
           this.db.exec('ROLLBACK;');
         } catch {}
@@ -477,6 +519,17 @@ export class AutopsyDatabase {
           WHERE id = ?
         `)
         .run(command, signature, id);
+
+      this.appendAuditLog({
+        kind: 'TEST_COMMAND_CONFIRMED',
+        entityType: 'PROJECT',
+        entityId: id,
+        payloadHash: hashAuditPayload({
+          projectId: id,
+          testCommand: command,
+          signature,
+        }),
+      });
     });
   }
 
@@ -769,6 +822,20 @@ export class AutopsyDatabase {
         scopeSummaryJson,
         incident.createdAt
       );
+
+      this.appendAuditLog({
+        kind: 'INCIDENT_REGISTERED',
+        entityType: 'INCIDENT',
+        entityId: incident.id,
+        payloadHash: hashAuditPayload({
+          projectId: incident.projectId,
+          title: incident.title,
+          baseCheckpointId: incident.baseCheckpointId,
+          diffSummary: incident.diffSummary,
+          createdAt: incident.createdAt,
+        }),
+        createdAt: incident.createdAt,
+      });
     });
   }
 
@@ -1042,6 +1109,20 @@ export class AutopsyDatabase {
         proposal.verifiedWithCommand || null,
         proposal.createdAt
       );
+
+      this.appendAuditLog({
+        kind: 'PROPOSAL_CREATED',
+        entityType: 'PROPOSAL',
+        entityId: proposal.id,
+        payloadHash: hashAuditPayload({
+          incidentId: proposal.incidentId,
+          patchHash: proposal.patchHash,
+          verificationStatus: proposal.verificationStatus,
+          fileChangesJson: proposal.fileChangesJson,
+          createdAt: proposal.createdAt,
+        }),
+        createdAt: proposal.createdAt,
+      });
     });
   }
 
@@ -1136,6 +1217,19 @@ export class AutopsyDatabase {
           WHERE id = ?
         `);
         stmt.run(status, timestamp, fpJson, id);
+
+        this.appendAuditLog({
+          kind: 'PROPOSAL_APPROVED',
+          entityType: 'PROPOSAL',
+          entityId: id,
+          payloadHash: hashAuditPayload({
+            proposalId: id,
+            approvalStatus: 'APPROVED',
+            fingerprint: fpJson,
+            approvedAt: timestamp,
+          }),
+          createdAt: timestamp,
+        });
       } else if (status === 'APPLIED') {
         const stmt = this.db.prepare(`
           UPDATE repair_proposals 
@@ -1143,6 +1237,18 @@ export class AutopsyDatabase {
           WHERE id = ?
         `);
         stmt.run(status, timestamp, id);
+
+        this.appendAuditLog({
+          kind: 'REPAIR_APPLIED',
+          entityType: 'PROPOSAL',
+          entityId: id,
+          payloadHash: hashAuditPayload({
+            proposalId: id,
+            approvalStatus: 'APPLIED',
+            appliedAt: timestamp,
+          }),
+          createdAt: timestamp,
+        });
       } else if (status === 'REJECTED') {
         const stmt = this.db.prepare(`
           UPDATE repair_proposals 
@@ -1150,6 +1256,37 @@ export class AutopsyDatabase {
           WHERE id = ?
         `);
         stmt.run(status, reason, id);
+
+        this.appendAuditLog({
+          kind: 'PROPOSAL_REJECTED',
+          entityType: 'PROPOSAL',
+          entityId: id,
+          payloadHash: hashAuditPayload({
+            proposalId: id,
+            approvalStatus: 'REJECTED',
+            rejectionReason: reason || '',
+          }),
+          createdAt: timestamp,
+        });
+      } else if (status === 'TAMPERED') {
+        const stmt = this.db.prepare(`
+          UPDATE repair_proposals 
+          SET approval_status = ? 
+          WHERE id = ?
+        `);
+        stmt.run(status, id);
+
+        this.appendAuditLog({
+          kind: 'TAMPERED_DETECTED',
+          entityType: 'PROPOSAL',
+          entityId: id,
+          payloadHash: hashAuditPayload({
+            proposalId: id,
+            approvalStatus: 'TAMPERED',
+            reason: reason || '',
+          }),
+          createdAt: timestamp,
+        });
       } else {
         const stmt = this.db.prepare(`
           UPDATE repair_proposals 
@@ -1369,6 +1506,185 @@ export class AutopsyDatabase {
       const stmt = this.db.prepare(`UPDATE directives SET ${updates.join(', ')} WHERE id = ?`);
       stmt.run(...values);
     });
+  }
+
+  // --- Audit Log Hash Chain (Tamper-Evident) ---
+
+  /**
+   * Appends a new audit log entry inside an immediate transaction, maintaining the cryptographic hash chain.
+   */
+  public appendAuditLog(entry: {
+    kind: string;
+    entityType: string;
+    entityId: string;
+    payloadHash: string;
+    createdAt?: string;
+  }): AuditLogEntry {
+    return this.runInImmediateTransaction(() => {
+      const createdAt = entry.createdAt || new Date().toISOString();
+      const lastRow = this.db
+        .prepare('SELECT seq, entry_hash FROM audit_log ORDER BY seq DESC LIMIT 1')
+        .get() as { seq: number; entry_hash: string } | undefined;
+
+      const seq = lastRow ? Number(lastRow.seq) + 1 : 1;
+      const prevHash = lastRow ? String(lastRow.entry_hash) : GENESIS_PREV_HASH;
+      const secret = getInstallationSecretKey();
+      const entryHash = computeAuditEntryHash(secret, {
+        prev_hash: prevHash,
+        seq,
+        created_at: createdAt,
+        kind: entry.kind,
+        entity_type: entry.entityType,
+        entity_id: entry.entityId,
+        payload_hash: entry.payloadHash,
+      });
+
+      this.db
+        .prepare(`
+          INSERT INTO audit_log (seq, created_at, kind, entity_type, entity_id, payload_hash, prev_hash, entry_hash)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        `)
+        .run(seq, createdAt, entry.kind, entry.entityType, entry.entityId, entry.payloadHash, prevHash, entryHash);
+
+      return {
+        seq,
+        createdAt,
+        kind: entry.kind,
+        entityType: entry.entityType,
+        entityId: entry.entityId,
+        payloadHash: entry.payloadHash,
+        prevHash,
+        entryHash,
+      };
+    });
+  }
+
+  /**
+   * Retrieves recent audit log entries ordered by sequence descending.
+   */
+  public getAuditLogs(limit: number = 100): AuditLogEntry[] {
+    const rows = this.db.prepare('SELECT * FROM audit_log ORDER BY seq DESC LIMIT ?').all(limit) as any[];
+    return rows.map((r) => ({
+      seq: Number(r.seq),
+      createdAt: String(r.created_at),
+      kind: String(r.kind),
+      entityType: String(r.entity_type),
+      entityId: String(r.entity_id),
+      payloadHash: String(r.payload_hash),
+      prevHash: String(r.prev_hash),
+      entryHash: String(r.entry_hash),
+    }));
+  }
+
+  /**
+   * Verifies the cryptographic integrity of the entire audit log chain.
+   * Recalculates HMAC for every row from sequence 1 to N.
+   * Returns OK and item count if valid, or the first broken seq and reason ('값 변경' | '항목 삭제/순서 변경' | '키 불일치').
+   */
+  public verifyAuditChain(overrideSecret?: string): AuditChainVerificationResult {
+    const rows = this.db.prepare('SELECT * FROM audit_log ORDER BY seq ASC').all() as any[];
+    if (rows.length === 0) {
+      return {
+        valid: true,
+        status: 'OK',
+        totalCount: 0,
+        message: '감사 기록이 비어 있습니다 (0개 항목).',
+      };
+    }
+
+    const secret = overrideSecret || getInstallationSecretKey();
+
+    for (let i = 0; i < rows.length; i++) {
+      const row = rows[i];
+      const seq = Number(row.seq);
+      const expectedSeq = i + 1;
+
+      // 1. Sequence number check
+      if (seq !== expectedSeq) {
+        return {
+          valid: false,
+          status: 'BROKEN',
+          totalCount: rows.length,
+          brokenSeq: expectedSeq,
+          reason: '항목 삭제/순서 변경',
+          reasonCode: 'ORDER_OR_DELETION',
+          message: `감사 기록의 일련번호 불일치 (기대: seq ${expectedSeq}, 실제: seq ${seq}). 항목 삭제 또는 순서 변경이 감지되었습니다.`,
+        };
+      }
+
+      // 2. prev_hash continuity check
+      const expectedPrevHash = i === 0 ? GENESIS_PREV_HASH : String(rows[i - 1].entry_hash);
+      if (String(row.prev_hash) !== expectedPrevHash) {
+        return {
+          valid: false,
+          status: 'BROKEN',
+          totalCount: rows.length,
+          brokenSeq: seq,
+          reason: '항목 삭제/순서 변경',
+          reasonCode: 'ORDER_OR_DELETION',
+          message: `감사 기록 해시 체인 단절 (seq ${seq}). 이전 항목의 해시값과 일치하지 않아 항목 삭제 또는 변조가 감지되었습니다.`,
+        };
+      }
+
+      // 3. HMAC entry_hash check
+      const expectedEntryHash = computeAuditEntryHash(secret, {
+        prev_hash: String(row.prev_hash),
+        seq,
+        created_at: String(row.created_at),
+        kind: String(row.kind),
+        entity_type: String(row.entity_type),
+        entity_id: String(row.entity_id),
+        payload_hash: String(row.payload_hash),
+      });
+
+      if (String(row.entry_hash) !== expectedEntryHash) {
+        // Distinguish KEY_MISMATCH vs VALUE_MODIFIED
+        if (i === 0) {
+          // If first row fails, check if ANY row in the chain matches this secret
+          const anyMatches = rows.some((r) => {
+            const h = computeAuditEntryHash(secret, {
+              prev_hash: String(r.prev_hash),
+              seq: Number(r.seq),
+              created_at: String(r.created_at),
+              kind: String(r.kind),
+              entity_type: String(r.entity_type),
+              entity_id: String(r.entity_id),
+              payload_hash: String(r.payload_hash),
+            });
+            return h === String(r.entry_hash);
+          });
+
+          if (!anyMatches) {
+            return {
+              valid: false,
+              status: 'BROKEN',
+              totalCount: rows.length,
+              brokenSeq: seq,
+              reason: '키 불일치',
+              reasonCode: 'KEY_MISMATCH',
+              message: `감사 기록 서명 키 불일치 (seq ${seq}). 다른 설치 환경의 데이터이거나 서명 키(.auth_secret)가 일치하지 않습니다.`,
+            };
+          }
+        }
+
+        return {
+          valid: false,
+          status: 'BROKEN',
+          totalCount: rows.length,
+          brokenSeq: seq,
+          reason: '값 변경',
+          reasonCode: 'VALUE_MODIFIED',
+          message: `감사 기록 값 변조 감지 (seq ${seq}). 데이터 필드 또는 해시값이 수정되었습니다.`,
+        };
+      }
+    }
+
+    return {
+      valid: true,
+      status: 'OK',
+      totalCount: rows.length,
+      message: `감사 기록 해시 체인 검증 통과 (총 ${rows.length}개 항목 무결성 확인).`,
+    };
   }
 
   public close(): void {

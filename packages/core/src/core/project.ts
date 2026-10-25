@@ -920,7 +920,3 @@ import {
     ctx.emitChange('project_settings_updated', updated);
     return updated;
   }
-
-  /**
-   * User approval: Computes ApprovalFingerprint and pins file pre-image hashes.
-   */

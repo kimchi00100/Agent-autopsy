@@ -275,7 +275,7 @@ import {
    * If undetected, returns an empty string (NEVER falls back to npm test).
    */
   export function detectTestCommand(ctx: CoreContext, repoPath: string): string {
-    const discovered = discoverSafeTestCommands.bind(null, ctx)(repoPath);
+    const discovered = discoverSafeTestCommands(ctx, repoPath);
     return discovered.fullRegressionCmd || '';
   }
 
@@ -351,7 +351,7 @@ import {
         const entries = fs.readdirSync(fullPath, { withFileTypes: true });
         const parts: string[] = [];
         for (const entry of entries) {
-          parts.push(`${entry.name}:${computePathFingerprint.bind(null, ctx)(path.join(fullPath, entry.name))}`);
+          parts.push(`${entry.name}:${computePathFingerprint(ctx, path.join(fullPath, entry.name))}`);
         }
         return crypto.createHash('sha256').update(parts.sort().join(';')).digest('hex');
       }
@@ -377,13 +377,13 @@ import {
     hasher.update(`tracked:${sortedTracked.join(',')}\n`);
     for (const rel of sortedTracked) {
       const full = path.resolve(repoPath, rel);
-      hasher.update(`${rel}:${computePathFingerprint.bind(null, ctx)(full)}\n`);
+      hasher.update(`${rel}:${computePathFingerprint(ctx, full)}\n`);
     }
 
     hasher.update(`untracked:${sortedUntracked.join(',')}\n`);
     for (const rel of sortedUntracked) {
       const full = path.resolve(repoPath, rel);
-      hasher.update(`${rel}:${computePathFingerprint.bind(null, ctx)(full)}\n`);
+      hasher.update(`${rel}:${computePathFingerprint(ctx, full)}\n`);
     }
 
     return hasher.digest('hex');
@@ -448,7 +448,7 @@ import {
     let quarantineBackupRef: string | undefined = undefined;
     if (unapprovedModificationsDetected) {
       // 0.5 Check: Compute exact fingerprint of unapproved changes (files list + content hashes)
-      const fingerprint = computeUnapprovedChangesFingerprint.bind(null, ctx)(
+      const fingerprint = computeUnapprovedChangesFingerprint(ctx,
         project.rootPath,
         unapprovedTracked,
         unapprovedUntracked
@@ -594,7 +594,7 @@ import {
     }
 
     // 4. Test Commands & Build Discovery
-    const discoveredCommands = discoverSafeTestCommands.bind(null, ctx)(rootPath);
+    const discoveredCommands = discoverSafeTestCommands(ctx, rootPath);
     if (!discoveredCommands.isCommandSafe) {
       items.push({
         key: 'test_commands',

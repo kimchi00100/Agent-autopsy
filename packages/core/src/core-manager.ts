@@ -1,3 +1,4 @@
+import { captureCheckpoint, rollbackToCheckpoint } from './core/checkpoint.js';
 import { CoreContext } from './core/context.js';
 import {
   discoverSafeTestCommands,
@@ -269,42 +270,9 @@ export class CoreManager {
     agentName: string = 'user',
     sessionId?: string
   ): Checkpoint {
-    const project = this.ensureProject(repoPath);
-    const id = `cp_${Date.now().toString(36)}_${Math.random().toString(36).substring(2, 6)}`;
-    const snapshot = this.gitEngine.createSnapshot(project.rootPath, id, label);
-
-    const cp: Checkpoint = {
-      id,
-      projectId: project.id,
-      agentName,
-      label,
-      gitHeadSha: snapshot.headSha,
-      gitStashSha:
-        snapshot.headSha === snapshot.worktreeCommitSha &&
-        snapshot.changedFiles.length === 0 &&
-        snapshot.untrackedFiles.length === 0
-          ? null
-          : snapshot.worktreeCommitSha,
-      gitIndexSha: snapshot.indexTreeSha,
-      worktreeCommitSha: snapshot.worktreeCommitSha,
-      gitRef: snapshot.gitRef,
-      changedFiles: snapshot.changedFiles,
-      untrackedFiles: snapshot.untrackedFiles,
-      sessionId,
-      createdAt: new Date().toISOString(),
-    };
-
-    this.db.recordAgentHeartbeat(agentName, sessionId, `체크포인트 생성: ${label}`);
-    this.db.insertCheckpoint(cp);
-    this.quarantineCache.delete(project.id);
-    this.db.updateProjectQuarantine(project.id, null, null);
-    this.emitChange('checkpoint_created', cp);
-    return cp;
+    return captureCheckpoint(this.ctx, repoPath, label, agentName, sessionId);
   }
 
-  /**
-   * Computes deterministic fingerprint for an unapproved relative file or folder path.
-   */
   private computePathFingerprint(fullPath: string): string {
     return computePathFingerprint(this.ctx, fullPath);
   }
@@ -1325,33 +1293,9 @@ export class CoreManager {
     repoPath: string,
     checkpointId: string
   ): { restored: boolean; backupRef: string } {
-    const project = this.ensureProject(repoPath);
-    const cp = this.db.getCheckpoint(checkpointId);
-    if (!cp) {
-      throw new Error(`Checkpoint with ID "${checkpointId}" not found.`);
-    }
-
-    const { backupRef } = this.gitEngine.restoreSnapshot(
-      project.rootPath,
-      cp.gitHeadSha,
-      cp.worktreeCommitSha,
-      cp.gitIndexSha,
-      cp.untrackedFiles || []
-    );
-
-    this.quarantineCache.delete(project.id);
-    this.db.updateProjectQuarantine(project.id, null, null);
-    this.emitChange('checkpoint_rolled_back', { checkpointId, backupRef });
-
-    return {
-      restored: true,
-      backupRef,
-    };
+    return rollbackToCheckpoint(this.ctx, repoPath, checkpointId);
   }
 
-  /**
-   * Records agent activity (file read, edit, command run, test result).
-   */
   public recordAgentEvent(
     repoPath: string,
     kind: AgentEventKind,

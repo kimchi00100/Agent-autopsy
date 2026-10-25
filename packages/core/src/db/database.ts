@@ -369,6 +369,8 @@ export class AutopsyDatabase {
     } catch {}
   }
 
+  public static totalBusyRetries: number = 0;
+
   /**
    * Executes a write function inside BEGIN IMMEDIATE with exponential backoff on SQLITE_BUSY.
    */
@@ -391,7 +393,8 @@ export class AutopsyDatabase {
           this.db.exec('ROLLBACK;');
         } catch {}
 
-        if (err.message && err.message.includes('busy') && attempt < maxRetries - 1) {
+        if (err.message && (err.message.includes('busy') || err.message.includes('locked')) && attempt < maxRetries - 1) {
+          AutopsyDatabase.totalBusyRetries++;
           attempt++;
           const waitMs = Math.floor(Math.random() * 50) + Math.pow(2, attempt) * 20;
           const end = Date.now() + waitMs;

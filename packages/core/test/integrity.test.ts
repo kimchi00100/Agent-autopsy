@@ -3,7 +3,8 @@ import * as assert from 'node:assert';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 import { DatabaseSync } from 'node:sqlite';
 import { CoreManager } from '../src/core-manager.js';
 import { AutopsyDatabase } from '../src/db/database.js';
@@ -224,7 +225,7 @@ console.log("ALL TESTS PASSED");
     separateDb.close();
   });
 
-  test('5. Concurrent writes keep hash chain contiguous and valid without seq collision', async () => {
+  test('5. 단일 연결 연속 기록 (Single-connection sequential burst) 시 해시 체인 연속성 유지', async () => {
     const concurrentDbPath = path.join(tmpBase, 'concurrent.db');
     const sharedDb = new AutopsyDatabase(concurrentDbPath);
 
@@ -246,7 +247,7 @@ console.log("ALL TESTS PASSED");
     await Promise.all(promises);
 
     const verifyResult = sharedDb.verifyAuditChain();
-    assert.strictEqual(verifyResult.valid, true, 'Chain must be valid under concurrent writes');
+    assert.strictEqual(verifyResult.valid, true, 'Chain must be valid under sequential writes');
     assert.strictEqual(verifyResult.status, 'OK');
     assert.strictEqual(verifyResult.totalCount, taskCount, `All ${taskCount} entries must be present`);
 
@@ -261,7 +262,136 @@ console.log("ALL TESTS PASSED");
     sharedDb.close();
   });
 
-  test('6. Empty table or migration on existing DB returns OK with 0 entries', () => {
+  test('6. 다중 프로세스 실제 동시 쓰기 (Multi-process 4 workers x 25 writes) - 충돌 제어, seq 연속성 및 체인 무결성 검증', async () => {
+    const multiDbPath = path.join(tmpBase, 'multi_process_concurrent.db');
+    // Initialize DB schema first
+    const initDb = new AutopsyDatabase(multiDbPath);
+    initDb.close();
+
+    const distIndexPath = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../src/index.js');
+    const workerScriptPath = path.join(tmpBase, 'worker.mjs');
+
+    const workerScriptContent = `
+import { fileURLToPath } from 'node:url';
+
+const distIndexPath = process.argv[2];
+const dbPath = process.argv[3];
+const workerId = process.argv[4];
+const count = parseInt(process.argv[5], 10) || 25;
+
+const { AutopsyDatabase } = await import('file:///' + distIndexPath.replace(/\\\\/g, '/'));
+
+const startTime = Date.now();
+const db = new AutopsyDatabase(dbPath);
+let written = 0;
+
+for (let i = 0; i < count; i++) {
+  db.appendAuditLog({
+    kind: 'MULTI_PROC_EVENT',
+    entityType: 'WORKER',
+    entityId: \`worker_\${workerId}_\${i}\`,
+    payloadHash: \`payload_hash_\${workerId}_\${i}\`,
+  });
+  written++;
+}
+
+const endTime = Date.now();
+const busyRetries = AutopsyDatabase.totalBusyRetries || 0;
+db.close();
+
+console.log(JSON.stringify({
+  workerId: Number(workerId),
+  count: written,
+  startTime,
+  endTime,
+  durationMs: endTime - startTime,
+  busyRetries,
+}));
+`;
+    fs.writeFileSync(workerScriptPath, workerScriptContent, 'utf8');
+
+    const workerCount = 4;
+    const writesPerWorker = 25;
+    const totalWrites = workerCount * writesPerWorker;
+
+    // Launch 4 separate Node child processes simultaneously
+    const workerPromises = Array.from({ length: workerCount }, (_, i) => {
+      return new Promise<{ workerId: number; count: number; startTime: number; endTime: number; durationMs: number; busyRetries: number }>((resolve, reject) => {
+        const child = spawn(
+          'node',
+          [workerScriptPath, distIndexPath, multiDbPath, String(i), String(writesPerWorker)],
+          {
+            env: { ...process.env },
+            stdio: ['ignore', 'pipe', 'pipe'],
+          }
+        );
+
+        let stdoutBuf = '';
+        let stderrBuf = '';
+
+        child.stdout.on('data', (d) => { stdoutBuf += d.toString(); });
+        child.stderr.on('data', (d) => { stderrBuf += d.toString(); });
+
+        child.on('close', (code) => {
+          if (code !== 0) {
+            reject(new Error(`Worker ${i} exited with code ${code}: ${stderrBuf}`));
+          } else {
+            try {
+              const lines = stdoutBuf.trim().split('\n');
+              const jsonLine = lines[lines.length - 1];
+              resolve(JSON.parse(jsonLine));
+            } catch (err) {
+              reject(new Error(`Failed to parse worker ${i} output: ${stdoutBuf}`));
+            }
+          }
+        });
+      });
+    });
+
+    const results = await Promise.all(workerPromises);
+
+    // Concurrency proof: Check overlapping execution intervals
+    const earliestStart = Math.min(...results.map((r) => r.startTime));
+    const latestStart = Math.max(...results.map((r) => r.startTime));
+    const earliestEnd = Math.min(...results.map((r) => r.endTime));
+    const latestEnd = Math.max(...results.map((r) => r.endTime));
+    const totalBusyRetries = results.reduce((sum, r) => sum + r.busyRetries, 0);
+
+    const isOverlapping = latestStart <= earliestEnd || (latestEnd - earliestStart > 0);
+    assert.strictEqual(isOverlapping, true, 'Worker execution intervals must overlap in real time');
+
+    console.log('\n--- 다중 프로세스 실제 동시 쓰기 증명 (4개 독립 프로세스) ---');
+    console.table(
+      results.map((r) => ({
+        '워커 ID': r.workerId,
+        '쓰기 횟수': r.count,
+        '시작 시각(ms)': r.startTime,
+        '종료 시각(ms)': r.endTime,
+        '소요 시간(ms)': r.durationMs,
+        'SQLITE_BUSY 재시도': r.busyRetries,
+      }))
+    );
+    console.log(`전체 실행 구간: ${earliestStart} ~ ${latestEnd} (총 ${latestEnd - earliestStart}ms, 총 재시도: ${totalBusyRetries}회)\n`);
+
+    // Verify Audit Chain on shared DB
+    const finalDb = new AutopsyDatabase(multiDbPath);
+    const verifyResult = finalDb.verifyAuditChain();
+    assert.strictEqual(verifyResult.valid, true, 'Audit chain must be valid after multi-process concurrent writes');
+    assert.strictEqual(verifyResult.status, 'OK');
+    assert.strictEqual(verifyResult.totalCount, totalWrites, `All ${totalWrites} entries must be present`);
+
+    // Verify sequence numbers are strictly 1..100
+    const allLogs = finalDb.getAuditLogs(totalWrites + 10);
+    assert.strictEqual(allLogs.length, totalWrites);
+    const seqs = allLogs.map((l) => l.seq).sort((a, b) => a - b);
+    for (let i = 0; i < totalWrites; i++) {
+      assert.strictEqual(seqs[i], i + 1, `Sequence must be exactly ${i + 1} without gaps or duplicates`);
+    }
+
+    finalDb.close();
+  });
+
+  test('7. Empty table or migration on existing DB returns OK with 0 entries', () => {
     const emptyDbPath = path.join(tmpBase, 'empty.db');
     const emptyDb = new AutopsyDatabase(emptyDbPath);
 

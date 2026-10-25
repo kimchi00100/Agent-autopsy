@@ -189,7 +189,7 @@ export default function Repair({
     setBusy(true);
     try {
       if (proposal.approvalStatus !== 'APPROVED') {
-        await api.approve(proposal.id, selected, forceAck);
+        await api.approve(proposal.id, selected, forceAck, repoPath);
       }
       await api.apply(proposal.id, repoPath, partial ? selected : []);
       notify('ok', '수정안을 적용했습니다. 변경 사항을 확인한 뒤 직접 Commit 해 주세요.');

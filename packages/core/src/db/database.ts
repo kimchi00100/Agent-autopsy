@@ -435,6 +435,99 @@ export class AutopsyDatabase {
           if (!p.root_path) continue;
           const canonicalId = generateDeterministicProjectId(p.root_path);
           if (p.id !== canonicalId) {
+            const secret = getInstallationSecretKey();
+
+            // 1. Verify existing signatures with old project_id (p.id) BEFORE migrating.
+            // Only rows whose signatures pass verification are re-signed with canonicalId.
+            // Tampered rows are left untouched (preserving TAMPERED status) and recorded in audit_log.
+            // Rows that already belonged to canonicalId are never re-signed.
+            try {
+              const migratingIncidents = this.db.prepare(`
+                SELECT id, user_report_text, created_at, row_signature 
+                FROM incidents 
+                WHERE project_id = ?
+              `).all(p.id) as any[];
+
+              for (const incRow of migratingIncidents) {
+                if (incRow.row_signature) {
+                  const isValid = verifyIncidentRowSignature(secret, {
+                    id: incRow.id,
+                    project_id: p.id,
+                    user_report_text: incRow.user_report_text || '',
+                    created_at: incRow.created_at,
+                  }, incRow.row_signature);
+
+                  if (isValid) {
+                    const newIncSig = computeIncidentRowSignature(secret, {
+                      id: incRow.id,
+                      project_id: canonicalId,
+                      user_report_text: incRow.user_report_text || '',
+                      created_at: incRow.created_at,
+                    });
+                    this.db.prepare(`UPDATE incidents SET row_signature = ? WHERE id = ?`).run(newIncSig, incRow.id);
+                  } else {
+                    this.appendAuditLog({
+                      kind: 'TAMPER_DETECTED',
+                      entityType: 'INCIDENT',
+                      entityId: incRow.id,
+                      payloadHash: hashAuditPayload({
+                        incidentId: incRow.id,
+                        oldProjectId: p.id,
+                        canonicalId,
+                        reason: 'Legacy incident signature verification failed during migration; signature preservation withheld',
+                      }),
+                    });
+                  }
+                }
+              }
+            } catch {}
+
+            try {
+              const migratingProposals = this.db.prepare(`
+                SELECT p.id, p.incident_id, p.file_changes_json, p.verification_status, p.created_at, p.row_signature
+                FROM repair_proposals p
+                JOIN incidents i ON i.id = p.incident_id
+                WHERE i.project_id = ?
+              `).all(p.id) as any[];
+
+              for (const propRow of migratingProposals) {
+                if (propRow.row_signature) {
+                  const isValid = verifyProposalRowSignature(secret, {
+                    id: propRow.id,
+                    incident_id: propRow.incident_id,
+                    project_id: p.id,
+                    file_changes_json: propRow.file_changes_json,
+                    verification_status: propRow.verification_status,
+                    created_at: propRow.created_at,
+                  }, propRow.row_signature);
+
+                  if (isValid) {
+                    const newPropSig = computeProposalRowSignature(secret, {
+                      id: propRow.id,
+                      incident_id: propRow.incident_id,
+                      project_id: canonicalId,
+                      file_changes_json: propRow.file_changes_json,
+                      verification_status: propRow.verification_status,
+                      created_at: propRow.created_at,
+                    });
+                    this.db.prepare(`UPDATE repair_proposals SET row_signature = ? WHERE id = ?`).run(newPropSig, propRow.id);
+                  } else {
+                    this.appendAuditLog({
+                      kind: 'TAMPER_DETECTED',
+                      entityType: 'PROPOSAL',
+                      entityId: propRow.id,
+                      payloadHash: hashAuditPayload({
+                        proposalId: propRow.id,
+                        oldProjectId: p.id,
+                        canonicalId,
+                        reason: 'Legacy proposal signature verification failed during migration; signature preservation withheld',
+                      }),
+                    });
+                  }
+                }
+              }
+            } catch {}
+
             const existing = this.db.prepare(`SELECT id FROM projects WHERE id = ?`).get(canonicalId) as any;
             if (!existing) {
               this.db.prepare(`UPDATE projects SET id = ? WHERE id = ?`).run(canonicalId, p.id);
@@ -443,43 +536,6 @@ export class AutopsyDatabase {
             }
             this.db.prepare(`UPDATE checkpoints SET project_id = ? WHERE project_id = ?`).run(canonicalId, p.id);
             this.db.prepare(`UPDATE incidents SET project_id = ? WHERE project_id = ?`).run(canonicalId, p.id);
-
-            // Re-sign updated incidents and proposals to preserve HMAC validity
-            try {
-              const secret = getInstallationSecretKey();
-              const updatedIncidents = this.db.prepare(`SELECT id, user_report_text, created_at, row_signature FROM incidents WHERE project_id = ?`).all(canonicalId) as any[];
-              for (const incRow of updatedIncidents) {
-                if (incRow.row_signature) {
-                  const newIncSig = computeIncidentRowSignature(secret, {
-                    id: incRow.id,
-                    project_id: canonicalId,
-                    user_report_text: incRow.user_report_text || '',
-                    created_at: incRow.created_at,
-                  });
-                  this.db.prepare(`UPDATE incidents SET row_signature = ? WHERE id = ?`).run(newIncSig, incRow.id);
-                }
-              }
-
-              const updatedProposals = this.db.prepare(`
-                SELECT p.id, p.incident_id, p.file_changes_json, p.verification_status, p.created_at, p.row_signature
-                FROM repair_proposals p
-                JOIN incidents i ON i.id = p.incident_id
-                WHERE i.project_id = ?
-              `).all(canonicalId) as any[];
-              for (const propRow of updatedProposals) {
-                if (propRow.row_signature) {
-                  const newPropSig = computeProposalRowSignature(secret, {
-                    id: propRow.id,
-                    incident_id: propRow.incident_id,
-                    project_id: canonicalId,
-                    file_changes_json: propRow.file_changes_json,
-                    verification_status: propRow.verification_status,
-                    created_at: propRow.created_at,
-                  });
-                  this.db.prepare(`UPDATE repair_proposals SET row_signature = ? WHERE id = ?`).run(newPropSig, propRow.id);
-                }
-              }
-            } catch {}
 
             try {
               this.db.prepare(`UPDATE agent_events SET project_id = ? WHERE project_id = ?`).run(canonicalId, p.id);

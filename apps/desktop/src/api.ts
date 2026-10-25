@@ -618,10 +618,10 @@ export const api = {
   analysis: (incidentId: string) =>
     request<{ incident: Incident; analysis: IncidentAnalysis }>(`/api/incidents/${incidentId}/analysis`),
   proposals: (incidentId: string) => request<{ proposals: Proposal[] }>(`/api/incidents/${incidentId}/proposals`),
-  approve: (id: string, selectedFiles?: string[], forceOverrideWithRiskAck?: boolean) =>
+  approve: (id: string, selectedFiles?: string[], forceOverrideWithRiskAck?: boolean, repoPath?: string) =>
     request<{ success: boolean; proposal: Proposal; fingerprint: ApprovalFingerprint }>(
       `/api/proposals/${id}/approve`,
-      post({ selectedFiles, forceOverrideWithRiskAck })
+      post({ selectedFiles, forceOverrideWithRiskAck, repoPath })
     ),
   reject: (id: string) => request(`/api/proposals/${id}/reject`, post({})),
   apply: (id: string, repoPath: string, selectedFiles: string[]) =>

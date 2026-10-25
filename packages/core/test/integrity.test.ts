@@ -8,7 +8,7 @@ import { fileURLToPath } from 'node:url';
 import { DatabaseSync } from 'node:sqlite';
 import { CoreManager } from '../src/core-manager.js';
 import { AutopsyDatabase } from '../src/db/database.js';
-import { GENESIS_PREV_HASH } from '../src/utils/security.js';
+import { GENESIS_PREV_HASH, getInstallationSecretKey } from '../src/utils/security.js';
 
 describe('C-1: Audit Log Hash Chain (Tamper-Evident Integrity Tests)', () => {
   const tmpBase = fs.mkdtempSync(path.join(os.tmpdir(), 'autopsy-integrity-test-'));
@@ -1115,6 +1115,207 @@ console.log("ALL TESTS PASSED");
       'node',
       ['--input-type=module', '-e', restoreScript, dbPath, inc8.id, projA!.id],
       { env: { ...process.env, NODE_OPTIONS: '' } }
+    );
+  });
+
+  test('9. 마이그레이션 재서명 안전성: 중복 프로젝트 ID 통합 시 기존 서명 검증 통과한 정상 행만 canonicalId로 재서명되고 변조된 행은 TAMPERED로 유지되어 승인 차단', async () => {
+    const migrationDbPath = path.join(tmpBase, 'migration_test.db');
+    const secret = getInstallationSecretKey();
+
+    // 1. Initial run: establish canonical project for repoPath in migrationDb
+    const initialCore = new CoreManager({ customDbPath: migrationDbPath });
+    initialCore.confirmTestCommand(repoPath, 'node test.js');
+    initialCore.captureCheckpoint(repoPath, 'Migration Baseline', 'tester');
+    const canonicalProj = initialCore.getDatabase().getProjectByPath(repoPath);
+    assert.ok(canonicalProj);
+    const canonicalId = canonicalProj.id;
+    await initialCore.shutdown();
+
+    // 2. Separate Node process inserts duplicate legacy project and creates both valid and tampered rows
+    const legacyProjId = `proj_legacy_dup_${Date.now().toString(36)}`;
+    const legacyRootPath = canonicalProj.rootPath.includes('\\')
+      ? canonicalProj.rootPath.replace(/\\/g, '/')
+      : canonicalProj.rootPath.replace(/\//g, '\\');
+    const nowIso = new Date().toISOString();
+
+    const incValidId = `inc_mig_valid_${Date.now().toString(36)}`;
+    const incTamperedId = `inc_mig_tampered_${Date.now().toString(36)}`;
+    const propValidId = `prop_mig_valid_${Date.now().toString(36)}`;
+    const propTamperedId = `prop_mig_tampered_${Date.now().toString(36)}`;
+
+    const validPatchJson = JSON.stringify([
+      {
+        filePath: 'calculator.js',
+        replacements: [{ search: 'return a - b;', replace: 'return a + b;' }],
+      },
+    ]);
+    const tamperedPatchJson = JSON.stringify([
+      {
+        filePath: 'calculator.js',
+        replacements: [{ search: 'return a - b;', replace: 'return a * 999; // rogue backdoor' }],
+      },
+    ]);
+
+    const setupLegacyScript = `
+      import * as crypto from 'node:crypto';
+      import { DatabaseSync } from 'node:sqlite';
+
+      const [
+        ,
+        dbPath,
+        secret,
+        legacyProjId,
+        legacyRootPath,
+        incValidId,
+        incTamperedId,
+        propValidId,
+        propTamperedId,
+        validPatchJson,
+        tamperedPatchJson,
+        nowIso
+      ] = process.argv;
+
+      const db = new DatabaseSync(dbPath);
+      db.exec('PRAGMA foreign_keys = OFF;');
+
+      // 1. Insert duplicate legacy project with identical normalized root_path
+      db.prepare(\`
+        INSERT INTO projects (id, name, root_path, created_at)
+        VALUES (?, 'Legacy Duplicate Project', ?, ?)
+      \`).run(legacyProjId, legacyRootPath, nowIso);
+
+      // Helper to compute HMAC
+      function signIncident(id, projId, text, createdAt) {
+        const payload = [id, projId, text || '', createdAt].join('::');
+        return crypto.createHmac('sha256', secret).update(payload).digest('hex');
+      }
+
+      function signProposal(id, incId, projId, changesJson, status, createdAt) {
+        const payload = [id, incId, projId, changesJson, status, createdAt].join('::');
+        return crypto.createHmac('sha256', secret).update(payload).digest('hex');
+      }
+
+      // 2. Insert incValid (valid signature for legacyProjId)
+      const validText = 'Normal bug report text';
+      const sigIncValid = signIncident(incValidId, legacyProjId, validText, nowIso);
+      db.prepare(\`
+        INSERT INTO incidents (id, project_id, title, error_output, diff_summary, user_report_text, status, row_signature, created_at)
+        VALUES (?, ?, 'Valid incident', '', '', ?, 'OPEN', ?, ?)
+      \`).run(incValidId, legacyProjId, validText, sigIncValid, nowIso);
+
+      // 3. Insert incTampered (valid signature generated for original text, but user_report_text tampered directly)
+      const originalText = 'Pristine original text before unauthorized tamper';
+      const sigIncTampered = signIncident(incTamperedId, legacyProjId, originalText, nowIso);
+      db.prepare(\`
+        INSERT INTO incidents (id, project_id, title, error_output, diff_summary, user_report_text, status, row_signature, created_at)
+        VALUES (?, ?, 'Tampered incident', '', '', ?, 'OPEN', ?, ?)
+      \`).run(incTamperedId, legacyProjId, 'TAMPERED user_report_text injected directly in DB', sigIncTampered, nowIso);
+
+      // 4. Insert propValid (valid proposal and signature for legacyProjId)
+      const sigPropValid = signProposal(propValidId, incValidId, legacyProjId, validPatchJson, 'VERIFIED_PASS', nowIso);
+      db.prepare(\`
+        INSERT INTO repair_proposals (
+          id, incident_id, root_cause_analysis, patch_diff, touched_files_json,
+          file_changes_json, verification_status, verification_log, approval_status,
+          approval_readiness, created_at, row_signature
+        ) VALUES (?, ?, 'Valid rca', 'diff', ?, ?, 'VERIFIED_PASS', 'log', 'AWAITING_USER', 'READY_FOR_APPROVAL', ?, ?)
+      \`).run(
+        propValidId,
+        incValidId,
+        JSON.stringify(['calculator.js']),
+        validPatchJson,
+        nowIso,
+        sigPropValid
+      );
+
+      // 5. Insert propTampered (valid signature generated for validPatchJson, but file_changes_json tampered directly)
+      const sigPropTampered = signProposal(propTamperedId, incValidId, legacyProjId, validPatchJson, 'VERIFIED_PASS', nowIso);
+      db.prepare(\`
+        INSERT INTO repair_proposals (
+          id, incident_id, root_cause_analysis, patch_diff, touched_files_json,
+          file_changes_json, verification_status, verification_log, approval_status,
+          approval_readiness, created_at, row_signature
+        ) VALUES (?, ?, 'Tampered rca', 'diff', ?, ?, 'VERIFIED_PASS', 'log', 'AWAITING_USER', 'READY_FOR_APPROVAL', ?, ?)
+      \`).run(
+        propTamperedId,
+        incValidId,
+        JSON.stringify(['calculator.js']),
+        tamperedPatchJson,
+        nowIso,
+        sigPropTampered
+      );
+
+      db.close();
+    `;
+
+    execFileSync(
+      'node',
+      [
+        '--input-type=module',
+        '-e',
+        setupLegacyScript,
+        migrationDbPath,
+        secret,
+        legacyProjId,
+        legacyRootPath,
+        incValidId,
+        incTamperedId,
+        propValidId,
+        propTamperedId,
+        validPatchJson,
+        tamperedPatchJson,
+        nowIso,
+      ],
+      { env: { ...process.env, NODE_OPTIONS: '' } }
+    );
+
+    // 3. Re-open DB with CoreManager -> triggers migrateDeterministicProjectIds()
+    const coreMigrated = new CoreManager({ customDbPath: migrationDbPath });
+
+    // ① Check propTampered: migration did NOT re-sign it; approval MUST be rejected with SECURITY_TAMPER_DETECTED
+    let tamperedApproveErr: any = null;
+    try {
+      coreMigrated.approveProposal(propTamperedId, undefined, true);
+    } catch (err: any) {
+      tamperedApproveErr = err;
+    }
+    assert.ok(tamperedApproveErr, 'Tampered proposal must be blocked from approval even after migration');
+    assert.strictEqual(
+      tamperedApproveErr.code,
+      'SECURITY_TAMPER_DETECTED',
+      `Expected SECURITY_TAMPER_DETECTED, got: ${tamperedApproveErr.code}`
+    );
+    const tamperedPropRow = coreMigrated.getDatabase().getRepairProposal(propTamperedId);
+    assert.strictEqual(tamperedPropRow?.approvalStatus, 'TAMPERED', 'Tampered proposal must be transitioned to TAMPERED');
+
+    // ② Check propValid: migration properly re-signed it with canonicalId; approval & application MUST succeed
+    const approvedFp = coreMigrated.approveProposal(propValidId, undefined, true);
+    assert.ok(approvedFp, 'Valid migrated proposal must be approvable');
+
+    const applyResult = coreMigrated.applyApprovedRepair(repoPath, propValidId);
+    assert.strictEqual(applyResult.applied, true, 'Valid migrated proposal must apply cleanly');
+    const appliedPropRow = coreMigrated.getDatabase().getRepairProposal(propValidId);
+    assert.strictEqual(appliedPropRow?.approvalStatus, 'APPLIED');
+
+    // ③ Check incidents:
+    // incTampered must have integrityCode === 'TAMPERED' ('변조 의심')
+    const queriedTamperedInc = coreMigrated.getDatabase().getIncident(incTamperedId);
+    assert.ok(queriedTamperedInc);
+    assert.strictEqual(queriedTamperedInc.integrityCode, 'TAMPERED');
+    assert.strictEqual(queriedTamperedInc.integrityStatus, '변조 의심');
+
+    // incValid must have integrityCode === 'VALID' ('정상')
+    const queriedValidInc = coreMigrated.getDatabase().getIncident(incValidId);
+    assert.ok(queriedValidInc);
+    assert.strictEqual(queriedValidInc.integrityCode, 'VALID');
+    assert.strictEqual(queriedValidInc.integrityStatus, '정상');
+
+    // Clean up
+    await coreMigrated.shutdown();
+    fs.writeFileSync(
+      path.join(repoPath, 'calculator.js'),
+      'export function add(a, b) { return a - b; }\n',
+      'utf8'
     );
   });
 });

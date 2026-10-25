@@ -60,7 +60,7 @@ export default function IncidentAnalysisView({
     if (!window.confirm(`수정안 "${prop.id}"을 승인하고 적용하시겠습니까?`)) return;
     setBusy(true);
     try {
-      await api.approve(prop.id);
+      await api.approve(prop.id, undefined, false, repoPath);
       await api.apply(prop.id, repoPath, prop.touchedFiles);
       notify('ok', '수정안이 안전하게 적용되었습니다.');
       onChanged();

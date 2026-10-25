@@ -142,10 +142,10 @@ export function useAppData({ view, notify }: UseAppDataOptions) {
         sensitivePaths,
         riskThresholdLines,
       });
-      notify('ok', '민감 경로 및 작업 줄 수 임계치가 저장되었습니다.');
+      notify('ok', '민감 경로 및 위험도 임계값이 저장되었습니다.');
       load();
     } catch (err: any) {
-      notify('error', `설정 저장 실패: ${err.message}`);
+      notify('error', err.message);
     }
   };
 

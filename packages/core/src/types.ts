@@ -1,3 +1,5 @@
+import type { ScopeStats } from './localization/change-localizer.js';
+
 export type VerificationMode = 'AUTO' | 'MAIN_ONLY' | 'DEEP_PRIORITY';
 export type RiskLevel = 'LOW' | 'MEDIUM' | 'HIGH';
 export type OrchestrationReviewStatus =
@@ -162,6 +164,24 @@ export interface CheckpointChangesSummary {
   summary: string;
 }
 
+export interface ChangeScopeSummaryFunction {
+  filePath: string;
+  name: string;
+  startLine: number;
+  endLine: number;
+  kind?: string;
+}
+
+export interface ChangeScopeSummary {
+  baselineSha: string;
+  baselineRule: string;
+  changedFunctions: ChangeScopeSummaryFunction[];
+  neighborFunctionCount: number;
+  scopeStats: ScopeStats;
+  warnings: string[];
+  notice?: string;
+}
+
 export interface Incident {
   id: string;
   projectId: string;
@@ -196,6 +216,8 @@ export interface Incident {
   executionTrace?: ExecutionTraceStep[];
   threeLevelHealth?: ThreeLevelHealth;
   testExecutionNote?: string;
+  changeScopeSummary?: ChangeScopeSummary | string;
+  change_scope_summary?: ChangeScopeSummary | string;
   createdAt: string;
 }
 

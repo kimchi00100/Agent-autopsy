@@ -23,6 +23,8 @@
      * 빈 의도 항목이 있으면 `next_action.action`이 `CLARIFY_INTENT`로 안내되며, `missing_fields`에 명시된 누락 항목만 채팅창에서 사용자에게 질문하여 구체적인 답변을 확인하세요.
    * `title`: 핵심 요약
    * `agentName`: 본인 에이전트 식별자 (`antigravity`, `claude-code`, `codex` 등)
+   * **사건 등록 후 변경 범위 확인 (`get_change_scope`)**:
+     * 사건 등록 후 바뀐 함수 범위를 `get_change_scope`로 먼저 확인하라. 이 범위는 순위가 아니고 원인 확정도 아니다.
 
 3. **구조화된 next_action 지침 준수 및 승인 착각 방지 (Respect Structured next_action)**
    * 모든 Agent Autopsy 도구의 응답에는 `{ "actor", "action", "agent_should", "forbidden", "note?" }` 형식의 `next_action`이 포함되어 있습니다. 에이전트는 반드시 `next_action`의 지시를 따라야 합니다.

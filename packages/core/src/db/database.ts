@@ -137,6 +137,7 @@ export class AutopsyDatabase {
         cause_evidence_json TEXT DEFAULT '[]',
         reproduction_result_json TEXT,
         coverage_lines_json TEXT,
+        change_scope_summary_json TEXT,
         agent_name TEXT DEFAULT 'agent',
         session_id TEXT,
         test_execution_note TEXT,
@@ -289,6 +290,7 @@ export class AutopsyDatabase {
       `ALTER TABLE incidents ADD COLUMN user_report_text TEXT;`,
       `ALTER TABLE incidents ADD COLUMN intents_json TEXT;`,
       `ALTER TABLE incidents ADD COLUMN missing_intents_json TEXT DEFAULT '[]';`,
+      `ALTER TABLE incidents ADD COLUMN change_scope_summary_json TEXT;`,
       `ALTER TABLE repair_proposals ADD COLUMN rejection_reason TEXT;`,
     ];
 
@@ -724,10 +726,13 @@ export class AutopsyDatabase {
           reproduction_condition, verification_method, verification_type, user_confirmed_intent, user_confirmation_summary, cause_verdict,
           risk_level, risk_signals_json, orchestration_decision_json, test_execution_note,
           reproduction_result_json, coverage_lines_json, user_report_text, intents_json, missing_intents_json,
+          change_scope_summary_json,
           created_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `);
+      const rawScope = incident.changeScopeSummary || incident.change_scope_summary;
+      const scopeSummaryJson = rawScope ? (typeof rawScope === 'string' ? JSON.stringify(rawScope) : JSON.stringify(rawScope)) : null;
       stmt.run(
         incident.id,
         incident.projectId,
@@ -761,6 +766,7 @@ export class AutopsyDatabase {
         incident.userReportText || null,
         incident.intents ? JSON.stringify(incident.intents) : null,
         JSON.stringify(incident.missingIntents || []),
+        scopeSummaryJson,
         incident.createdAt
       );
     });
@@ -803,8 +809,33 @@ export class AutopsyDatabase {
       userReportText: row.user_report_text || undefined,
       intents: row.intents_json ? JSON.parse(row.intents_json) : undefined,
       missingIntents: row.missing_intents_json ? JSON.parse(row.missing_intents_json) : [],
+      changeScopeSummary: row.change_scope_summary_json
+        ? (() => {
+            try {
+              return JSON.parse(row.change_scope_summary_json);
+            } catch {
+              return row.change_scope_summary_json;
+            }
+          })()
+        : undefined,
+      change_scope_summary: row.change_scope_summary_json
+        ? (() => {
+            try {
+              return JSON.parse(row.change_scope_summary_json);
+            } catch {
+              return row.change_scope_summary_json;
+            }
+          })()
+        : undefined,
       createdAt: row.created_at,
     };
+  }
+
+  public updateIncidentChangeScopeSummary(id: string, summary: any): void {
+    this.runInImmediateTransaction(() => {
+      const stmt = this.db.prepare(`UPDATE incidents SET change_scope_summary_json = ? WHERE id = ?`);
+      stmt.run(JSON.stringify(summary), id);
+    });
   }
 
   public updateIncidentStatus(id: string, status: Incident['status']): void {
@@ -917,6 +948,24 @@ export class AutopsyDatabase {
       userReportText: row.user_report_text || undefined,
       intents: row.intents_json ? JSON.parse(row.intents_json) : undefined,
       missingIntents: row.missing_intents_json ? JSON.parse(row.missing_intents_json) : [],
+      changeScopeSummary: row.change_scope_summary_json
+        ? (() => {
+            try {
+              return JSON.parse(row.change_scope_summary_json);
+            } catch {
+              return row.change_scope_summary_json;
+            }
+          })()
+        : undefined,
+      change_scope_summary: row.change_scope_summary_json
+        ? (() => {
+            try {
+              return JSON.parse(row.change_scope_summary_json);
+            } catch {
+              return row.change_scope_summary_json;
+            }
+          })()
+        : undefined,
       createdAt: row.created_at,
     }));
   }

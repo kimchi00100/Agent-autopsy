@@ -283,7 +283,12 @@ import {
    * Ensures project is registered in DB and returns it.
    */
   export function ensureProject(ctx: CoreContext, repoPath: string, testCommand?: string): Project {
-    const rootPath = ctx.gitEngine.getRepoRoot(repoPath);
+    let rootPath: string;
+    try {
+      rootPath = ctx.gitEngine.getRepoRoot(repoPath);
+    } catch {
+      rootPath = path.resolve(repoPath);
+    }
     const deterministicId = generateDeterministicProjectId(rootPath);
     let project = ctx.db.getProjectByPath(rootPath);
 
@@ -723,13 +728,16 @@ import {
    * 빌드/테스트 에러(\`AssertionError\`, \`TypeError\` 등)가 발생하거나, **코드는 정상인데 사용자가 의도한 기능이 작동하지 않는 경우(기능 불일치)** 즉시 \`collect_incident_bundle\` 도구를 호출하세요.
    * **사용자 신고 원문 및 구조화된 의도 전달**:
      * 사용자의 말을 자의적으로 짐작해 코드를 바로 고쳐서는 안 됩니다.
-     * \`userReportText\`: 사용자가 채팅이나 지시서에 작성한 원문을 그대로 넘기세요.
+     * \`userReportText\`: 사용자가 채팅이나 지시서에 작성한 원문을 그대로 넘기세요. 원문이 누락되면 출처 판정이 불가능하므로 \`action: 'PROVIDE_USER_REPORT'\`가 안내됩니다.
      * 4가지 의도 필드(\`expectedBehavior\`, \`observedBehavior\`, \`reproductionCondition\`, \`verificationMethod\`)를 함께 전달하면 출처(\`USER_QUOTE\`, \`AI_INFERRED\`, \`MISSING\`)가 자동 판별됩니다.
-   * **누락 항목 되묻기 (\`next_action.action: 'CLARIFY_INTENT'\`)**:
-     * 네 가지 의도가 모두 채워져 있으면 질문 없이 사건이 즉시 등록되고 다음 단계로 진행됩니다.
-     * 빈 항목이 있으면 \`next_action.action\`이 \`CLARIFY_INTENT\`로 안내되며, \`missing_fields\`에 명시된 누락 항목만 채팅창에서 사용자에게 질문하여 구체적인 답변을 확인하세요.
+   * **누락 항목 되묻기 (\`next_action.action: 'CLARIFY_INTENT'\` 또는 \`'PROVIDE_USER_REPORT'\`)**:
+     * \`userReportText\`가 없으면 \`next_action.action\`이 \`PROVIDE_USER_REPORT\`로 안내되며, 사용자에게 원문을 요청하여 확인한 후 다시 등록해야 합니다.
+     * 원문이 있고 네 가지 의도가 모두 채워져 있으면 질문 없이 사건이 즉시 등록되고 다음 단계로 진행됩니다.
+     * 빈 의도 항목이 있으면 \`next_action.action\`이 \`CLARIFY_INTENT\`로 안내되며, \`missing_fields\`에 명시된 누락 항목만 채팅창에서 사용자에게 질문하여 구체적인 답변을 확인하세요.
    * \`title\`: 핵심 요약
    * \`agentName\`: 본인 에이전트 식별자 (\`antigravity\`, \`claude-code\`, \`codex\` 등)
+   * **사건 등록 후 변경 범위 확인 (\`get_change_scope\`)**:
+     * 사건 등록 후 바뀐 함수 범위를 \`get_change_scope\`로 먼저 확인하라. 이 범위는 순위가 아니고 원인 확정도 아니다.
 
 3. **구조화된 next_action 지침 준수 및 승인 착각 방지 (Respect Structured next_action)**
    * 모든 Agent Autopsy 도구의 응답에는 \`{ "actor", "action", "agent_should", "forbidden", "note?" }\` 형식의 \`next_action\`이 포함되어 있습니다. 에이전트는 반드시 \`next_action\`의 지시를 따라야 합니다.
@@ -765,6 +773,7 @@ import {
    * 사용자가 대시보드에서 수정안을 승인하기 전에는 \`apply_approved_repair\` 도구를 호출하지 마세요. (서버에서 거부됩니다)
    * 사용자가 승인을 완료했거나, 대시보드에서 직접 패치를 적용할 때까지 대기하세요.
    * 패치 적용 후에는 워킹 트리에 수정된 상태로 남겨두어 사용자가 최종 확인 후 원하는 메시지로 직접 Git 커밋할 수 있도록 하세요.
+
 `;
   }
 

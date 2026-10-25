@@ -4,11 +4,13 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 import * as fs from 'node:fs';
 import { execSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 import { extractFunctions } from '../src/localization/function-extractor.js';
 import { locateChangeScope, locateCandidates } from '../src/localization/change-localizer.js';
 import { packChangeScope, packChangeScopeFromScope } from '../src/localization/context-packer.js';
 import { GitEngine } from '../src/git/git-engine.js';
 import { CoreManager } from '../src/core-manager.js';
+import { getAgentsMdTemplate } from '../src/core/project.js';
 
 describe('B-1a: Function Boundary Extractor (function-extractor)', () => {
   test('Python extraction with decorators, class methods, and nested functions', async () => {
@@ -2547,6 +2549,252 @@ describe('B-1c: AI Delivery Package (context-packer)', () => {
       fs.rmSync(repo, { recursive: true, force: true });
       fs.rmSync(tempEnv, { recursive: true, force: true });
     }
+  });
+});
+
+describe('B-1d: Incident Flow Integration with Change Scope', () => {
+  test('1. Incident collection response contains change_scope_summary with exact function name and line ranges', async () => {
+    const tempEnv = fs.mkdtempSync(path.join(os.tmpdir(), 'autopsy_flow_env_1_'));
+    const oldData = process.env.AUTOPSY_DATA_DIR;
+    const oldCache = process.env.AUTOPSY_CACHE_DIR;
+    process.env.AUTOPSY_DATA_DIR = path.join(tempEnv, 'data');
+    process.env.AUTOPSY_CACHE_DIR = path.join(tempEnv, 'cache');
+
+    const repo = createTempGitRepo();
+    let core: CoreManager | undefined;
+    try {
+      fs.mkdirSync(path.join(repo, 'src'), { recursive: true });
+      fs.writeFileSync(
+        path.join(repo, 'src', 'billing.js'),
+        'function calculateDiscount(user, amount) {\n  return 0;\n}\n\nmodule.exports = { calculateDiscount };\n'
+      );
+      execSync('git add . && git commit -m "initial commit"', { cwd: repo, stdio: 'ignore' });
+
+      core = new CoreManager();
+      core.ensureProject(repo);
+
+      // Modify the function
+      fs.writeFileSync(
+        path.join(repo, 'src', 'billing.js'),
+        'function calculateDiscount(user, amount) {\n  return amount * 0.1;\n}\n\nmodule.exports = { calculateDiscount };\n'
+      );
+
+      const inc = await core.collectIncidentBundle(repo, {
+        title: 'Discount rate calculation error',
+        userReportText: '할인율 계산 시 calculateDiscount 함수에서 10% 할인이 제대로 적용되지 않습니다.',
+        agentName: 'antigravity',
+        expectedBehavior: 'amount * 0.1 할인 반환',
+        observedBehavior: '0 반환',
+        reproductionCondition: 'calculateDiscount(user, 1000) 호출',
+        verificationMethod: '결과값 검증',
+        userConfirmedIntent: true,
+      });
+
+      assert.ok(inc.change_scope_summary, 'change_scope_summary must exist on incident');
+      assert.ok(inc.changeScopeSummary, 'changeScopeSummary must exist on incident');
+      assert.strictEqual(typeof inc.change_scope_summary, 'object');
+
+      const summary = inc.change_scope_summary as any;
+      assert.ok(summary.baselineSha, 'baselineSha must exist');
+      assert.ok(summary.baselineRule, 'baselineRule must exist');
+      assert.ok(Array.isArray(summary.warnings), 'warnings must be an array');
+      assert.ok(summary.scopeStats, 'scopeStats must exist');
+
+      assert.strictEqual(summary.changedFunctions.length, 1);
+      const fn = summary.changedFunctions[0];
+      assert.strictEqual(fn.name, 'calculateDiscount');
+      assert.strictEqual(fn.filePath, 'src/billing.js');
+      assert.strictEqual(fn.startLine, 1);
+      assert.strictEqual(fn.endLine, 3);
+    } finally {
+      if (core) await core.shutdown();
+      if (oldData) process.env.AUTOPSY_DATA_DIR = oldData;
+      else delete process.env.AUTOPSY_DATA_DIR;
+      if (oldCache) process.env.AUTOPSY_CACHE_DIR = oldCache;
+      else delete process.env.AUTOPSY_CACHE_DIR;
+      fs.rmSync(repo, { recursive: true, force: true });
+      fs.rmSync(tempEnv, { recursive: true, force: true });
+    }
+  });
+
+  test('2. Failure handling on non-git folder succeeds and leaves warning string in change_scope_summary', async () => {
+    const tempEnv = fs.mkdtempSync(path.join(os.tmpdir(), 'autopsy_flow_env_2_'));
+    const oldData = process.env.AUTOPSY_DATA_DIR;
+    const oldCache = process.env.AUTOPSY_CACHE_DIR;
+    process.env.AUTOPSY_DATA_DIR = path.join(tempEnv, 'data');
+    process.env.AUTOPSY_CACHE_DIR = path.join(tempEnv, 'cache');
+
+    const nonGitDir = fs.mkdtempSync(path.join(os.tmpdir(), 'autopsy_nongit_dir_'));
+    let core: CoreManager | undefined;
+    try {
+      fs.writeFileSync(path.join(nonGitDir, 'script.js'), 'console.log("hello");\n');
+
+      core = new CoreManager();
+      const inc = await core.collectIncidentBundle(nonGitDir, {
+        title: 'Non-git project test',
+        userReportText: 'git이 아닌 폴더에서 사건 번들 수집 테스트',
+        agentName: 'antigravity',
+      });
+
+      // Incident registration MUST succeed
+      assert.ok(inc.id, 'Incident ID must be generated');
+      assert.strictEqual(inc.title, 'Non-git project test');
+      assert.strictEqual(inc.status, 'OPEN');
+
+      // change_scope_summary must contain warning string
+      assert.ok(inc.change_scope_summary, 'change_scope_summary must exist');
+      assert.strictEqual(typeof inc.change_scope_summary, 'string', 'change_scope_summary should be a warning string');
+      const warningText = inc.change_scope_summary as string;
+      assert.ok(
+        warningText.includes('경고') || warningText.includes('실패'),
+        'Warning string should indicate failure'
+      );
+    } finally {
+      if (core) await core.shutdown();
+      if (oldData) process.env.AUTOPSY_DATA_DIR = oldData;
+      else delete process.env.AUTOPSY_DATA_DIR;
+      if (oldCache) process.env.AUTOPSY_CACHE_DIR = oldCache;
+      else delete process.env.AUTOPSY_CACHE_DIR;
+      fs.rmSync(nonGitDir, { recursive: true, force: true });
+      fs.rmSync(tempEnv, { recursive: true, force: true });
+    }
+  });
+
+  test('3. 30-cap limit on changed functions triggers truncation notice', async () => {
+    const tempEnv = fs.mkdtempSync(path.join(os.tmpdir(), 'autopsy_flow_env_3_'));
+    const oldData = process.env.AUTOPSY_DATA_DIR;
+    const oldCache = process.env.AUTOPSY_CACHE_DIR;
+    process.env.AUTOPSY_DATA_DIR = path.join(tempEnv, 'data');
+    process.env.AUTOPSY_CACHE_DIR = path.join(tempEnv, 'cache');
+
+    const repo = createTempGitRepo();
+    let core: CoreManager | undefined;
+    try {
+      // Create 35 functions
+      const funcs: string[] = [];
+      for (let i = 1; i <= 35; i++) {
+        funcs.push(`function func_${i}() {\n  return 0;\n}\n`);
+      }
+      fs.writeFileSync(path.join(repo, 'many.js'), funcs.join('\n'));
+      execSync('git add . && git commit -m "35 functions baseline"', { cwd: repo, stdio: 'ignore' });
+
+      core = new CoreManager();
+      core.ensureProject(repo);
+
+      // Modify all 35 functions
+      const modified: string[] = [];
+      for (let i = 1; i <= 35; i++) {
+        modified.push(`function func_${i}() {\n  return ${i};\n}\n`);
+      }
+      fs.writeFileSync(path.join(repo, 'many.js'), modified.join('\n'));
+
+      const inc = await core.collectIncidentBundle(repo, {
+        title: '35 functions changed',
+        userReportText: '35개 함수가 동시에 변경되었습니다.',
+        agentName: 'antigravity',
+      });
+
+      assert.ok(inc.change_scope_summary && typeof inc.change_scope_summary === 'object');
+      const summary = inc.change_scope_summary as any;
+
+      // Exactly 30 functions in changedFunctions
+      assert.strictEqual(summary.changedFunctions.length, 30, 'Must cap at 30 functions');
+
+      // Notice for remaining 5
+      const expectedNotice = '나머지 5개는 get_change_scope로 확인';
+      assert.strictEqual(summary.notice, expectedNotice, 'notice must state remaining 5 functions');
+      assert.ok(
+        summary.warnings.some((w: string) => w.includes(expectedNotice)),
+        'warnings must include remaining notice'
+      );
+    } finally {
+      if (core) await core.shutdown();
+      if (oldData) process.env.AUTOPSY_DATA_DIR = oldData;
+      else delete process.env.AUTOPSY_DATA_DIR;
+      if (oldCache) process.env.AUTOPSY_CACHE_DIR = oldCache;
+      else delete process.env.AUTOPSY_CACHE_DIR;
+      fs.rmSync(repo, { recursive: true, force: true });
+      fs.rmSync(tempEnv, { recursive: true, force: true });
+    }
+  });
+
+  test('4. next_action retains action RUN_REPRODUCTION_OR_PROPOSE_REPAIR and agent_should guides get_change_scope', async () => {
+    const tempEnv = fs.mkdtempSync(path.join(os.tmpdir(), 'autopsy_flow_env_4_'));
+    const oldData = process.env.AUTOPSY_DATA_DIR;
+    const oldCache = process.env.AUTOPSY_CACHE_DIR;
+    process.env.AUTOPSY_DATA_DIR = path.join(tempEnv, 'data');
+    process.env.AUTOPSY_CACHE_DIR = path.join(tempEnv, 'cache');
+
+    const repo = createTempGitRepo();
+    let core: CoreManager | undefined;
+    try {
+      fs.writeFileSync(path.join(repo, 'calc.js'), 'function calc() { return 1; }\n');
+      execSync('git add . && git commit -m "init"', { cwd: repo, stdio: 'ignore' });
+
+      core = new CoreManager();
+      const inc = await core.collectIncidentBundle(repo, {
+        title: 'Calculation error',
+        userReportText: '기대 동작: 정상 합산, 실제 결과: 0 반환, 재현: calc() 호출, 검증: 단위 테스트',
+        agentName: 'antigravity',
+        expectedBehavior: '정상 합산',
+        observedBehavior: '0 반환',
+        reproductionCondition: 'calc() 호출',
+        verificationMethod: '단위 테스트',
+        userConfirmedIntent: true,
+      });
+
+      const nextAction = core.getIncidentNextAction(inc);
+      assert.strictEqual(nextAction.actor, 'AGENT');
+      assert.strictEqual(nextAction.action, 'RUN_REPRODUCTION_OR_PROPOSE_REPAIR');
+      assert.ok(nextAction.agent_should.includes('get_change_scope'));
+      assert.ok(nextAction.agent_should.includes('기준 시점 이후 바뀐 함수의 코드'));
+      assert.ok(nextAction.agent_should.includes('저장소 전체를 처음부터 읽지 마세요'));
+      // No ranking or confirmed cause expressions
+      assert.ok(!nextAction.agent_should.includes('1위'));
+      assert.ok(!nextAction.agent_should.includes('순위'));
+      assert.ok(!nextAction.agent_should.includes('확정 원인'));
+    } finally {
+      if (core) await core.shutdown();
+      if (oldData) process.env.AUTOPSY_DATA_DIR = oldData;
+      else delete process.env.AUTOPSY_DATA_DIR;
+      if (oldCache) process.env.AUTOPSY_CACHE_DIR = oldCache;
+      else delete process.env.AUTOPSY_CACHE_DIR;
+      fs.rmSync(repo, { recursive: true, force: true });
+      fs.rmSync(tempEnv, { recursive: true, force: true });
+    }
+  });
+
+  test('5. AGENTS.md and getAgentsMdTemplate() get_change_scope guidance phrasing match strictly', () => {
+    let cur = path.dirname(fileURLToPath(import.meta.url));
+    let agentsMdPath = '';
+    for (let i = 0; i < 6; i++) {
+      const candidate = path.join(cur, 'AGENTS.md');
+      if (fs.existsSync(candidate)) {
+        agentsMdPath = candidate;
+        break;
+      }
+      cur = path.dirname(cur);
+    }
+    assert.ok(agentsMdPath, 'AGENTS.md path must be found');
+    const agentsMdContent = fs.readFileSync(agentsMdPath, 'utf8').trim();
+    const templateContent = getAgentsMdTemplate().trim();
+
+    const requiredPhrase = '사건 등록 후 바뀐 함수 범위를 `get_change_scope`로 먼저 확인하라. 이 범위는 순위가 아니고 원인 확정도 아니다.';
+    assert.ok(
+      agentsMdContent.includes(requiredPhrase) ||
+        (agentsMdContent.includes('사건 등록 후 바뀐 함수 범위를') &&
+          agentsMdContent.includes('get_change_scope') &&
+          agentsMdContent.includes('이 범위는 순위가 아니고 원인 확정도 아니다.')),
+      'AGENTS.md must contain the required phrase'
+    );
+    assert.ok(
+      templateContent.includes(requiredPhrase) ||
+        (templateContent.includes('사건 등록 후 바뀐 함수 범위를') &&
+          templateContent.includes('get_change_scope') &&
+          templateContent.includes('이 범위는 순위가 아니고 원인 확정도 아니다.')),
+      'getAgentsMdTemplate() must contain the required phrase'
+    );
+    assert.strictEqual(templateContent, agentsMdContent, 'getAgentsMdTemplate() must strictly match AGENTS.md');
   });
 });
 

@@ -15,7 +15,10 @@ import {
   ThreeLevelHealth,
   HealthLevelStatus,
   CauseVerdict,
+  ChangeScopeSummary,
+  ChangeScopeSummaryFunction,
 } from '../types.js';
+import { locateChangeScope } from '../localization/change-localizer.js';
 import { analyzeIncident, IncidentAnalysis } from '../analysis/analyzer.js';
 import { parseUnifiedDiffFiles, firstMeaningfulLine } from './helpers.js';
 
@@ -158,10 +161,14 @@ export async function collectIncidentBundle(ctx: CoreContext,
 
     // Calculate diff against latest checkpoint or HEAD
     let diffSummary = '';
-    if (latestCheckpoint && latestCheckpoint.gitHeadSha) {
-      diffSummary = ctx.gitEngine.getDiff(project.rootPath, latestCheckpoint.gitHeadSha);
-    } else {
-      diffSummary = ctx.gitEngine.getDiff(project.rootPath);
+    try {
+      if (latestCheckpoint && latestCheckpoint.gitHeadSha) {
+        diffSummary = ctx.gitEngine.getDiff(project.rootPath, latestCheckpoint.gitHeadSha);
+      } else {
+        diffSummary = ctx.gitEngine.getDiff(project.rootPath);
+      }
+    } catch {
+      diffSummary = '';
     }
 
     let finalErrorOutput = errorOutput || '';
@@ -287,6 +294,67 @@ export async function collectIncidentBundle(ctx: CoreContext,
     };
 
     ctx.db.insertIncident(incident);
+
+    let changeScopeSummary: ChangeScopeSummary | string;
+    try {
+      const scopeResult = await locateChangeScope(ctx, {
+        incidentId: incident.id,
+        repoPath: project.rootPath,
+      });
+
+      const hasFailureWarning =
+        scopeResult.warnings &&
+        scopeResult.warnings.some(
+          (w) =>
+            w.includes('실패') ||
+            w.includes('Not a git repository') ||
+            w.includes('not a git repository') ||
+            w.includes('확인할 수 없습니다')
+        );
+
+      if (hasFailureWarning && scopeResult.changedFunctions.length === 0 && scopeResult.totalChangedFiles === 0) {
+        changeScopeSummary = `경고: 변경 범위 계산 실패 (${scopeResult.warnings.join('; ')})`;
+      } else {
+        const maxLimit = 30;
+        const totalCount = scopeResult.changedFunctions.length;
+        const isTruncated = totalCount > maxLimit;
+        const sliced = scopeResult.changedFunctions.slice(0, maxLimit);
+
+        const changedFunctions: ChangeScopeSummaryFunction[] = sliced.map((fn) => ({
+          filePath: fn.filePath,
+          name: fn.name,
+          startLine: fn.startLine,
+          endLine: fn.endLine,
+          kind: fn.kind,
+        }));
+
+        const warnings = [...scopeResult.warnings];
+        let notice: string | undefined;
+        if (isTruncated) {
+          const remaining = totalCount - maxLimit;
+          notice = `나머지 ${remaining}개는 get_change_scope로 확인`;
+          warnings.push(notice);
+        }
+
+        changeScopeSummary = {
+          baselineSha: scopeResult.baselineSha,
+          baselineRule: scopeResult.baselineRule,
+          changedFunctions,
+          neighborFunctionCount: scopeResult.neighborFunctions.length,
+          scopeStats: scopeResult.scopeStats,
+          warnings,
+          ...(notice ? { notice } : {}),
+        };
+      }
+    } catch (err: any) {
+      changeScopeSummary = `경고: 변경 범위 계산 실패 (${err?.message || String(err)})`;
+    }
+
+    incident.changeScopeSummary = changeScopeSummary;
+    incident.change_scope_summary = changeScopeSummary;
+    try {
+      ctx.db.updateIncidentChangeScopeSummary(incident.id, changeScopeSummary);
+    } catch {}
     ctx.emitChange('incident_created', incident);
     return incident;
   }
@@ -343,7 +411,8 @@ export async function collectIncidentBundle(ctx: CoreContext,
     return {
       actor: 'AGENT',
       action: 'RUN_REPRODUCTION_OR_PROPOSE_REPAIR',
-      agent_should: '네 가지 의도가 모두 확인되었습니다. run_reproduction으로 재현 테스트를 실행하거나 propose_and_verify_repair로 격리 검증을 진행하세요.',
+      agent_should:
+        '네 가지 의도가 모두 확인되었습니다. 먼저 get_change_scope로 기준 시점 이후 바뀐 함수의 코드를 확인하고 사용자 원문과 비교하세요. 그 다음 run_reproduction으로 재현 테스트를 실행하거나 propose_and_verify_repair로 격리 검증을 진행하세요. 저장소 전체를 처음부터 읽지 마세요.',
       forbidden: ['원본 파일 직접 수정', 'DB 직접 수정'],
     };
   }

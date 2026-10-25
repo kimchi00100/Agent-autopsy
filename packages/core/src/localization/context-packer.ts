@@ -5,6 +5,7 @@ import {
   ChangeScopeResult,
   ChangedFunction,
   locateChangeScope,
+  CheckpointSummary,
 } from './change-localizer.js';
 import { Incident } from '../types.js';
 
@@ -17,10 +18,12 @@ export interface PackagedChangeScope {
   truncationStep: number;
   truncationReason?: string;
   characterCount: number;
+  olderCheckpoints?: CheckpointSummary[];
 }
 
 export interface PackChangeScopeOptions {
   maxCharacters?: number;
+  baselineCheckpointId?: string;
 }
 
 function getLanguageForExt(filePath: string): { lang: string; commentPrefix: string } {
@@ -167,7 +170,7 @@ export function packChangeScopeFromScope(
 
     // 1. Notice
     parts.push(
-      '아래는 기준 시점 이후 바뀐 함수와 그 호출 관계에 있는 함수다. 순위가 아니며, 실행 증거로 확인된 원인도 아니다. 저장소 전체를 처음부터 읽지 말고, 먼저 이 범위의 함수들을 사용자 원문(userReportText)과 비교하라. 큰 변경이 버그라는 뜻이 아니다. 계산식, 비교 연산자, 빠진 필드처럼 작은 변경도 확인하라.'
+      '아래는 기준 시점 이후 바뀐 함수와 그 호출 관계에 있는 함수다. 순위가 아니며, 실행 증거로 확인된 원인도 아니다. 저장소 전체를 처음부터 읽지 말고, 먼저 이 범위의 함수들을 사용자 원문(userReportText)과 비교하라. 큰 변경이 버그라는 뜻이 아니다. 계산식, 비교 연산자, 빠진 필드처럼 작은 변경도 확인하라. 바뀐 함수가 신고 내용과 무관해 보이면, 기준 시점이 버그가 생긴 뒤일 수 있다. baseline_checkpoint_id로 더 이전 체크포인트를 지정해 범위를 넓히거나, 범위에 갇히지 말고 재현 테스트로 확인하라.'
     );
     parts.push('');
 
@@ -215,6 +218,15 @@ export function packChangeScopeFromScope(
       );
     }
     parts.push('');
+
+    // 3-B. Older Checkpoints for manual expansion
+    if (scopeResult.olderCheckpoints && scopeResult.olderCheckpoints.length > 0) {
+      parts.push('[더 이전 체크포인트 목록 (baseline_checkpoint_id로 지정 가능)]');
+      for (const ocp of scopeResult.olderCheckpoints) {
+        parts.push(`- ${ocp.id} ("${ocp.label}", ${ocp.createdAt})`);
+      }
+      parts.push('');
+    }
 
     // 4. Changed Functions
     parts.push(`[직접 변경된 함수 목록] (${scopeResult.changedFunctions.length}개)`);
@@ -341,6 +353,7 @@ export function packChangeScopeFromScope(
     truncationStep: finalStep,
     truncationReason: finalReason,
     characterCount: text.length,
+    olderCheckpoints: scopeResult.olderCheckpoints,
   };
 }
 
@@ -358,6 +371,10 @@ export async function packChangeScope(
     }
   }
 
-  const scopeResult = await locateChangeScope(ctx, { incidentId, repoPath });
+  const scopeResult = await locateChangeScope(ctx, {
+    incidentId,
+    repoPath,
+    baselineCheckpointId: options?.baselineCheckpointId,
+  });
   return packChangeScopeFromScope(incident, scopeResult, repoPath, options);
 }

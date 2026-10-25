@@ -1,4 +1,8 @@
-import type { ScopeStats } from './localization/change-localizer.js';
+import type {
+  ScopeStats,
+  ScopeExpansionInfo,
+  CheckpointSummary,
+} from './localization/change-localizer.js';
 
 export type VerificationMode = 'AUTO' | 'MAIN_ONLY' | 'DEEP_PRIORITY';
 export type RiskLevel = 'LOW' | 'MEDIUM' | 'HIGH';
@@ -180,6 +184,8 @@ export interface ChangeScopeSummary {
   scopeStats: ScopeStats;
   warnings: string[];
   notice?: string;
+  olderCheckpoints?: CheckpointSummary[];
+  expansion?: ScopeExpansionInfo;
 }
 
 export interface Incident {

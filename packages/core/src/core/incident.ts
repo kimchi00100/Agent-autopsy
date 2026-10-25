@@ -344,6 +344,8 @@ export async function collectIncidentBundle(ctx: CoreContext,
           scopeStats: scopeResult.scopeStats,
           warnings,
           ...(notice ? { notice } : {}),
+          ...(scopeResult.olderCheckpoints ? { olderCheckpoints: scopeResult.olderCheckpoints } : {}),
+          ...(scopeResult.expansion ? { expansion: scopeResult.expansion } : {}),
         };
       }
     } catch (err: any) {
@@ -411,7 +413,7 @@ export async function collectIncidentBundle(ctx: CoreContext,
       actor: 'AGENT',
       action: 'RUN_REPRODUCTION_OR_PROPOSE_REPAIR',
       agent_should:
-        '네 가지 의도가 모두 확인되었습니다. 먼저 get_change_scope로 기준 시점 이후 바뀐 함수의 코드를 확인하고 사용자 원문과 비교하세요. 그 다음 run_reproduction으로 재현 테스트를 실행하거나 propose_and_verify_repair로 격리 검증을 진행하세요. 저장소 전체를 처음부터 읽지 마세요.',
+        '네 가지 의도가 모두 확인되었습니다. 먼저 get_change_scope로 기준 시점 이후 바뀐 함수의 코드를 확인하고 사용자 원문과 비교하세요. 바뀐 함수가 신고 내용과 무관해 보이면, 기준 시점이 버그가 생긴 뒤일 수 있다. baseline_checkpoint_id로 더 이전 체크포인트를 지정해 범위를 넓히거나, 범위에 갇히지 말고 재현 테스트로 확인하라. 그 다음 run_reproduction으로 재현 테스트를 실행하거나 propose_and_verify_repair로 격리 검증을 진행하세요. 저장소 전체를 처음부터 읽지 마세요.',
       forbidden: ['원본 파일 직접 수정', 'DB 직접 수정'],
     };
   }

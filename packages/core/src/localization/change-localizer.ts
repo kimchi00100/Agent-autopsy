@@ -62,9 +62,26 @@ export interface ScopeStats {
   reductionRatio: number;
 }
 
+export interface ScopeExpansionInfo {
+  originalCheckpoint?: { id: string; label: string; createdAt: string };
+  usedCheckpoint?: { id: string; label: string; createdAt: string };
+  expansionStepCount: number;
+}
+
+export interface CheckpointSummary {
+  id: string;
+  label: string;
+  createdAt: string;
+}
+
 export interface ChangeScopeResult {
   baselineSha: string;
-  baselineRule: 'INCIDENT_BASE_CHECKPOINT' | 'LAST_GOOD_CHECKPOINT' | 'NO_CHECKPOINT_HEAD' | 'EXPLICIT_BASELINE';
+  baselineRule:
+    | 'INCIDENT_BASE_CHECKPOINT'
+    | 'LAST_GOOD_CHECKPOINT'
+    | 'NO_CHECKPOINT_HEAD'
+    | 'EXPLICIT_BASELINE'
+    | 'EXPANDED_TO_OLDER_CHECKPOINT';
   warnings: string[];
   totalChangedFiles: number;
   analyzedFiles: number;
@@ -73,12 +90,15 @@ export interface ChangeScopeResult {
   topLevelChanges: TopLevelChange[];
   hunks: HunkCandidate[];
   scopeStats: ScopeStats;
+  olderCheckpoints?: CheckpointSummary[];
+  expansion?: ScopeExpansionInfo;
 }
 
 export interface LocateChangeScopeOptions {
   incidentId?: string;
   repoPath?: string;
   baselineSha?: string;
+  baselineCheckpointId?: string;
 }
 
 // Aliases for backwards compatibility
@@ -133,7 +153,6 @@ function parseGitDiffU0(diffOutput: string): Map<string, ParsedDiffFile> {
         files.set(currentFile, { filePath: currentFile, addedLines: [], deletedTraces: [] });
       }
     } else if (line.startsWith('@@ ') && currentFile) {
-      // @@ -oldStart[,oldCount] +newStart[,newCount] @@
       const match = line.match(/^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/);
       if (match) {
         const oldCount = match[2] !== undefined ? parseInt(match[2], 10) : 1;
@@ -166,49 +185,97 @@ export async function locateChangeScope(
   let baselineSha = options.baselineSha || '';
   let baselineRule: ChangeScopeResult['baselineRule'] = 'EXPLICIT_BASELINE';
 
-  // 1. Resolve Repo Path and Baseline SHA
+  let projectId: string | undefined;
+  let incident: any = null;
+
   if (options.incidentId && ctx.db) {
-    const incident = ctx.db.getIncident(options.incidentId);
+    incident = ctx.db.getIncident(options.incidentId);
     if (incident) {
+      projectId = incident.projectId;
       const project = ctx.db.getProject(incident.projectId);
       if (project) {
         repoPath = project.rootPath;
       }
-      // Rule 1: baseCheckpointId worktreeCommitSha -> gitHeadSha
-      if (incident.baseCheckpointId) {
-        const cp = ctx.db.getCheckpoint(incident.baseCheckpointId);
-        if (cp) {
-          baselineSha = cp.worktreeCommitSha || cp.gitHeadSha || '';
-          if (baselineSha) baselineRule = 'INCIDENT_BASE_CHECKPOINT';
-        }
-      }
-      // Rule 2: Good checkpoint like getChangesSinceGoodCheckpoint
-      if (!baselineSha && project) {
-        const checkpoints = ctx.db.listCheckpoints(project.id);
-        const goodCp =
-          checkpoints.find((cp: any) => cp.gitStashSha === null && cp.changedFiles.length === 0) ||
-          checkpoints[0];
-        if (goodCp) {
-          baselineSha = goodCp.worktreeCommitSha || goodCp.gitHeadSha || '';
-          if (baselineSha) baselineRule = 'LAST_GOOD_CHECKPOINT';
+    }
+  }
+
+  if (repoPath && !projectId && ctx.db) {
+    if (ctx.ensureProject) {
+      try {
+        const p = ctx.ensureProject(repoPath);
+        projectId = p.id;
+      } catch {}
+    }
+    if (!projectId && ctx.db.getProjectByPath) {
+      const p = ctx.db.getProjectByPath(repoPath);
+      projectId = p?.id;
+    }
+  }
+
+  let originalCheckpoint: any = null;
+  let disableAutoExpand = false;
+
+  // 1. Resolve Repo Path and Baseline SHA
+  if (options.baselineCheckpointId) {
+    disableAutoExpand = true;
+    if (!ctx.db) {
+      throw new Error(`DB가 연결되지 않아 체크포인트 ID "${options.baselineCheckpointId}"를 조회할 수 없습니다.`);
+    }
+    const cp = ctx.db.getCheckpoint(options.baselineCheckpointId);
+    if (!cp) {
+      throw new Error(`체크포인트 ID "${options.baselineCheckpointId}"를 찾을 수 없습니다.`);
+    }
+    if (projectId && cp.projectId !== projectId) {
+      throw new Error(`체크포인트 "${options.baselineCheckpointId}"는 이 사건/프로젝트(ID: ${projectId})의 체크포인트가 아닙니다.`);
+    }
+    baselineSha = cp.worktreeCommitSha || cp.gitHeadSha || '';
+    baselineRule = 'EXPLICIT_BASELINE';
+    originalCheckpoint = cp;
+  } else if (options.baselineSha) {
+    disableAutoExpand = true;
+    baselineSha = options.baselineSha;
+    baselineRule = 'EXPLICIT_BASELINE';
+  } else if (incident && ctx.db) {
+    if (incident.baseCheckpointId) {
+      const cp = ctx.db.getCheckpoint(incident.baseCheckpointId);
+      if (cp) {
+        baselineSha = cp.worktreeCommitSha || cp.gitHeadSha || '';
+        if (baselineSha) {
+          baselineRule = 'INCIDENT_BASE_CHECKPOINT';
+          originalCheckpoint = cp;
         }
       }
     }
-  } else if (repoPath && !baselineSha && ctx.db && ctx.ensureProject) {
-    try {
-      const project = ctx.ensureProject(repoPath);
-      const checkpoints = ctx.db.listCheckpoints(project.id);
+    if (!baselineSha && projectId) {
+      const checkpoints = ctx.db.listCheckpoints(projectId, 50);
       const goodCp =
         checkpoints.find((cp: any) => cp.gitStashSha === null && cp.changedFiles.length === 0) ||
         checkpoints[0];
       if (goodCp) {
         baselineSha = goodCp.worktreeCommitSha || goodCp.gitHeadSha || '';
-        if (baselineSha) baselineRule = 'LAST_GOOD_CHECKPOINT';
+        if (baselineSha) {
+          baselineRule = 'LAST_GOOD_CHECKPOINT';
+          originalCheckpoint = goodCp;
+        }
+      }
+    }
+  } else if (repoPath && !baselineSha && ctx.db && projectId) {
+    try {
+      const checkpoints = ctx.db.listCheckpoints(projectId, 50);
+      const goodCp =
+        checkpoints.find((cp: any) => cp.gitStashSha === null && cp.changedFiles.length === 0) ||
+        checkpoints[0];
+      if (goodCp) {
+        baselineSha = goodCp.worktreeCommitSha || goodCp.gitHeadSha || '';
+        if (baselineSha) {
+          baselineRule = 'LAST_GOOD_CHECKPOINT';
+          originalCheckpoint = goodCp;
+        }
       }
     } catch {}
   }
 
-  // Rule 3: Fallback to HEAD
+  // Fallback to HEAD
   if (!baselineSha) {
     baselineSha = 'HEAD';
     baselineRule = 'NO_CHECKPOINT_HEAD';
@@ -234,66 +301,13 @@ export async function locateChangeScope(
         scopeFunctionCount: 0,
         reductionRatio: 0,
       },
+      olderCheckpoints: [],
     };
   }
 
-  // 2. Change Collection via git diff -U0 and git ls-files
   const gitEngine = ctx.gitEngine;
-  let diffOutput = '';
-  try {
-    diffOutput = gitEngine.runGit(repoPath, ['diff', '-U0', baselineSha]);
-  } catch (err: any) {
-    warnings.push(`git diff 실행 실패: ${err.message}`);
-  }
 
-  const fileDiffs = parseGitDiffU0(diffOutput);
-
-  // Untracked files via git ls-files --others --exclude-standard
-  try {
-    const untrackedRaw = gitEngine.runGit(repoPath, ['ls-files', '--others', '--exclude-standard']);
-    for (const rawLine of untrackedRaw.split(/\r?\n/)) {
-      const relPath = rawLine.trim();
-      if (!relPath || isExcludedFile(relPath)) continue;
-      const fullPath = path.resolve(repoPath, relPath);
-      if (fs.existsSync(fullPath) && fs.statSync(fullPath).isFile()) {
-        const content = fs.readFileSync(fullPath, 'utf8');
-        const lineCount = content.split(/\r?\n/).length;
-        const addedLines: number[] = [];
-        for (let l = 1; l <= lineCount; l++) addedLines.push(l);
-        fileDiffs.set(relPath, {
-          filePath: relPath,
-          addedLines,
-          deletedTraces: [],
-        });
-      }
-    }
-  } catch {}
-
-  // Filter out excluded files
-  for (const [filePath] of Array.from(fileDiffs.entries())) {
-    if (isExcludedFile(filePath)) {
-      fileDiffs.delete(filePath);
-    }
-  }
-
-  const totalChangedFiles = fileDiffs.size;
-  let filesToAnalyze = Array.from(fileDiffs.values());
-
-  // Truncate to top 50 if too many changed files
-  if (filesToAnalyze.length > 50) {
-    filesToAnalyze.sort(
-      (a, b) =>
-        b.addedLines.length + b.deletedTraces.length - (a.addedLines.length + a.deletedTraces.length)
-    );
-    filesToAnalyze = filesToAnalyze.slice(0, 50);
-    warnings.push(
-      `변경 파일이 50개를 초과하여 (${totalChangedFiles}개), 변경 줄 수가 많은 상위 50개 파일만 분석했습니다.`
-    );
-  }
-
-  const analyzedFiles = filesToAnalyze.length;
-
-  // 3. Scan all tracked & untracked supported files in repository
+  // 2. Scan all tracked & untracked supported files in repository
   const allRepoFiles = new Set<string>();
   try {
     const trackedRaw = gitEngine.runGit(repoPath, ['ls-files']);
@@ -339,268 +353,430 @@ export async function locateChangeScope(
     }
   }
 
-  // 4. Identify changed functions, top-level changes, and hunks
-  const changedFunctions: ChangedFunction[] = [];
-  const topLevelChanges: TopLevelChange[] = [];
-  const hunks: HunkCandidate[] = [];
-
-  for (const diffFile of filesToAnalyze) {
-    const fullPath = path.resolve(repoPath, diffFile.filePath);
-    if (!fs.existsSync(fullPath)) continue;
-
-    let content = '';
+  // 3. Helper to compute scope for a specific commit SHA
+  function computeScopeDiff(sha: string) {
+    const diffWarnings: string[] = [];
+    let diffOutput = '';
     try {
-      content = fs.readFileSync(fullPath, 'utf8');
-    } catch {
-      continue;
+      diffOutput = gitEngine.runGit(repoPath, ['diff', '-U0', sha]);
+    } catch (err: any) {
+      diffWarnings.push(`git diff 실행 실패: ${err.message}`);
     }
 
-    const addedSet = new Set(diffFile.addedLines);
-    const deletedSet = new Set(diffFile.deletedTraces);
-    const fileLines = content.split(/\r?\n/);
-    const totalLinesInFile = fileLines.length;
+    const fileDiffs = parseGitDiffU0(diffOutput);
 
-    const functions = fileExtractedCache.get(diffFile.filePath) || [];
-    const isSupported = isSupportedFile(diffFile.filePath);
-
-    if (!isSupported) {
-      // Unsupported language file: candidate hunk +/- 15 lines
-      const allChanged = [...diffFile.addedLines, ...diffFile.deletedTraces].sort((a, b) => a - b);
-      if (allChanged.length > 0) {
-        const hunkStart = allChanged[0];
-        const hunkEnd = allChanged[allChanged.length - 1];
-        const startLine = Math.max(1, hunkStart - 15);
-        const endLine = Math.min(totalLinesInFile, hunkEnd + 15);
-        const ext = path.extname(diffFile.filePath) || '알 수 없음';
-        hunks.push({
-          filePath: diffFile.filePath,
-          name: `(변경 덩어리 L${hunkStart}-L${hunkEnd})`,
-          kind: 'HUNK',
-          startLine,
-          endLine,
-          changedLines: allChanged.length,
-          totalLines: endLine - startLine + 1,
-          reasons: [`미지원 언어(${ext}) 파일의 변경 덩어리 (L${hunkStart}-L${hunkEnd})`],
-        });
+    // Untracked files via git ls-files --others --exclude-standard
+    try {
+      const untrackedRaw = gitEngine.runGit(repoPath, ['ls-files', '--others', '--exclude-standard']);
+      for (const rawLine of untrackedRaw.split(/\r?\n/)) {
+        const relPath = rawLine.trim();
+        if (!relPath || isExcludedFile(relPath)) continue;
+        const fullPath = path.resolve(repoPath, relPath);
+        if (fs.existsSync(fullPath) && fs.statSync(fullPath).isFile()) {
+          const content = fs.readFileSync(fullPath, 'utf8');
+          const lineCount = content.split(/\r?\n/).length;
+          const addedLines: number[] = [];
+          for (let l = 1; l <= lineCount; l++) addedLines.push(l);
+          fileDiffs.set(relPath, {
+            filePath: relPath,
+            addedLines,
+            deletedTraces: [],
+          });
+        }
       }
-      continue;
+    } catch {}
+
+    // Filter out excluded files
+    for (const [filePath] of Array.from(fileDiffs.entries())) {
+      if (isExcludedFile(filePath)) {
+        fileDiffs.delete(filePath);
+      }
     }
 
-    if (functions.length === 0) {
-      // Supported file but no functions (script with only top-level code)
-      const nonBlankChanged: number[] = [];
-      for (const l of diffFile.addedLines) {
-        if (fileLines[l - 1] && fileLines[l - 1].trim().length > 0) {
+    const totalChangedFiles = fileDiffs.size;
+    let filesToAnalyze = Array.from(fileDiffs.values());
+
+    // Truncate to top 50 if too many changed files
+    if (filesToAnalyze.length > 50) {
+      filesToAnalyze.sort(
+        (a, b) =>
+          b.addedLines.length + b.deletedTraces.length - (a.addedLines.length + a.deletedTraces.length)
+      );
+      filesToAnalyze = filesToAnalyze.slice(0, 50);
+      diffWarnings.push(
+        `변경 파일이 50개를 초과하여 (${totalChangedFiles}개), 변경 줄 수가 많은 상위 50개 파일만 분석했습니다.`
+      );
+    }
+
+    const analyzedFiles = filesToAnalyze.length;
+
+    // Identify changed functions, top-level changes, and hunks
+    const changedFunctions: ChangedFunction[] = [];
+    const topLevelChanges: TopLevelChange[] = [];
+    const hunks: HunkCandidate[] = [];
+
+    for (const diffFile of filesToAnalyze) {
+      const fullPath = path.resolve(repoPath, diffFile.filePath);
+      if (!fs.existsSync(fullPath)) continue;
+
+      let content = '';
+      try {
+        content = fs.readFileSync(fullPath, 'utf8');
+      } catch {
+        continue;
+      }
+
+      const addedSet = new Set(diffFile.addedLines);
+      const deletedSet = new Set(diffFile.deletedTraces);
+      const fileLines = content.split(/\r?\n/);
+      const totalLinesInFile = fileLines.length;
+
+      const functions = fileExtractedCache.get(diffFile.filePath) || [];
+      const isSupported = isSupportedFile(diffFile.filePath);
+
+      if (!isSupported) {
+        const allChanged = [...diffFile.addedLines, ...diffFile.deletedTraces].sort((a, b) => a - b);
+        if (allChanged.length > 0) {
+          const hunkStart = allChanged[0];
+          const hunkEnd = allChanged[allChanged.length - 1];
+          const startLine = Math.max(1, hunkStart - 15);
+          const endLine = Math.min(totalLinesInFile, hunkEnd + 15);
+          const ext = path.extname(diffFile.filePath) || '알 수 없음';
+          hunks.push({
+            filePath: diffFile.filePath,
+            name: `(변경 덩어리 L${hunkStart}-L${hunkEnd})`,
+            kind: 'HUNK',
+            startLine,
+            endLine,
+            changedLines: allChanged.length,
+            totalLines: endLine - startLine + 1,
+            reasons: [`미지원 언어(${ext}) 파일의 변경 덩어리 (L${hunkStart}-L${hunkEnd})`],
+          });
+        }
+        continue;
+      }
+
+      if (functions.length === 0) {
+        const nonBlankChanged: number[] = [];
+        for (const l of diffFile.addedLines) {
+          if (fileLines[l - 1] && fileLines[l - 1].trim().length > 0) {
+            nonBlankChanged.push(l);
+          }
+        }
+        for (const l of diffFile.deletedTraces) {
           nonBlankChanged.push(l);
+        }
+
+        if (nonBlankChanged.length > 0) {
+          nonBlankChanged.sort((a, b) => a - b);
+          topLevelChanges.push({
+            filePath: diffFile.filePath,
+            name: `${path.basename(diffFile.filePath)} (최상위 코드)`,
+            kind: 'TOP_LEVEL',
+            startLine: nonBlankChanged[0] || 1,
+            endLine: nonBlankChanged[nonBlankChanged.length - 1] || totalLinesInFile,
+            changedLines: nonBlankChanged.length,
+            totalLines: totalLinesInFile,
+            reasons: [`함수 외부(파일 최상위)에서 ${nonBlankChanged.length}줄 변경`],
+          });
+        }
+        continue;
+      }
+
+      const coveredLines = new Set<number>();
+      for (const func of functions) {
+        const funcAdded: number[] = [];
+        const funcDeleted: number[] = [];
+        for (let l = func.startLine; l <= func.endLine; l++) {
+          if (addedSet.has(l)) funcAdded.push(l);
+          if (deletedSet.has(l)) funcDeleted.push(l);
+          coveredLines.add(l);
+        }
+
+        const funcChangedCount = funcAdded.length + funcDeleted.length;
+        if (funcChangedCount > 0) {
+          const totalLines = func.endLine - func.startLine + 1;
+          changedFunctions.push({
+            filePath: diffFile.filePath,
+            name: func.name,
+            kind: func.name.includes('.') ? 'METHOD' : 'FUNCTION',
+            startLine: func.startLine,
+            endLine: func.endLine,
+            signature: func.signature,
+            addedLines: funcAdded,
+            deletedTraces: funcDeleted,
+            changedLines: funcChangedCount,
+            totalLines,
+            reasons: [
+              `기준 시점 이후 이 함수에서 ${funcAdded.length}줄 추가, ${funcDeleted.length}줄 삭제`,
+              `함수 전체 ${totalLines}줄 중 ${funcChangedCount}줄 변경됨`,
+            ],
+          });
+        }
+      }
+
+      const uncoveredNonBlank: number[] = [];
+      for (const l of diffFile.addedLines) {
+        if (!coveredLines.has(l) && fileLines[l - 1] && fileLines[l - 1].trim().length > 0) {
+          uncoveredNonBlank.push(l);
         }
       }
       for (const l of diffFile.deletedTraces) {
-        nonBlankChanged.push(l);
+        if (!coveredLines.has(l)) {
+          uncoveredNonBlank.push(l);
+        }
       }
 
-      if (nonBlankChanged.length > 0) {
-        nonBlankChanged.sort((a, b) => a - b);
+      if (uncoveredNonBlank.length > 0) {
+        uncoveredNonBlank.sort((a, b) => a - b);
         topLevelChanges.push({
           filePath: diffFile.filePath,
           name: `${path.basename(diffFile.filePath)} (최상위 코드)`,
           kind: 'TOP_LEVEL',
-          startLine: nonBlankChanged[0] || 1,
-          endLine: nonBlankChanged[nonBlankChanged.length - 1] || totalLinesInFile,
-          changedLines: nonBlankChanged.length,
+          startLine: uncoveredNonBlank[0],
+          endLine: uncoveredNonBlank[uncoveredNonBlank.length - 1],
+          changedLines: uncoveredNonBlank.length,
           totalLines: totalLinesInFile,
-          reasons: [`함수 외부(파일 최상위)에서 ${nonBlankChanged.length}줄 변경`],
-        });
-      }
-      continue;
-    }
-
-    // Supported file with functions
-    const coveredLines = new Set<number>();
-    for (const func of functions) {
-      const funcAdded: number[] = [];
-      const funcDeleted: number[] = [];
-      for (let l = func.startLine; l <= func.endLine; l++) {
-        if (addedSet.has(l)) funcAdded.push(l);
-        if (deletedSet.has(l)) funcDeleted.push(l);
-        coveredLines.add(l);
-      }
-
-      const funcChangedCount = funcAdded.length + funcDeleted.length;
-      if (funcChangedCount > 0) {
-        const totalLines = func.endLine - func.startLine + 1;
-        changedFunctions.push({
-          filePath: diffFile.filePath,
-          name: func.name,
-          kind: func.name.includes('.') ? 'METHOD' : 'FUNCTION',
-          startLine: func.startLine,
-          endLine: func.endLine,
-          signature: func.signature,
-          addedLines: funcAdded,
-          deletedTraces: funcDeleted,
-          changedLines: funcChangedCount,
-          totalLines,
-          reasons: [
-            `기준 시점 이후 이 함수에서 ${funcAdded.length}줄 추가, ${funcDeleted.length}줄 삭제`,
-            `함수 전체 ${totalLines}줄 중 ${funcChangedCount}줄 변경됨`,
-          ],
+          reasons: [`함수 외부(파일 최상위)에서 ${uncoveredNonBlank.length}줄 변경`],
         });
       }
     }
 
-    // Top-level lines in file with functions
-    const uncoveredNonBlank: number[] = [];
-    for (const l of diffFile.addedLines) {
-      if (!coveredLines.has(l) && fileLines[l - 1] && fileLines[l - 1].trim().length > 0) {
-        uncoveredNonBlank.push(l);
-      }
-    }
-    for (const l of diffFile.deletedTraces) {
-      if (!coveredLines.has(l)) {
-        uncoveredNonBlank.push(l);
-      }
-    }
+    // 1-Step Neighbor Functions (Callers & Callees)
+    const changedKeySet = new Set(changedFunctions.map((f) => `${f.filePath}::${f.name}`));
+    const neighborMap = new Map<string, NeighborFunction>();
 
-    if (uncoveredNonBlank.length > 0) {
-      uncoveredNonBlank.sort((a, b) => a - b);
-      topLevelChanges.push({
-        filePath: diffFile.filePath,
-        name: `${path.basename(diffFile.filePath)} (최상위 코드)`,
-        kind: 'TOP_LEVEL',
-        startLine: uncoveredNonBlank[0],
-        endLine: uncoveredNonBlank[uncoveredNonBlank.length - 1],
-        changedLines: uncoveredNonBlank.length,
-        totalLines: totalLinesInFile,
-        reasons: [`함수 외부(파일 최상위)에서 ${uncoveredNonBlank.length}줄 변경`],
-      });
-    }
-  }
+    for (const changedFunc of changedFunctions) {
+      const funcsInFile = fileExtractedCache.get(changedFunc.filePath) || [];
+      const astFunc = funcsInFile.find(
+        (f) => f.name === changedFunc.name && f.startLine === changedFunc.startLine
+      );
+      if (!astFunc) continue;
 
-  // 5. 1-Step Neighbor Functions (Callers & Callees)
-  const changedKeySet = new Set(changedFunctions.map((f) => `${f.filePath}::${f.name}`));
-  const neighborMap = new Map<string, NeighborFunction>();
+      for (const calleeName of astFunc.calls) {
+        const matches = functionRegistry.get(calleeName);
+        if (matches) {
+          for (const target of matches) {
+            const key = `${target.filePath}::${target.func.name}`;
+            if (changedKeySet.has(key)) continue;
 
-  for (const changedFunc of changedFunctions) {
-    const funcsInFile = fileExtractedCache.get(changedFunc.filePath) || [];
-    const astFunc = funcsInFile.find(
-      (f) => f.name === changedFunc.name && f.startLine === changedFunc.startLine
-    );
-    if (!astFunc) continue;
+            if (neighborMap.has(key)) {
+              const existing = neighborMap.get(key)!;
+              if (!existing.relatedTo.includes(changedFunc.name)) {
+                existing.relatedTo += `, ${changedFunc.name}`;
+                existing.reasons.push(`변경 함수 ${changedFunc.name}이(가) 호출함`);
+              }
+            } else {
+              const totalLines = target.func.endLine - target.func.startLine + 1;
+              const nameOnlyMatch = matches.length > 1;
+              const reasons = [`변경 함수 ${changedFunc.name}이(가) 호출함`];
+              if (nameOnlyMatch) {
+                reasons.push('이름만으로 연결됨');
+              }
 
-    // 5-A. Callees: functions called by changedFunc
-    for (const calleeName of astFunc.calls) {
-      const matches = functionRegistry.get(calleeName);
-      if (matches) {
-        for (const target of matches) {
-          const key = `${target.filePath}::${target.func.name}`;
-          if (changedKeySet.has(key)) continue; // Already directly changed
-
-          if (neighborMap.has(key)) {
-            const existing = neighborMap.get(key)!;
-            if (!existing.relatedTo.includes(changedFunc.name)) {
-              existing.relatedTo += `, ${changedFunc.name}`;
-              existing.reasons.push(`변경 함수 ${changedFunc.name}이(가) 호출함`);
+              neighborMap.set(key, {
+                filePath: target.filePath,
+                name: target.func.name,
+                kind: target.func.name.includes('.') ? 'METHOD' : 'FUNCTION',
+                startLine: target.func.startLine,
+                endLine: target.func.endLine,
+                signature: target.func.signature,
+                totalLines,
+                relatedTo: changedFunc.name,
+                relation: 'CALLED_BY',
+                nameOnlyMatch,
+                reasons,
+              });
             }
-          } else {
-            const totalLines = target.func.endLine - target.func.startLine + 1;
-            const nameOnlyMatch = matches.length > 1;
-            const reasons = [`변경 함수 ${changedFunc.name}이(가) 호출함`];
-            if (nameOnlyMatch) {
-              reasons.push('이름만으로 연결됨');
-            }
+          }
+        }
+      }
 
-            neighborMap.set(key, {
-              filePath: target.filePath,
-              name: target.func.name,
-              kind: target.func.name.includes('.') ? 'METHOD' : 'FUNCTION',
-              startLine: target.func.startLine,
-              endLine: target.func.endLine,
-              signature: target.func.signature,
-              totalLines,
-              relatedTo: changedFunc.name,
-              relation: 'CALLED_BY',
-              nameOnlyMatch,
-              reasons,
-            });
+      const baseChangedName = changedFunc.name.includes('.')
+        ? changedFunc.name.split('.').pop()!
+        : changedFunc.name;
+
+      for (const [relPath, funcs] of fileExtractedCache.entries()) {
+        for (const f of funcs) {
+          if (f.calls.includes(changedFunc.name) || f.calls.includes(baseChangedName)) {
+            const key = `${relPath}::${f.name}`;
+            if (changedKeySet.has(key)) continue;
+
+            if (neighborMap.has(key)) {
+              const existing = neighborMap.get(key)!;
+              if (!existing.relatedTo.includes(changedFunc.name)) {
+                existing.relatedTo += `, ${changedFunc.name}`;
+                existing.reasons.push(`변경 함수 ${changedFunc.name}을(를) 호출함`);
+              }
+            } else {
+              const totalLines = f.endLine - f.startLine + 1;
+              neighborMap.set(key, {
+                filePath: relPath,
+                name: f.name,
+                kind: f.name.includes('.') ? 'METHOD' : 'FUNCTION',
+                startLine: f.startLine,
+                endLine: f.endLine,
+                signature: f.signature,
+                totalLines,
+                relatedTo: changedFunc.name,
+                relation: 'CALLS',
+                nameOnlyMatch: false,
+                reasons: [`변경 함수 ${changedFunc.name}을(를) 호출함`],
+              });
+            }
           }
         }
       }
     }
 
-    // 5-B. Callers: functions in repo that call changedFunc
-    const baseChangedName = changedFunc.name.includes('.')
-      ? changedFunc.name.split('.').pop()!
-      : changedFunc.name;
+    const sortFn = (
+      a: { filePath: string; startLine: number },
+      b: { filePath: string; startLine: number }
+    ) => a.filePath.localeCompare(b.filePath) || a.startLine - b.startLine;
 
-    for (const [relPath, funcs] of fileExtractedCache.entries()) {
-      for (const f of funcs) {
-        if (f.calls.includes(changedFunc.name) || f.calls.includes(baseChangedName)) {
-          const key = `${relPath}::${f.name}`;
-          if (changedKeySet.has(key)) continue; // Already directly changed
+    changedFunctions.sort(sortFn);
+    const neighborFunctions = Array.from(neighborMap.values()).sort(sortFn);
+    topLevelChanges.sort(sortFn);
+    hunks.sort(sortFn);
 
-          if (neighborMap.has(key)) {
-            const existing = neighborMap.get(key)!;
-            if (!existing.relatedTo.includes(changedFunc.name)) {
-              existing.relatedTo += `, ${changedFunc.name}`;
-              existing.reasons.push(`변경 함수 ${changedFunc.name}을(를) 호출함`);
-            }
-          } else {
-            const totalLines = f.endLine - f.startLine + 1;
-            neighborMap.set(key, {
-              filePath: relPath,
-              name: f.name,
-              kind: f.name.includes('.') ? 'METHOD' : 'FUNCTION',
-              startLine: f.startLine,
-              endLine: f.endLine,
-              signature: f.signature,
-              totalLines,
-              relatedTo: changedFunc.name,
-              relation: 'CALLS',
-              nameOnlyMatch: false,
-              reasons: [`변경 함수 ${changedFunc.name}을(를) 호출함`],
-            });
-          }
-        }
+    const changedFunctionCount = changedFunctions.length;
+    const neighborFunctionCount = neighborFunctions.length;
+    const scopeFunctionCount = changedFunctionCount + neighborFunctionCount;
+    const reductionRatio =
+      totalRepoFunctions > 0
+        ? Number(((totalRepoFunctions - scopeFunctionCount) / totalRepoFunctions).toFixed(4))
+        : 0;
+
+    return {
+      diffWarnings,
+      totalChangedFiles,
+      analyzedFiles,
+      changedFunctions,
+      neighborFunctions,
+      topLevelChanges,
+      hunks,
+      scopeStats: {
+        totalRepoFunctions,
+        changedFunctionCount,
+        neighborFunctionCount,
+        scopeFunctionCount,
+        reductionRatio,
+      },
+    };
+  }
+
+  // 4. Initial calculation with baselineSha
+  const initialScope = computeScopeDiff(baselineSha);
+  let finalScope = initialScope;
+  let usedCheckpoint: any = null;
+  let expansionInfo: ScopeExpansionInfo | undefined;
+
+  const isScopeEmpty =
+    initialScope.changedFunctions.length === 0 &&
+    initialScope.topLevelChanges.length === 0 &&
+    initialScope.hunks.length === 0;
+
+  // 5. Auto-expansion if scope is completely empty
+  if (isScopeEmpty && !disableAutoExpand && originalCheckpoint && ctx.db && projectId) {
+    const allCheckpoints: any[] = ctx.db.listCheckpoints(projectId, 100);
+    const origIdx = allCheckpoints.findIndex((c) => c.id === originalCheckpoint.id);
+    const earlierCandidates =
+      origIdx >= 0
+        ? allCheckpoints.slice(origIdx + 1)
+        : allCheckpoints.filter(
+            (c) => c.createdAt < originalCheckpoint.createdAt && c.id !== originalCheckpoint.id
+          );
+
+    let stepsBack = 0;
+    let lastTestedSha = baselineSha;
+
+    for (const candCp of earlierCandidates) {
+      if (stepsBack >= 10) break;
+
+      const candSha = candCp.worktreeCommitSha || candCp.gitHeadSha;
+      if (!candSha) continue;
+      // Skip checkpoints pointing to the same commit SHA
+      if (candSha === lastTestedSha || candSha === baselineSha) {
+        continue;
+      }
+
+      stepsBack++;
+      lastTestedSha = candSha;
+
+      const candidateScope = computeScopeDiff(candSha);
+      const candidateEmpty =
+        candidateScope.changedFunctions.length === 0 &&
+        candidateScope.topLevelChanges.length === 0 &&
+        candidateScope.hunks.length === 0;
+
+      if (!candidateEmpty) {
+        finalScope = candidateScope;
+        usedCheckpoint = candCp;
+        baselineSha = candSha;
+        baselineRule = 'EXPANDED_TO_OLDER_CHECKPOINT';
+        expansionInfo = {
+          originalCheckpoint: {
+            id: originalCheckpoint.id,
+            label: originalCheckpoint.label,
+            createdAt: originalCheckpoint.createdAt,
+          },
+          usedCheckpoint: {
+            id: candCp.id,
+            label: candCp.label,
+            createdAt: candCp.createdAt,
+          },
+          expansionStepCount: stepsBack,
+        };
+        warnings.push(
+          `기준 시점이 버그 이후 체크포인트(${originalCheckpoint.id})여서 변경 범위가 비어, 더 이전 체크포인트 ${candCp.id} ("${candCp.label}", ${candCp.createdAt})로 자동 확장했습니다 (${stepsBack}단계 이전).`
+        );
+        break;
       }
     }
   }
 
-  // 6. Sort all groups by filePath -> startLine (No rank, no score)
-  const sortFn = (
-    a: { filePath: string; startLine: number },
-    b: { filePath: string; startLine: number }
-  ) => a.filePath.localeCompare(b.filePath) || a.startLine - b.startLine;
+  warnings.push(...finalScope.diffWarnings);
 
-  changedFunctions.sort(sortFn);
-  const neighborFunctions = Array.from(neighborMap.values()).sort(sortFn);
-  topLevelChanges.sort(sortFn);
-  hunks.sort(sortFn);
-
-  // 7. Scope statistics
-  const changedFunctionCount = changedFunctions.length;
-  const neighborFunctionCount = neighborFunctions.length;
-  const scopeFunctionCount = changedFunctionCount + neighborFunctionCount;
-  const reductionRatio =
-    totalRepoFunctions > 0
-      ? Number(((totalRepoFunctions - scopeFunctionCount) / totalRepoFunctions).toFixed(4))
-      : 0;
+  // 6. Gather older checkpoints (up to 5 recent checkpoints before used/original checkpoint)
+  let olderCheckpoints: CheckpointSummary[] = [];
+  if (ctx.db && projectId) {
+    const refCheckpoint = usedCheckpoint || originalCheckpoint;
+    const allCheckpoints: any[] = ctx.db.listCheckpoints(projectId, 50);
+    if (refCheckpoint) {
+      const refIdx = allCheckpoints.findIndex((c) => c.id === refCheckpoint.id);
+      const olderCps =
+        refIdx >= 0
+          ? allCheckpoints.slice(refIdx + 1)
+          : allCheckpoints.filter(
+              (c) => c.createdAt < refCheckpoint.createdAt && c.id !== refCheckpoint.id
+            );
+      olderCheckpoints = olderCps.slice(0, 5).map((c) => ({
+        id: c.id,
+        label: c.label,
+        createdAt: c.createdAt,
+      }));
+    } else {
+      olderCheckpoints = allCheckpoints.slice(0, 5).map((c) => ({
+        id: c.id,
+        label: c.label,
+        createdAt: c.createdAt,
+      }));
+    }
+  }
 
   return {
     baselineSha,
     baselineRule,
     warnings,
-    totalChangedFiles,
-    analyzedFiles,
-    changedFunctions,
-    neighborFunctions,
-    topLevelChanges,
-    hunks,
-    scopeStats: {
-      totalRepoFunctions,
-      changedFunctionCount,
-      neighborFunctionCount,
-      scopeFunctionCount,
-      reductionRatio,
-    },
+    totalChangedFiles: finalScope.totalChangedFiles,
+    analyzedFiles: finalScope.analyzedFiles,
+    changedFunctions: finalScope.changedFunctions,
+    neighborFunctions: finalScope.neighborFunctions,
+    topLevelChanges: finalScope.topLevelChanges,
+    hunks: finalScope.hunks,
+    scopeStats: finalScope.scopeStats,
+    olderCheckpoints,
+    expansion: expansionInfo,
   };
 }
 

@@ -2813,3 +2813,335 @@ describe('B-1d: Incident Flow Integration with Change Scope', () => {
   });
 });
 
+describe('B-1e: Auto-expansion of Baseline Checkpoint & Direct Selection', () => {
+  test('1. Checkpoint A (good) -> Bug commit -> Checkpoint B (after bug, clean) -> Incident auto-expands to A with EXPANDED_TO_OLDER_CHECKPOINT', async () => {
+    const tempEnv = fs.mkdtempSync(path.join(os.tmpdir(), 'autopsy_flow_b1e_1_'));
+    const oldData = process.env.AUTOPSY_DATA_DIR;
+    const oldCache = process.env.AUTOPSY_CACHE_DIR;
+    process.env.AUTOPSY_DATA_DIR = path.join(tempEnv, 'data');
+    process.env.AUTOPSY_CACHE_DIR = path.join(tempEnv, 'cache');
+
+    const repo = createTempGitRepo();
+    let core: CoreManager | undefined;
+    try {
+      // 1. Initial good code
+      const initialCode = [
+        'function add(a, b) {',
+        '  return a + b;',
+        '}',
+        'function multiply(a, b) {',
+        '  return a * b;',
+        '}',
+        'module.exports = { add, multiply };',
+      ].join('\n') + '\n';
+      fs.writeFileSync(path.join(repo, 'calc.js'), initialCode);
+      execSync('git add . && git commit -m "initial good commit"', { cwd: repo, stdio: 'ignore' });
+
+      core = new CoreManager();
+      core.ensureProject(repo);
+
+      // Checkpoint A (good baseline)
+      const cpA = core.captureCheckpoint(repo, 'cp-A-good', 'antigravity');
+
+      // 2. Introduce bug into multiply and commit
+      const bugCode = [
+        'function add(a, b) {',
+        '  return a + b;',
+        '}',
+        'function multiply(a, b) {',
+        '  return a + b; // Bug: should be a * b',
+        '}',
+        'module.exports = { add, multiply };',
+      ].join('\n') + '\n';
+      fs.writeFileSync(path.join(repo, 'calc.js'), bugCode);
+      execSync('git add . && git commit -m "buggy multiply commit"', { cwd: repo, stdio: 'ignore' });
+
+      // Checkpoint B (captured after bug, clean working tree)
+      const cpB = core.captureCheckpoint(repo, 'cp-B-after-bug', 'antigravity');
+
+      // 3. User reports bug -> Incident created
+      const inc = await core.collectIncidentBundle(repo, {
+        title: 'multiply(2, 3) yields 5 instead of 6',
+        userReportText: 'multiply(2, 3)을 실행하면 6이 아니라 5가 나옵니다. 계산 오류를 수정해주세요.',
+        agentName: 'antigravity',
+        expectedBehavior: '6',
+        observedBehavior: '5',
+        reproductionCondition: 'multiply(2, 3)',
+        verificationMethod: '단위 테스트',
+        userConfirmedIntent: true,
+      });
+
+      // Verification:
+      // Incident base checkpoint is B (the latest at incident time)
+      assert.strictEqual(inc.baseCheckpointId, cpB.id);
+
+      // changeScopeSummary must automatically expand to A
+      assert.ok(inc.changeScopeSummary && typeof inc.changeScopeSummary === 'object');
+      const summary = inc.changeScopeSummary as any;
+      assert.strictEqual(summary.baselineRule, 'EXPANDED_TO_OLDER_CHECKPOINT');
+      assert.strictEqual(summary.baselineSha, cpA.worktreeCommitSha || cpA.gitHeadSha);
+      assert.ok(
+        summary.changedFunctions.some((f: any) => f.name === 'multiply'),
+        'Buggy function multiply must be in changedFunctions'
+      );
+      assert.ok(
+        summary.warnings.some((w: string) => w.includes('자동 확장했습니다')),
+        'Warnings must mention auto-expansion'
+      );
+      assert.ok(summary.expansion, 'Expansion details must be present');
+      assert.strictEqual(summary.expansion.originalCheckpoint.id, cpB.id);
+      assert.strictEqual(summary.expansion.usedCheckpoint.id, cpA.id);
+      assert.strictEqual(summary.expansion.expansionStepCount, 1);
+
+      // 4. getChangeScope also returns auto-expanded result
+      const pkg = await core.getChangeScope(inc.id);
+      assert.strictEqual(pkg.baselineRule, 'EXPANDED_TO_OLDER_CHECKPOINT');
+      assert.ok(
+        pkg.scopeResult.changedFunctions.some((f) => f.name === 'multiply'),
+        'multiply must be in package scopeResult'
+      );
+      assert.ok(
+        pkg.packageText.includes('EXPANDED_TO_OLDER_CHECKPOINT'),
+        'Package text must reflect EXPANDED_TO_OLDER_CHECKPOINT'
+      );
+      assert.ok(
+        pkg.packageText.includes('baseline_checkpoint_id로 더 이전 체크포인트를 지정해 범위를 넓히거나'),
+        'Package text must include guidance about baseline_checkpoint_id'
+      );
+    } finally {
+      if (core) await core.shutdown();
+      if (oldData) process.env.AUTOPSY_DATA_DIR = oldData;
+      else delete process.env.AUTOPSY_DATA_DIR;
+      if (oldCache) process.env.AUTOPSY_CACHE_DIR = oldCache;
+      else delete process.env.AUTOPSY_CACHE_DIR;
+      fs.rmSync(repo, { recursive: true, force: true });
+      fs.rmSync(tempEnv, { recursive: true, force: true });
+    }
+  });
+
+  test('2. Direct baseline_checkpoint_id selection yields same result without auto-expansion, and invalid id throws error', async () => {
+    const tempEnv = fs.mkdtempSync(path.join(os.tmpdir(), 'autopsy_flow_b1e_2_'));
+    const oldData = process.env.AUTOPSY_DATA_DIR;
+    const oldCache = process.env.AUTOPSY_CACHE_DIR;
+    process.env.AUTOPSY_DATA_DIR = path.join(tempEnv, 'data');
+    process.env.AUTOPSY_CACHE_DIR = path.join(tempEnv, 'cache');
+
+    const repo = createTempGitRepo();
+    let core: CoreManager | undefined;
+    try {
+      fs.writeFileSync(path.join(repo, 'calc.js'), 'function multiply(a, b) { return a * b; }\n');
+      execSync('git add . && git commit -m "init"', { cwd: repo, stdio: 'ignore' });
+
+      core = new CoreManager();
+      core.ensureProject(repo);
+      const cpA = core.captureCheckpoint(repo, 'cp-A-good', 'antigravity');
+
+      fs.writeFileSync(path.join(repo, 'calc.js'), 'function multiply(a, b) { return a + b; }\n');
+      execSync('git add . && git commit -m "bug"', { cwd: repo, stdio: 'ignore' });
+      const cpB = core.captureCheckpoint(repo, 'cp-B-bug', 'antigravity');
+
+      const inc = await core.collectIncidentBundle(repo, {
+        title: 'multiply error',
+        userReportText: 'multiply result error',
+        agentName: 'antigravity',
+        expectedBehavior: '6',
+        observedBehavior: '5',
+        reproductionCondition: 'multiply(2, 3)',
+        verificationMethod: 'test',
+        userConfirmedIntent: true,
+      });
+
+      // Direct selection of cpA
+      const pkg = await core.getChangeScope(inc.id, { baselineCheckpointId: cpA.id });
+      assert.strictEqual(pkg.baselineRule, 'EXPLICIT_BASELINE');
+      assert.strictEqual(pkg.baselineSha, cpA.worktreeCommitSha || cpA.gitHeadSha);
+      assert.ok(pkg.scopeResult.changedFunctions.some((f) => f.name === 'multiply'));
+      assert.ok(Array.isArray(pkg.olderCheckpoints), 'olderCheckpoints must be an array');
+
+      // Non-existent id throws
+      await assert.rejects(
+        core.getChangeScope(inc.id, { baselineCheckpointId: 'cp_non_existent' }),
+        /찾을 수 없습니다/
+      );
+
+      // Checkpoint from different project throws
+      const otherRepo = createTempGitRepo();
+      try {
+        fs.writeFileSync(path.join(otherRepo, 'other.js'), 'console.log(1);\n');
+        execSync('git add . && git commit -m "init other"', { cwd: otherRepo, stdio: 'ignore' });
+        core.ensureProject(otherRepo);
+        const cpOther = core.captureCheckpoint(otherRepo, 'cp-other-proj', 'antigravity');
+
+        await assert.rejects(
+          core.getChangeScope(inc.id, { baselineCheckpointId: cpOther.id }),
+          /체크포인트/
+        );
+      } finally {
+        fs.rmSync(otherRepo, { recursive: true, force: true });
+      }
+    } finally {
+      if (core) await core.shutdown();
+      if (oldData) process.env.AUTOPSY_DATA_DIR = oldData;
+      else delete process.env.AUTOPSY_DATA_DIR;
+      if (oldCache) process.env.AUTOPSY_CACHE_DIR = oldCache;
+      else delete process.env.AUTOPSY_CACHE_DIR;
+      fs.rmSync(repo, { recursive: true, force: true });
+      fs.rmSync(tempEnv, { recursive: true, force: true });
+    }
+  });
+
+  test('3. Scope remains empty and returns warnings when all earlier checkpoints are also empty', async () => {
+    const tempEnv = fs.mkdtempSync(path.join(os.tmpdir(), 'autopsy_flow_b1e_3_'));
+    const oldData = process.env.AUTOPSY_DATA_DIR;
+    const oldCache = process.env.AUTOPSY_CACHE_DIR;
+    process.env.AUTOPSY_DATA_DIR = path.join(tempEnv, 'data');
+    process.env.AUTOPSY_CACHE_DIR = path.join(tempEnv, 'cache');
+
+    const repo = createTempGitRepo();
+    let core: CoreManager | undefined;
+    try {
+      fs.writeFileSync(path.join(repo, 'calc.js'), 'function calc() { return 1; }\n');
+      execSync('git add . && git commit -m "init"', { cwd: repo, stdio: 'ignore' });
+
+      core = new CoreManager();
+      core.ensureProject(repo);
+
+      // Capture cp1, cp2, cp3 with no code changes
+      core.captureCheckpoint(repo, 'cp-1', 'antigravity');
+      core.captureCheckpoint(repo, 'cp-2', 'antigravity');
+      const cp3 = core.captureCheckpoint(repo, 'cp-3', 'antigravity');
+
+      const inc = await core.collectIncidentBundle(repo, {
+        title: 'No changes test',
+        userReportText: '코드 변경 없는 상태에서 사건 등록 테스트',
+        agentName: 'antigravity',
+        expectedBehavior: '1',
+        observedBehavior: '1',
+        reproductionCondition: 'none',
+        verificationMethod: 'none',
+        userConfirmedIntent: true,
+      });
+
+      assert.strictEqual(inc.baseCheckpointId, cp3.id);
+      assert.ok(inc.changeScopeSummary && typeof inc.changeScopeSummary === 'object');
+      const summary = inc.changeScopeSummary as any;
+      // Should not be EXPANDED_TO_OLDER_CHECKPOINT because all earlier checkpoints are also identical
+      assert.strictEqual(summary.baselineRule, 'INCIDENT_BASE_CHECKPOINT');
+      assert.strictEqual(summary.changedFunctions.length, 0);
+    } finally {
+      if (core) await core.shutdown();
+      if (oldData) process.env.AUTOPSY_DATA_DIR = oldData;
+      else delete process.env.AUTOPSY_DATA_DIR;
+      if (oldCache) process.env.AUTOPSY_CACHE_DIR = oldCache;
+      else delete process.env.AUTOPSY_CACHE_DIR;
+      fs.rmSync(repo, { recursive: true, force: true });
+      fs.rmSync(tempEnv, { recursive: true, force: true });
+    }
+  });
+
+  test('4. 10-checkpoint traversal upper limit stops and does not expand past 10 steps', async () => {
+    const tempEnv = fs.mkdtempSync(path.join(os.tmpdir(), 'autopsy_flow_b1e_4_'));
+    const oldData = process.env.AUTOPSY_DATA_DIR;
+    const oldCache = process.env.AUTOPSY_CACHE_DIR;
+    process.env.AUTOPSY_DATA_DIR = path.join(tempEnv, 'data');
+    process.env.AUTOPSY_CACHE_DIR = path.join(tempEnv, 'cache');
+
+    const repo = createTempGitRepo();
+    let core: CoreManager | undefined;
+    try {
+      // 1. cp0 before bug
+      fs.writeFileSync(path.join(repo, 'calc.js'), 'function multiply(a, b) { return a * b; }\n');
+      execSync('git add . && git commit -m "init"', { cwd: repo, stdio: 'ignore' });
+
+      core = new CoreManager();
+      core.ensureProject(repo);
+      const cp0 = core.captureCheckpoint(repo, 'cp-0-baseline', 'antigravity');
+
+      // 2. Introduce bug into multiply
+      fs.writeFileSync(path.join(repo, 'calc.js'), 'function multiply(a, b) { return a + b; }\n');
+      execSync('git add . && git commit -m "bug"', { cwd: repo, stdio: 'ignore' });
+
+      // 3. Create 11 empty commits with distinct SHAs and capture checkpoints
+      for (let i = 1; i <= 11; i++) {
+        execSync(`git commit --allow-empty -m "empty commit ${i}"`, { cwd: repo, stdio: 'ignore' });
+        core.captureCheckpoint(repo, `cp-${i}`, 'antigravity');
+      }
+
+      // 4. Register incident at latest state (cp11)
+      const inc = await core.collectIncidentBundle(repo, {
+        title: 'Limit test',
+        userReportText: '10개 상한 테스트',
+        agentName: 'antigravity',
+        expectedBehavior: '6',
+        observedBehavior: '5',
+        reproductionCondition: 'multiply(2, 3)',
+        verificationMethod: 'test',
+        userConfirmedIntent: true,
+      });
+
+      // Since cp11 -> cp10 ... cp1 = 10 steps all have 0 diff,
+      // the search stops after 10 steps and does not reach cp0!
+      const summary = inc.changeScopeSummary as any;
+      assert.notStrictEqual(summary.baselineRule, 'EXPANDED_TO_OLDER_CHECKPOINT');
+      assert.strictEqual(summary.changedFunctions.length, 0);
+
+      // But manual specification of cp0 directly finds multiply!
+      const pkgDirect = await core.getChangeScope(inc.id, { baselineCheckpointId: cp0.id });
+      assert.strictEqual(pkgDirect.baselineRule, 'EXPLICIT_BASELINE');
+      assert.ok(pkgDirect.scopeResult.changedFunctions.some((f) => f.name === 'multiply'));
+    } finally {
+      if (core) await core.shutdown();
+      if (oldData) process.env.AUTOPSY_DATA_DIR = oldData;
+      else delete process.env.AUTOPSY_DATA_DIR;
+      if (oldCache) process.env.AUTOPSY_CACHE_DIR = oldCache;
+      else delete process.env.AUTOPSY_CACHE_DIR;
+      fs.rmSync(repo, { recursive: true, force: true });
+      fs.rmSync(tempEnv, { recursive: true, force: true });
+    }
+  });
+
+  test('5. getIncidentNextAction includes guidance about baseline_checkpoint_id when scope may be after bug', async () => {
+    const tempEnv = fs.mkdtempSync(path.join(os.tmpdir(), 'autopsy_flow_b1e_5_'));
+    const oldData = process.env.AUTOPSY_DATA_DIR;
+    const oldCache = process.env.AUTOPSY_CACHE_DIR;
+    process.env.AUTOPSY_DATA_DIR = path.join(tempEnv, 'data');
+    process.env.AUTOPSY_CACHE_DIR = path.join(tempEnv, 'cache');
+
+    const repo = createTempGitRepo();
+    let core: CoreManager | undefined;
+    try {
+      fs.writeFileSync(path.join(repo, 'calc.js'), 'function calc() { return 1; }\n');
+      execSync('git add . && git commit -m "init"', { cwd: repo, stdio: 'ignore' });
+
+      core = new CoreManager();
+      const inc = await core.collectIncidentBundle(repo, {
+        title: 'Guidance check',
+        userReportText: '정상 동작: 1, 실제: 0, 재현: calc(), 검증: test',
+        agentName: 'antigravity',
+        expectedBehavior: '1',
+        observedBehavior: '0',
+        reproductionCondition: 'calc()',
+        verificationMethod: 'test',
+        userConfirmedIntent: true,
+      });
+
+      const nextAction = core.getIncidentNextAction(inc);
+      assert.strictEqual(nextAction.actor, 'AGENT');
+      assert.strictEqual(nextAction.action, 'RUN_REPRODUCTION_OR_PROPOSE_REPAIR');
+      assert.ok(
+        nextAction.agent_should.includes('baseline_checkpoint_id로 더 이전 체크포인트를 지정해 범위를 넓히거나'),
+        'Next action must contain guidance on baseline_checkpoint_id'
+      );
+    } finally {
+      if (core) await core.shutdown();
+      if (oldData) process.env.AUTOPSY_DATA_DIR = oldData;
+      else delete process.env.AUTOPSY_DATA_DIR;
+      if (oldCache) process.env.AUTOPSY_CACHE_DIR = oldCache;
+      else delete process.env.AUTOPSY_CACHE_DIR;
+      fs.rmSync(repo, { recursive: true, force: true });
+      fs.rmSync(tempEnv, { recursive: true, force: true });
+    }
+  });
+});
+
+

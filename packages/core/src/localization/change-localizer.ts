@@ -4,37 +4,86 @@ import { CoreContext } from '../core/context.js';
 import { GitEngine } from '../git/git-engine.js';
 import { extractFunctions, ExtractedFunction } from './function-extractor.js';
 
-export interface LocalizationCandidate {
-  rank: number;
+export interface ChangedFunction {
   filePath: string;
   name: string;
-  kind: 'FUNCTION' | 'METHOD' | 'TOP_LEVEL' | 'HUNK';
+  kind: 'FUNCTION' | 'METHOD';
   startLine: number;
   endLine: number;
-  score: number;
   signature?: string;
+  addedLines: number[];
+  deletedTraces: number[];
   changedLines: number;
   totalLines: number;
   reasons: string[];
-  isNeighbor?: boolean;
-  relatedTo?: string;
 }
 
-export interface LocalizationResult {
+export interface NeighborFunction {
+  filePath: string;
+  name: string;
+  kind: 'FUNCTION' | 'METHOD';
+  startLine: number;
+  endLine: number;
+  signature?: string;
+  totalLines: number;
+  relatedTo: string;
+  relation: 'CALLS' | 'CALLED_BY';
+  nameOnlyMatch: boolean;
+  reasons: string[];
+}
+
+export interface TopLevelChange {
+  filePath: string;
+  name: string;
+  kind: 'TOP_LEVEL';
+  startLine: number;
+  endLine: number;
+  changedLines: number;
+  totalLines: number;
+  reasons: string[];
+}
+
+export interface HunkCandidate {
+  filePath: string;
+  name: string;
+  kind: 'HUNK';
+  startLine: number;
+  endLine: number;
+  changedLines: number;
+  totalLines: number;
+  reasons: string[];
+}
+
+export interface ScopeStats {
+  totalRepoFunctions: number;
+  changedFunctionCount: number;
+  neighborFunctionCount: number;
+  scopeFunctionCount: number;
+  reductionRatio: number;
+}
+
+export interface ChangeScopeResult {
   baselineSha: string;
   baselineRule: 'INCIDENT_BASE_CHECKPOINT' | 'LAST_GOOD_CHECKPOINT' | 'NO_CHECKPOINT_HEAD' | 'EXPLICIT_BASELINE';
   warnings: string[];
   totalChangedFiles: number;
   analyzedFiles: number;
-  candidates: LocalizationCandidate[];
+  changedFunctions: ChangedFunction[];
+  neighborFunctions: NeighborFunction[];
+  topLevelChanges: TopLevelChange[];
+  hunks: HunkCandidate[];
+  scopeStats: ScopeStats;
 }
 
-export interface LocateCandidatesOptions {
+export interface LocateChangeScopeOptions {
   incidentId?: string;
   repoPath?: string;
   baselineSha?: string;
-  maxCandidates?: number;
 }
+
+// Aliases for backwards compatibility
+export type LocalizationResult = ChangeScopeResult;
+export type LocateCandidatesOptions = LocateChangeScopeOptions;
 
 const EXCLUDED_DIR_PATTERNS = [
   /^(node_modules|dist|build|\.git)(\/|\\|$)/i,
@@ -46,11 +95,23 @@ const EXCLUDED_FILE_PATTERNS = [
   /(package-lock\.json|pnpm-lock\.yaml|yarn\.lock|Cargo\.lock)$/i,
 ];
 
+const SUPPORTED_EXTENSIONS = new Set([
+  '.py',
+  '.js', '.mjs', '.cjs', '.jsx',
+  '.ts', '.tsx',
+  '.c', '.cc', '.cpp', '.cxx', '.h', '.hpp',
+]);
+
 function isExcludedFile(filePath: string): boolean {
   const norm = filePath.replace(/\\/g, '/');
   if (EXCLUDED_DIR_PATTERNS.some((p) => p.test(norm))) return true;
   if (EXCLUDED_FILE_PATTERNS.some((p) => p.test(norm))) return true;
   return false;
+}
+
+function isSupportedFile(filePath: string): boolean {
+  const ext = path.extname(filePath).toLowerCase();
+  return SUPPORTED_EXTENSIONS.has(ext) && !isExcludedFile(filePath);
 }
 
 interface ParsedDiffFile {
@@ -86,7 +147,6 @@ function parseGitDiffU0(diffOutput: string): Map<string, ParsedDiffFile> {
               fileRecord.addedLines.push(l);
             }
           } else if (oldCount > 0 && newCount === 0) {
-            // Pure deletion trace: next line at deletion spot
             fileRecord.deletedTraces.push(newStart === 0 ? 1 : newStart);
           }
         }
@@ -97,14 +157,14 @@ function parseGitDiffU0(diffOutput: string): Map<string, ParsedDiffFile> {
   return files;
 }
 
-export async function locateCandidates(
+export async function locateChangeScope(
   ctx: CoreContext | { gitEngine: GitEngine; db?: any; ensureProject?: any },
-  options: LocateCandidatesOptions
-): Promise<LocalizationResult> {
+  options: LocateChangeScopeOptions
+): Promise<ChangeScopeResult> {
   const warnings: string[] = [];
   let repoPath = options.repoPath || '';
   let baselineSha = options.baselineSha || '';
-  let baselineRule: LocalizationResult['baselineRule'] = 'EXPLICIT_BASELINE';
+  let baselineRule: ChangeScopeResult['baselineRule'] = 'EXPLICIT_BASELINE';
 
   // 1. Resolve Repo Path and Baseline SHA
   if (options.incidentId && ctx.db) {
@@ -163,7 +223,17 @@ export async function locateCandidates(
       warnings,
       totalChangedFiles: 0,
       analyzedFiles: 0,
-      candidates: [],
+      changedFunctions: [],
+      neighborFunctions: [],
+      topLevelChanges: [],
+      hunks: [],
+      scopeStats: {
+        totalRepoFunctions: 0,
+        changedFunctionCount: 0,
+        neighborFunctionCount: 0,
+        scopeFunctionCount: 0,
+        reductionRatio: 0,
+      },
     };
   }
 
@@ -223,17 +293,56 @@ export async function locateCandidates(
 
   const analyzedFiles = filesToAnalyze.length;
 
-  // 3. Extract functions and identify modified functions
-  const candidatePool: LocalizationCandidate[] = [];
-  const modifiedFunctions: Array<{
-    func: ExtractedFunction;
-    filePath: string;
-    score: number;
-    changedLines: number;
-  }> = [];
+  // 3. Scan all tracked & untracked supported files in repository
+  const allRepoFiles = new Set<string>();
+  try {
+    const trackedRaw = gitEngine.runGit(repoPath, ['ls-files']);
+    for (const line of trackedRaw.split(/\r?\n/)) {
+      const p = line.trim();
+      if (p && isSupportedFile(p)) allRepoFiles.add(p);
+    }
+    const untrackedRaw = gitEngine.runGit(repoPath, ['ls-files', '--others', '--exclude-standard']);
+    for (const line of untrackedRaw.split(/\r?\n/)) {
+      const p = line.trim();
+      if (p && isSupportedFile(p)) allRepoFiles.add(p);
+    }
+  } catch {}
 
-  // Track extracted functions by name across analyzed files
+  let totalRepoFunctions = 0;
   const functionRegistry = new Map<string, Array<{ func: ExtractedFunction; filePath: string }>>();
+  const fileExtractedCache = new Map<string, ExtractedFunction[]>();
+
+  for (const relPath of allRepoFiles) {
+    const fullPath = path.resolve(repoPath, relPath);
+    if (!fs.existsSync(fullPath)) continue;
+    let content = '';
+    try {
+      content = fs.readFileSync(fullPath, 'utf8');
+    } catch {
+      continue;
+    }
+
+    const res = await extractFunctions(relPath, content);
+    if (res.supported) {
+      totalRepoFunctions += res.functions.length;
+      fileExtractedCache.set(relPath, res.functions);
+      for (const func of res.functions) {
+        const baseName = func.name.includes('.') ? func.name.split('.').pop()! : func.name;
+        const entry = { func, filePath: relPath };
+        if (!functionRegistry.has(func.name)) functionRegistry.set(func.name, []);
+        functionRegistry.get(func.name)!.push(entry);
+        if (baseName !== func.name) {
+          if (!functionRegistry.has(baseName)) functionRegistry.set(baseName, []);
+          functionRegistry.get(baseName)!.push(entry);
+        }
+      }
+    }
+  }
+
+  // 4. Identify changed functions, top-level changes, and hunks
+  const changedFunctions: ChangedFunction[] = [];
+  const topLevelChanges: TopLevelChange[] = [];
+  const hunks: HunkCandidate[] = [];
 
   for (const diffFile of filesToAnalyze) {
     const fullPath = path.resolve(repoPath, diffFile.filePath);
@@ -246,318 +355,234 @@ export async function locateCandidates(
       continue;
     }
 
-    const extractRes = await extractFunctions(diffFile.filePath, content);
     const addedSet = new Set(diffFile.addedLines);
     const deletedSet = new Set(diffFile.deletedTraces);
-    const totalLinesInFile = content.split(/\r?\n/).length;
+    const fileLines = content.split(/\r?\n/);
+    const totalLinesInFile = fileLines.length;
 
-    if (!extractRes.supported || extractRes.functions.length === 0) {
-      if (extractRes.supported && extractRes.functions.length === 0) {
-        // Supported file but no functions (e.g. script with only top-level statements)
-        const changedLinesCount = diffFile.addedLines.length + diffFile.deletedTraces.length;
-        if (changedLinesCount > 0) {
-          const allChanged = [...diffFile.addedLines, ...diffFile.deletedTraces].sort((a, b) => a - b);
-          candidatePool.push({
-            rank: 0,
-            filePath: diffFile.filePath,
-            name: `${path.basename(diffFile.filePath)} (최상위 코드)`,
-            kind: 'TOP_LEVEL',
-            startLine: allChanged[0] || 1,
-            endLine: allChanged[allChanged.length - 1] || totalLinesInFile,
-            score: 50.0 + Math.min(changedLinesCount, 20) * 1.5,
-            changedLines: changedLinesCount,
-            totalLines: totalLinesInFile,
-            reasons: [`함수 외부(파일 최상위)에서 ${changedLinesCount}줄 변경`],
-          });
-        }
-      } else {
-        // Unsupported language file: candidate hunk +/- 15 lines
-        const allChanged = [...diffFile.addedLines, ...diffFile.deletedTraces].sort((a, b) => a - b);
-        if (allChanged.length > 0) {
-          const hunkStart = allChanged[0];
-          const hunkEnd = allChanged[allChanged.length - 1];
-          const startLine = Math.max(1, hunkStart - 15);
-          const endLine = Math.min(totalLinesInFile, hunkEnd + 15);
-          const ext = path.extname(diffFile.filePath) || '알 수 없음';
-          candidatePool.push({
-            rank: 0,
-            filePath: diffFile.filePath,
-            name: `(변경 덩어리 L${hunkStart}-L${hunkEnd})`,
-            kind: 'HUNK',
-            startLine,
-            endLine,
-            score: 40.0 + Math.min(allChanged.length, 10),
-            changedLines: allChanged.length,
-            totalLines: endLine - startLine + 1,
-            reasons: [`미지원 언어(${ext}) 파일의 변경 덩어리 (L${hunkStart}-L${hunkEnd})`],
-          });
-        }
+    const functions = fileExtractedCache.get(diffFile.filePath) || [];
+    const isSupported = isSupportedFile(diffFile.filePath);
+
+    if (!isSupported) {
+      // Unsupported language file: candidate hunk +/- 15 lines
+      const allChanged = [...diffFile.addedLines, ...diffFile.deletedTraces].sort((a, b) => a - b);
+      if (allChanged.length > 0) {
+        const hunkStart = allChanged[0];
+        const hunkEnd = allChanged[allChanged.length - 1];
+        const startLine = Math.max(1, hunkStart - 15);
+        const endLine = Math.min(totalLinesInFile, hunkEnd + 15);
+        const ext = path.extname(diffFile.filePath) || '알 수 없음';
+        hunks.push({
+          filePath: diffFile.filePath,
+          name: `(변경 덩어리 L${hunkStart}-L${hunkEnd})`,
+          kind: 'HUNK',
+          startLine,
+          endLine,
+          changedLines: allChanged.length,
+          totalLines: endLine - startLine + 1,
+          reasons: [`미지원 언어(${ext}) 파일의 변경 덩어리 (L${hunkStart}-L${hunkEnd})`],
+        });
       }
       continue;
     }
 
-    // Supported language with functions
-    const coveredLines = new Set<number>();
-
-    for (const func of extractRes.functions) {
-      // Register function for call resolution
-      const baseName = func.name.includes('.') ? func.name.split('.').pop()! : func.name;
-      const entry = { func, filePath: diffFile.filePath };
-      if (!functionRegistry.has(func.name)) functionRegistry.set(func.name, []);
-      functionRegistry.get(func.name)!.push(entry);
-      if (baseName !== func.name) {
-        if (!functionRegistry.has(baseName)) functionRegistry.set(baseName, []);
-        functionRegistry.get(baseName)!.push(entry);
+    if (functions.length === 0) {
+      // Supported file but no functions (script with only top-level code)
+      const nonBlankChanged: number[] = [];
+      for (const l of diffFile.addedLines) {
+        if (fileLines[l - 1] && fileLines[l - 1].trim().length > 0) {
+          nonBlankChanged.push(l);
+        }
+      }
+      for (const l of diffFile.deletedTraces) {
+        nonBlankChanged.push(l);
       }
 
-      let funcAdded = 0;
-      let funcDeleted = 0;
+      if (nonBlankChanged.length > 0) {
+        nonBlankChanged.sort((a, b) => a - b);
+        topLevelChanges.push({
+          filePath: diffFile.filePath,
+          name: `${path.basename(diffFile.filePath)} (최상위 코드)`,
+          kind: 'TOP_LEVEL',
+          startLine: nonBlankChanged[0] || 1,
+          endLine: nonBlankChanged[nonBlankChanged.length - 1] || totalLinesInFile,
+          changedLines: nonBlankChanged.length,
+          totalLines: totalLinesInFile,
+          reasons: [`함수 외부(파일 최상위)에서 ${nonBlankChanged.length}줄 변경`],
+        });
+      }
+      continue;
+    }
+
+    // Supported file with functions
+    const coveredLines = new Set<number>();
+    for (const func of functions) {
+      const funcAdded: number[] = [];
+      const funcDeleted: number[] = [];
       for (let l = func.startLine; l <= func.endLine; l++) {
-        if (addedSet.has(l)) funcAdded++;
-        if (deletedSet.has(l)) funcDeleted++;
+        if (addedSet.has(l)) funcAdded.push(l);
+        if (deletedSet.has(l)) funcDeleted.push(l);
         coveredLines.add(l);
       }
 
-      const funcChanged = funcAdded + funcDeleted;
-      if (funcChanged > 0) {
+      const funcChangedCount = funcAdded.length + funcDeleted.length;
+      if (funcChangedCount > 0) {
         const totalLines = func.endLine - func.startLine + 1;
-        const ratio = funcChanged / Math.max(1, totalLines);
-        // Scoring formula for directly modified functions:
-        // score = 100.0 + min(changedLines, 50) * 2.0 + (ratio * 30.0)
-        const score = Number((100.0 + Math.min(funcChanged, 50) * 2.0 + ratio * 30.0).toFixed(2));
-        const reasons = [
-          `기준 시점 이후 이 함수에서 ${funcAdded}줄 추가, ${funcDeleted}줄 삭제`,
-          `함수 전체 ${totalLines}줄 중 ${funcChanged}줄(${Math.round(ratio * 100)}%) 변경됨`,
-        ];
-
-        const cand: LocalizationCandidate = {
-          rank: 0,
+        changedFunctions.push({
           filePath: diffFile.filePath,
           name: func.name,
           kind: func.name.includes('.') ? 'METHOD' : 'FUNCTION',
           startLine: func.startLine,
           endLine: func.endLine,
-          score,
           signature: func.signature,
-          changedLines: funcChanged,
+          addedLines: funcAdded,
+          deletedTraces: funcDeleted,
+          changedLines: funcChangedCount,
           totalLines,
-          reasons,
-        };
-
-        candidatePool.push(cand);
-        modifiedFunctions.push({
-          func,
-          filePath: diffFile.filePath,
-          score,
-          changedLines: funcChanged,
+          reasons: [
+            `기준 시점 이후 이 함수에서 ${funcAdded.length}줄 추가, ${funcDeleted.length}줄 삭제`,
+            `함수 전체 ${totalLines}줄 중 ${funcChangedCount}줄 변경됨`,
+          ],
         });
       }
     }
 
-    // Check for top-level changes outside any function
-    const fileLines = content.split(/\r?\n/);
-    const uncoveredChanged: number[] = [];
+    // Top-level lines in file with functions
+    const uncoveredNonBlank: number[] = [];
     for (const l of diffFile.addedLines) {
-      if (!coveredLines.has(l)) {
-        if (fileLines[l - 1] && fileLines[l - 1].trim().length > 0) {
-          uncoveredChanged.push(l);
-        }
+      if (!coveredLines.has(l) && fileLines[l - 1] && fileLines[l - 1].trim().length > 0) {
+        uncoveredNonBlank.push(l);
       }
     }
     for (const l of diffFile.deletedTraces) {
-      if (!coveredLines.has(l)) uncoveredChanged.push(l);
+      if (!coveredLines.has(l)) {
+        uncoveredNonBlank.push(l);
+      }
     }
 
-    if (uncoveredChanged.length > 0) {
-      uncoveredChanged.sort((a, b) => a - b);
-      candidatePool.push({
-        rank: 0,
+    if (uncoveredNonBlank.length > 0) {
+      uncoveredNonBlank.sort((a, b) => a - b);
+      topLevelChanges.push({
         filePath: diffFile.filePath,
         name: `${path.basename(diffFile.filePath)} (최상위 코드)`,
         kind: 'TOP_LEVEL',
-        startLine: uncoveredChanged[0],
-        endLine: uncoveredChanged[uncoveredChanged.length - 1],
-        score: 50.0 + Math.min(uncoveredChanged.length, 20) * 1.5,
-        changedLines: uncoveredChanged.length,
+        startLine: uncoveredNonBlank[0],
+        endLine: uncoveredNonBlank[uncoveredNonBlank.length - 1],
+        changedLines: uncoveredNonBlank.length,
         totalLines: totalLinesInFile,
-        reasons: [`함수 외부(파일 최상위)에서 ${uncoveredChanged.length}줄 변경`],
+        reasons: [`함수 외부(파일 최상위)에서 ${uncoveredNonBlank.length}줄 변경`],
       });
     }
   }
 
-  // 4. Neighbor Function Resolution (Callees and Callers within 1 step)
-  for (const mod of modifiedFunctions) {
-    const callerFunc = mod.func;
-    const callerFile = mod.filePath;
+  // 5. 1-Step Neighbor Functions (Callers & Callees)
+  const changedKeySet = new Set(changedFunctions.map((f) => `${f.filePath}::${f.name}`));
+  const neighborMap = new Map<string, NeighborFunction>();
 
-    // 4-A. Callees: Functions called by callerFunc
-    for (const calleeName of callerFunc.calls) {
-      // Find matching function definitions
-      let matches = functionRegistry.get(calleeName);
-      if (!matches || matches.length === 0) {
-        // Search repo for this function via git grep
-        try {
-          const grepResult = gitEngine.runGit(repoPath, ['grep', '-l', '-w', calleeName]);
-          for (const rawLine of grepResult.split(/\r?\n/)) {
-            const rel = rawLine.trim();
-            if (!rel || isExcludedFile(rel)) continue;
-            const fp = path.resolve(repoPath, rel);
-            if (fs.existsSync(fp)) {
-              const c = fs.readFileSync(fp, 'utf8');
-              const res = await extractFunctions(rel, c);
-              for (const f of res.functions) {
-                const bName = f.name.includes('.') ? f.name.split('.').pop()! : f.name;
-                const reg = { func: f, filePath: rel };
-                if (!functionRegistry.has(f.name)) functionRegistry.set(f.name, []);
-                functionRegistry.get(f.name)!.push(reg);
-                if (bName !== f.name) {
-                  if (!functionRegistry.has(bName)) functionRegistry.set(bName, []);
-                  functionRegistry.get(bName)!.push(reg);
-                }
-              }
-            }
-          }
-        } catch {}
-        matches = functionRegistry.get(calleeName);
-      }
+  for (const changedFunc of changedFunctions) {
+    const funcsInFile = fileExtractedCache.get(changedFunc.filePath) || [];
+    const astFunc = funcsInFile.find(
+      (f) => f.name === changedFunc.name && f.startLine === changedFunc.startLine
+    );
+    if (!astFunc) continue;
 
+    // 5-A. Callees: functions called by changedFunc
+    for (const calleeName of astFunc.calls) {
+      const matches = functionRegistry.get(calleeName);
       if (matches) {
         for (const target of matches) {
-          // Check if already in candidate pool
-          const existing = candidatePool.find(
-            (c) => c.filePath === target.filePath && c.name === target.func.name
-          );
-          if (existing) {
-            existing.score += 10.0;
-            existing.reasons.push(`변경 함수 ${callerFunc.name}이(가) 호출함`);
-            if (existing.relatedTo && !existing.relatedTo.includes(callerFunc.name)) {
-              existing.relatedTo += `, ${callerFunc.name}`;
-            } else if (!existing.relatedTo) {
-              existing.relatedTo = callerFunc.name;
+          const key = `${target.filePath}::${target.func.name}`;
+          if (changedKeySet.has(key)) continue; // Already directly changed
+
+          if (neighborMap.has(key)) {
+            const existing = neighborMap.get(key)!;
+            if (!existing.relatedTo.includes(changedFunc.name)) {
+              existing.relatedTo += `, ${changedFunc.name}`;
+              existing.reasons.push(`변경 함수 ${changedFunc.name}이(가) 호출함`);
             }
           } else {
-            // New neighbor candidate
             const totalLines = target.func.endLine - target.func.startLine + 1;
-            const neighborScore = Math.max(30.0, mod.score * 0.6);
-            const reasons = [`변경 함수 ${callerFunc.name}이(가) 호출함`];
-            if (matches.length > 1) {
+            const nameOnlyMatch = matches.length > 1;
+            const reasons = [`변경 함수 ${changedFunc.name}이(가) 호출함`];
+            if (nameOnlyMatch) {
               reasons.push('이름만으로 연결됨');
             }
 
-            candidatePool.push({
-              rank: 0,
+            neighborMap.set(key, {
               filePath: target.filePath,
               name: target.func.name,
               kind: target.func.name.includes('.') ? 'METHOD' : 'FUNCTION',
               startLine: target.func.startLine,
               endLine: target.func.endLine,
-              score: neighborScore,
               signature: target.func.signature,
-              changedLines: 0,
               totalLines,
+              relatedTo: changedFunc.name,
+              relation: 'CALLED_BY',
+              nameOnlyMatch,
               reasons,
-              isNeighbor: true,
-              relatedTo: callerFunc.name,
             });
           }
         }
       }
     }
 
-    // 4-B. Callers: Functions that call callerFunc
-    const baseCallerName = callerFunc.name.includes('.')
-      ? callerFunc.name.split('.').pop()!
-      : callerFunc.name;
-    const namesToSearch = [callerFunc.name];
-    if (baseCallerName !== callerFunc.name) namesToSearch.push(baseCallerName);
+    // 5-B. Callers: functions in repo that call changedFunc
+    const baseChangedName = changedFunc.name.includes('.')
+      ? changedFunc.name.split('.').pop()!
+      : changedFunc.name;
 
-    for (const nameToSearch of namesToSearch) {
-      try {
-        const grepResult = gitEngine.runGit(repoPath, ['grep', '-l', '-w', nameToSearch]);
-        for (const rawLine of grepResult.split(/\r?\n/)) {
-          const rel = rawLine.trim();
-          if (!rel || isExcludedFile(rel)) continue;
-          const fp = path.resolve(repoPath, rel);
-          if (fs.existsSync(fp)) {
-            const c = fs.readFileSync(fp, 'utf8');
-            const res = await extractFunctions(rel, c);
-            for (const f of res.functions) {
-              if (f.calls.includes(callerFunc.name) || f.calls.includes(baseCallerName)) {
-                const existing = candidatePool.find(
-                  (c) => c.filePath === rel && c.name === f.name
-                );
-                if (existing) {
-                  existing.score += 10.0;
-                  existing.reasons.push(`변경 함수 ${callerFunc.name}을(를) 호출함`);
-                  if (existing.relatedTo && !existing.relatedTo.includes(callerFunc.name)) {
-                    existing.relatedTo += `, ${callerFunc.name}`;
-                  } else if (!existing.relatedTo) {
-                    existing.relatedTo = callerFunc.name;
-                  }
-                } else {
-                  const totalLines = f.endLine - f.startLine + 1;
-                  const neighborScore = Math.max(30.0, mod.score * 0.6);
-                  candidatePool.push({
-                    rank: 0,
-                    filePath: rel,
-                    name: f.name,
-                    kind: f.name.includes('.') ? 'METHOD' : 'FUNCTION',
-                    startLine: f.startLine,
-                    endLine: f.endLine,
-                    score: neighborScore,
-                    signature: f.signature,
-                    changedLines: 0,
-                    totalLines,
-                    reasons: [`변경 함수 ${callerFunc.name}을(를) 호출함`],
-                    isNeighbor: true,
-                    relatedTo: callerFunc.name,
-                  });
-                }
-              }
+    for (const [relPath, funcs] of fileExtractedCache.entries()) {
+      for (const f of funcs) {
+        if (f.calls.includes(changedFunc.name) || f.calls.includes(baseChangedName)) {
+          const key = `${relPath}::${f.name}`;
+          if (changedKeySet.has(key)) continue; // Already directly changed
+
+          if (neighborMap.has(key)) {
+            const existing = neighborMap.get(key)!;
+            if (!existing.relatedTo.includes(changedFunc.name)) {
+              existing.relatedTo += `, ${changedFunc.name}`;
+              existing.reasons.push(`변경 함수 ${changedFunc.name}을(를) 호출함`);
             }
+          } else {
+            const totalLines = f.endLine - f.startLine + 1;
+            neighborMap.set(key, {
+              filePath: relPath,
+              name: f.name,
+              kind: f.name.includes('.') ? 'METHOD' : 'FUNCTION',
+              startLine: f.startLine,
+              endLine: f.endLine,
+              signature: f.signature,
+              totalLines,
+              relatedTo: changedFunc.name,
+              relation: 'CALLS',
+              nameOnlyMatch: false,
+              reasons: [`변경 함수 ${changedFunc.name}을(를) 호출함`],
+            });
           }
         }
-      } catch {}
-    }
-  }
-
-  // 5. Ranking and Mandatory Top-5 Neighbor Inclusion
-  candidatePool.sort((a, b) => b.score - a.score);
-
-  const maxCandidates = options.maxCandidates || 5;
-
-  if (candidatePool.length > 0) {
-    const rank1 = candidatePool[0];
-    const top5 = candidatePool.slice(0, Math.min(maxCandidates, candidatePool.length));
-
-    // Check if any candidate in top 5 is a caller or callee of rank 1
-    const hasRank1NeighborInTop5 = top5.some(
-      (c) =>
-        c !== rank1 &&
-        ((c.relatedTo && c.relatedTo.includes(rank1.name)) ||
-          (rank1.relatedTo && rank1.relatedTo.includes(c.name)))
-    );
-
-    if (!hasRank1NeighborInTop5 && candidatePool.length > maxCandidates) {
-      // Find the best neighbor of rank 1 outside top 5
-      const neighborIdx = candidatePool.findIndex(
-        (c, idx) =>
-          idx >= maxCandidates &&
-          ((c.relatedTo && c.relatedTo.includes(rank1.name)) ||
-            (rank1.relatedTo && rank1.relatedTo.includes(c.name)))
-      );
-      if (neighborIdx !== -1) {
-        const neighborCand = candidatePool.splice(neighborIdx, 1)[0];
-        // Insert into the 5th position (index 4)
-        candidatePool.splice(maxCandidates - 1, 0, neighborCand);
       }
     }
   }
 
-  const finalCandidates = candidatePool.slice(0, maxCandidates).map((c, i) => ({
-    ...c,
-    rank: i + 1,
-  }));
+  // 6. Sort all groups by filePath -> startLine (No rank, no score)
+  const sortFn = (
+    a: { filePath: string; startLine: number },
+    b: { filePath: string; startLine: number }
+  ) => a.filePath.localeCompare(b.filePath) || a.startLine - b.startLine;
+
+  changedFunctions.sort(sortFn);
+  const neighborFunctions = Array.from(neighborMap.values()).sort(sortFn);
+  topLevelChanges.sort(sortFn);
+  hunks.sort(sortFn);
+
+  // 7. Scope statistics
+  const changedFunctionCount = changedFunctions.length;
+  const neighborFunctionCount = neighborFunctions.length;
+  const scopeFunctionCount = changedFunctionCount + neighborFunctionCount;
+  const reductionRatio =
+    totalRepoFunctions > 0
+      ? Number(((totalRepoFunctions - scopeFunctionCount) / totalRepoFunctions).toFixed(4))
+      : 0;
 
   return {
     baselineSha,
@@ -565,6 +590,18 @@ export async function locateCandidates(
     warnings,
     totalChangedFiles,
     analyzedFiles,
-    candidates: finalCandidates,
+    changedFunctions,
+    neighborFunctions,
+    topLevelChanges,
+    hunks,
+    scopeStats: {
+      totalRepoFunctions,
+      changedFunctionCount,
+      neighborFunctionCount,
+      scopeFunctionCount,
+      reductionRatio,
+    },
   };
 }
+
+export const locateCandidates = locateChangeScope;

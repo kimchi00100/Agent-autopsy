@@ -5,7 +5,7 @@ import * as path from 'node:path';
 import * as fs from 'node:fs';
 import { execSync } from 'node:child_process';
 import { extractFunctions } from '../src/localization/function-extractor.js';
-import { locateCandidates } from '../src/localization/change-localizer.js';
+import { locateChangeScope, locateCandidates } from '../src/localization/change-localizer.js';
 import { GitEngine } from '../src/git/git-engine.js';
 import { CoreManager } from '../src/core-manager.js';
 
@@ -264,17 +264,17 @@ describe('B-1b: Change-based Candidate Localizer (change-localizer)', () => {
   const gitEngine = new GitEngine();
 
   test('기능 확인용(smoke): 12개 기본 예제', async () => {
-    interface BenchmarkResult {
+    interface SmokeResult {
       name: string;
       lang: string;
       type: string;
       expected: string;
-      top1Candidate: string;
-      isTop1: boolean;
-      isTop5: boolean;
+      inChanged: boolean;
+      inNeighbor: boolean;
+      inScope: boolean;
     }
 
-    const results: BenchmarkResult[] = [];
+    const results: SmokeResult[] = [];
 
     async function runCase(
       name: string,
@@ -291,40 +291,30 @@ describe('B-1b: Change-based Candidate Localizer (change-localizer)', () => {
         setupFn(repo);
         execSync('git add . && git commit -m "baseline"', { cwd: repo, stdio: 'ignore' });
         modifyFn(repo);
-        const res = await locateCandidates({ gitEngine }, { repoPath: repo, baselineSha: 'HEAD' });
+        const res = await locateChangeScope({ gitEngine }, { repoPath: repo, baselineSha: 'HEAD' });
 
-        const top1 = res.candidates[0]?.name || '';
-        const top5Names = res.candidates.map((c) => c.name);
+        const targets = Array.isArray(expectedGroundTruth) ? expectedGroundTruth : [expectedGroundTruth];
+        const inChanged = res.changedFunctions.some((f) => targets.includes(f.name));
+        const inNeighbor = res.neighborFunctions.some((f) => targets.includes(f.name));
+        const inScope = inChanged || inNeighbor;
 
-        let isTop1 = false;
-        let isTop5 = false;
-
-        if (Array.isArray(expectedGroundTruth)) {
-          isTop1 = expectedGroundTruth.includes(top1);
-          isTop5 = expectedGroundTruth.some((gt) => top5Names.includes(gt));
-        } else {
-          isTop1 = top1 === expectedGroundTruth;
-          isTop5 = top5Names.includes(expectedGroundTruth);
-        }
+        assert.ok(inScope, `${name}: Ground truth must be in scope (changed or neighbor)`);
 
         if (isRipple && rippleUnchangedName) {
-          const bCand = res.candidates.find((c) => c.name === rippleUnchangedName);
-          assert.ok(bCand, `Ripple unchanged function ${rippleUnchangedName} must be in candidates`);
-          assert.ok(bCand.rank <= 5, `Ripple unchanged function ${rippleUnchangedName} must be in top 5`);
-          assert.equal(bCand.isNeighbor, true, 'Must be marked isNeighbor');
+          const bNeighbor = res.neighborFunctions.find((f) => f.name === rippleUnchangedName);
+          assert.ok(bNeighbor, `Ripple unchanged function ${rippleUnchangedName} must be in neighborFunctions`);
+          assert.ok(bNeighbor.relatedTo, `Neighbor function must specify relatedTo`);
         }
 
         results.push({
           name,
           lang,
           type,
-          expected: Array.isArray(expectedGroundTruth) ? expectedGroundTruth.join('/') : expectedGroundTruth,
-          top1Candidate: top1,
-          isTop1,
-          isTop5,
+          expected: targets.join(' / '),
+          inChanged,
+          inNeighbor,
+          inScope,
         });
-
-        assert.ok(isTop5, `${name}: Ground truth must be in top 5`);
       } finally {
         fs.rmSync(repo, { recursive: true, force: true });
       }
@@ -517,9 +507,9 @@ describe('B-1b: Change-based Candidate Localizer (change-localizer)', () => {
         언어: r.lang,
         유형: r.type,
         '기대 정답': r.expected,
-        '1위 후보': r.top1Candidate,
-        'Top-1 일치': r.isTop1 ? 'O' : 'X',
-        'Top-5 포함': r.isTop5 ? 'O' : 'X',
+        'changed 포함': r.inChanged ? 'O' : 'X',
+        'neighbor 포함': r.inNeighbor ? 'O' : 'X',
+        '범위 포함 여부': r.inScope ? 'O' : 'X',
       }))
     );
     console.log(`기능 확인용(smoke) 예제 완료: ${results.length}개 (정확도 집계 제외)`);
@@ -530,14 +520,13 @@ describe('B-1b: Change-based Candidate Localizer (change-localizer)', () => {
       name: string;
       lang: string;
       type: string;
-      totalCandidates: number;
-      groundTruth: string;
-      top1Name: string;
-      groundTruthRank: number | string;
-      isTop1: boolean;
-      isTop5: boolean;
-      expectedRandomTop1: number;
-      expectedRandomTop5: number;
+      totalRepoFunctions: number;
+      changedCount: number;
+      neighborCount: number;
+      scopeCount: number;
+      inScope: boolean;
+      location: string;
+      reductionRatio: number;
     }
 
     const results: RealisticResult[] = [];
@@ -556,42 +545,29 @@ describe('B-1b: Change-based Candidate Localizer (change-localizer)', () => {
         execSync('git add . && git commit -m "initial baseline"', { cwd: repo, stdio: 'ignore' });
         modifyFn(repo);
 
-        const res = await locateCandidates({ gitEngine }, { repoPath: repo, baselineSha: 'HEAD', maxCandidates: 25 });
-        const candidates = res.candidates;
-        const totalCandidates = candidates.length;
-
-        const top1Name = candidates[0]?.name || '(none)';
-
-        let groundTruthRank: number | string = '>5';
-        let isTop1 = false;
-        let isTop5 = false;
-
+        const res = await locateChangeScope({ gitEngine }, { repoPath: repo, baselineSha: 'HEAD' });
         const targets = Array.isArray(expectedGroundTruth) ? expectedGroundTruth : [expectedGroundTruth];
-        for (let i = 0; i < candidates.length; i++) {
-          if (targets.includes(candidates[i].name)) {
-            groundTruthRank = i + 1;
-            break;
-          }
-        }
 
-        if (groundTruthRank === 1) isTop1 = true;
-        if (typeof groundTruthRank === 'number' && groundTruthRank >= 1 && groundTruthRank <= 5) isTop5 = true;
+        const inChanged = res.changedFunctions.some((f) => targets.includes(f.name));
+        const inNeighbor = res.neighborFunctions.some((f) => targets.includes(f.name));
+        const inScope = inChanged || inNeighbor;
 
-        const expectedRandomTop1 = totalCandidates > 0 ? 1.0 / totalCandidates : 0;
-        const expectedRandomTop5 = totalCandidates > 0 ? Math.min(5, totalCandidates) / totalCandidates : 0;
+        let location = '범위 밖';
+        if (inChanged && inNeighbor) location = 'changed + neighbor';
+        else if (inChanged) location = 'changed';
+        else if (inNeighbor) location = 'neighbor';
 
         results.push({
           name,
           lang,
           type,
-          totalCandidates,
-          groundTruth: targets.join(' / '),
-          top1Name,
-          groundTruthRank,
-          isTop1,
-          isTop5,
-          expectedRandomTop1,
-          expectedRandomTop5,
+          totalRepoFunctions: res.scopeStats.totalRepoFunctions,
+          changedCount: res.scopeStats.changedFunctionCount,
+          neighborCount: res.scopeStats.neighborFunctionCount,
+          scopeCount: res.scopeStats.scopeFunctionCount,
+          inScope,
+          location,
+          reductionRatio: res.scopeStats.reductionRatio,
         });
       } finally {
         fs.rmSync(repo, { recursive: true, force: true });
@@ -2180,35 +2156,28 @@ bool isVoiceActive() { return true; }
       ['dbToLinear', 'renderVoiceFrame']
     );
 
-    console.log('\n=================== 9 Realistic Benchmark Results ===================');
+    console.log('\n=================== 9 Realistic Benchmark Results (범위 좁히기) ===================');
     console.table(
       results.map((r) => ({
         예제: r.name,
-        언어: r.lang,
-        유형: r.type,
-        '후보 수': r.totalCandidates,
-        '기대 정답': r.groundTruth,
-        '1위 후보': r.top1Name,
-        '정답 순위': r.groundTruthRank,
-        'Top-1': r.isTop1 ? 'O' : 'X',
-        'Top-5': r.isTop5 ? 'O' : 'X',
-        '무작위 Top-1': `${(r.expectedRandomTop1 * 100).toFixed(1)}%`,
-        '무작위 Top-5': `${(r.expectedRandomTop5 * 100).toFixed(1)}%`,
+        '저장소 전체 함수 수': r.totalRepoFunctions,
+        '범위 함수 수 (changed / neighbor)': `${r.scopeCount} (${r.changedCount} / ${r.neighborCount})`,
+        '정답이 범위 안에 있는가': r.inScope ? 'O' : 'X',
+        '정답 위치': r.location,
+        '범위 축소 비율': `${(r.reductionRatio * 100).toFixed(1)}%`,
       }))
     );
 
-    const top1Count = results.filter((r) => r.isTop1).length;
-    const top5Count = results.filter((r) => r.isTop5).length;
-    const avgRandomTop1 = ((results.reduce((a, b) => a + b.expectedRandomTop1, 0) / results.length) * 100).toFixed(1);
-    const avgRandomTop5 = ((results.reduce((a, b) => a + b.expectedRandomTop5, 0) / results.length) * 100).toFixed(1);
+    const inScopeCount = results.filter((r) => r.inScope).length;
+    const inScopePercent = ((inScopeCount / results.length) * 100).toFixed(1);
+    const avgReduction = ((results.reduce((a, b) => a + b.reductionRatio, 0) / results.length) * 100).toFixed(1);
 
-    console.log(`총 현실적 예제: ${results.length}개`);
-    console.log(
-      `실제 Top-1 성공률: ${top1Count}/${results.length} (${((top1Count / results.length) * 100).toFixed(1)}%) vs 무작위 기대값: ${avgRandomTop1}%`
-    );
-    console.log(
-      `실제 Top-5 성공률: ${top5Count}/${results.length} (${((top5Count / results.length) * 100).toFixed(1)}%) vs 무작위 기대값: ${avgRandomTop5}%`
-    );
+    console.log(`정답 포함 비율: ${inScopeCount}/${results.length} (${inScopePercent}%)`);
+    console.log(`평균 범위 축소 비율: ${avgReduction}%`);
+
+    for (const r of results) {
+      assert.ok(r.inScope, `${r.name}: 정답 함수가 범위(changed 또는 neighbor) 안에 있어야 함`);
+    }
   });
 
   test('Edge case 1: Untracked new file is discovered and localized', async () => {
@@ -2223,11 +2192,11 @@ bool isVoiceActive() { return true; }
         'def brand_new_feature():\n    val = 42\n    return val * 2\n'
       );
 
-      const res = await locateCandidates({ gitEngine }, { repoPath: repo, baselineSha: 'HEAD' });
+      const res = await locateChangeScope({ gitEngine }, { repoPath: repo, baselineSha: 'HEAD' });
       assert.equal(res.totalChangedFiles, 1);
-      assert.equal(res.candidates.length, 1);
-      assert.equal(res.candidates[0].name, 'brand_new_feature');
-      assert.equal(res.candidates[0].filePath, 'new_module.py');
+      assert.equal(res.changedFunctions.length, 1);
+      assert.equal(res.changedFunctions[0].name, 'brand_new_feature');
+      assert.equal(res.changedFunctions[0].filePath, 'new_module.py');
     } finally {
       fs.rmSync(repo, { recursive: true, force: true });
     }
@@ -2241,11 +2210,11 @@ bool isVoiceActive() { return true; }
 
       fs.writeFileSync(path.join(repo, 'test.py'), 'def foo():\n    return 2\n');
 
-      const res = await locateCandidates({ gitEngine }, { repoPath: repo });
+      const res = await locateChangeScope({ gitEngine }, { repoPath: repo });
       assert.equal(res.baselineSha, 'HEAD');
       assert.equal(res.baselineRule, 'NO_CHECKPOINT_HEAD');
       assert.ok(res.warnings.some((w) => w.includes('기준 시점 없음')));
-      assert.equal(res.candidates[0].name, 'foo');
+      assert.equal(res.changedFunctions[0].name, 'foo');
     } finally {
       fs.rmSync(repo, { recursive: true, force: true });
     }
@@ -2264,9 +2233,9 @@ bool isVoiceActive() { return true; }
       initialRuby[20] = 'puts "modified line 21"';
       fs.writeFileSync(path.join(repo, 'script.rb'), initialRuby.join('\n'));
 
-      const res = await locateCandidates({ gitEngine }, { repoPath: repo, baselineSha: 'HEAD' });
-      assert.equal(res.candidates.length, 1);
-      const cand = res.candidates[0];
+      const res = await locateChangeScope({ gitEngine }, { repoPath: repo, baselineSha: 'HEAD' });
+      assert.equal(res.hunks.length, 1);
+      const cand = res.hunks[0];
       assert.equal(cand.kind, 'HUNK');
       assert.ok(cand.name.includes('변경 덩어리'));
       assert.ok(cand.startLine <= 20);
@@ -2290,7 +2259,7 @@ bool isVoiceActive() { return true; }
         fs.writeFileSync(path.join(repo, `file_${i}.py`), `def func_${i}():\n    return ${i * 10}\n`);
       }
 
-      const res = await locateCandidates({ gitEngine }, { repoPath: repo, baselineSha: 'HEAD' });
+      const res = await locateChangeScope({ gitEngine }, { repoPath: repo, baselineSha: 'HEAD' });
       assert.equal(res.totalChangedFiles, 55);
       assert.equal(res.analyzedFiles, 50);
       assert.ok(res.warnings.some((w) => w.includes('50개를 초과하여 (55개)')));
@@ -2340,11 +2309,11 @@ bool isVoiceActive() { return true; }
         ensureProject: (r: string) => core!.ensureProject(r),
       };
 
-      // locateCandidates for inc1: Rule 2 (LAST_GOOD_CHECKPOINT) triggers
-      const resRule2 = await locateCandidates(locCtx, { incidentId: inc1.id });
+      // locateChangeScope for inc1: Rule 2 (LAST_GOOD_CHECKPOINT) triggers
+      const resRule2 = await locateChangeScope(locCtx, { incidentId: inc1.id });
       assert.equal(resRule2.baselineRule, 'LAST_GOOD_CHECKPOINT');
       assert.equal(resRule2.baselineSha, cp1.worktreeCommitSha || cp1.gitHeadSha);
-      assert.equal(resRule2.candidates[0].name, 'calculate');
+      assert.equal(resRule2.changedFunctions[0].name, 'calculate');
 
       // Verify incident causeVerdict is NOT escalated to CONFIRMED
       const fetchedInc1 = core.getDatabase().getIncident(inc1.id);
@@ -2364,11 +2333,11 @@ bool isVoiceActive() { return true; }
       });
       assert.equal(inc2.baseCheckpointId, cp1.id);
 
-      // locateCandidates for inc2: Rule 1 (INCIDENT_BASE_CHECKPOINT) triggers
-      const resRule1 = await locateCandidates(locCtx, { incidentId: inc2.id });
+      // locateChangeScope for inc2: Rule 1 (INCIDENT_BASE_CHECKPOINT) triggers
+      const resRule1 = await locateChangeScope(locCtx, { incidentId: inc2.id });
       assert.equal(resRule1.baselineRule, 'INCIDENT_BASE_CHECKPOINT');
       assert.equal(resRule1.baselineSha, cp1.worktreeCommitSha || cp1.gitHeadSha);
-      assert.equal(resRule1.candidates[0].name, 'calculate');
+      assert.equal(resRule1.changedFunctions[0].name, 'calculate');
 
       // Verify incident 2 causeVerdict is also UNKNOWN
       const fetchedInc2 = core.getDatabase().getIncident(inc2.id);

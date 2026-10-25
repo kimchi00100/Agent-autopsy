@@ -11,4 +11,5 @@ export * from './utils/paths.js';
 export * from './utils/security.js';
 export * from './localization/function-extractor.js';
 export * from './localization/change-localizer.js';
+export * from './localization/context-packer.js';
 export * from './core-manager.js';

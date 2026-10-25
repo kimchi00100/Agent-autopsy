@@ -28,6 +28,7 @@ import { evaluateOrchestrationDecision, createReviewChallenge, submitOrchestrati
 import { runReproduction, buildReproductionCommand } from './core/reproduction.js';
 import { searchHistory, getIncidentAttempts, getChangesSinceGoodCheckpoint } from './core/history.js';
 import { captureCheckpoint, rollbackToCheckpoint } from './core/checkpoint.js';
+import { packChangeScope, PackagedChangeScope, PackChangeScopeOptions } from './localization/context-packer.js';
 import { CoreContext } from './core/context.js';
 import {
   discoverSafeTestCommands,
@@ -579,6 +580,13 @@ export class CoreManager {
   ): WorkspaceComparison {
     return getWorkspaceComparison(this.ctx, repoPath, options);
   }
+  public async getChangeScope(
+    incidentId: string,
+    options?: PackChangeScopeOptions
+  ): Promise<PackagedChangeScope> {
+    return packChangeScope(this.ctx, incidentId, options);
+  }
+
   public async shutdown(): Promise<void> {
     for (const watcher of this.watchers.values()) {
       await watcher.stop();

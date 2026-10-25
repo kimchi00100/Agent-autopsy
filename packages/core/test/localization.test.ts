@@ -6,6 +6,7 @@ import * as fs from 'node:fs';
 import { execSync } from 'node:child_process';
 import { extractFunctions } from '../src/localization/function-extractor.js';
 import { locateChangeScope, locateCandidates } from '../src/localization/change-localizer.js';
+import { packChangeScope, packChangeScopeFromScope } from '../src/localization/context-packer.js';
 import { GitEngine } from '../src/git/git-engine.js';
 import { CoreManager } from '../src/core-manager.js';
 
@@ -284,7 +285,9 @@ describe('B-1b: Change-based Candidate Localizer (change-localizer)', () => {
       modifyFn: (repo: string) => void,
       expectedGroundTruth: string | string[],
       isRipple = false,
-      rippleUnchangedName = ''
+      rippleUnchangedName = '',
+      expectedRelatedTo = '',
+      expectedRelation: 'CALLS' | 'CALLED_BY' | '' = ''
     ): Promise<void> {
       const repo = createTempGitRepo();
       try {
@@ -303,7 +306,8 @@ describe('B-1b: Change-based Candidate Localizer (change-localizer)', () => {
         if (isRipple && rippleUnchangedName) {
           const bNeighbor = res.neighborFunctions.find((f) => f.name === rippleUnchangedName);
           assert.ok(bNeighbor, `Ripple unchanged function ${rippleUnchangedName} must be in neighborFunctions`);
-          assert.ok(bNeighbor.relatedTo, `Neighbor function must specify relatedTo`);
+          assert.equal(bNeighbor.relatedTo, expectedRelatedTo, `Neighbor function must relate to ${expectedRelatedTo}`);
+          assert.equal(bNeighbor.relation, expectedRelation, `Neighbor function relation must be ${expectedRelation}`);
         }
 
         results.push({
@@ -377,7 +381,9 @@ describe('B-1b: Change-based Candidate Localizer (change-localizer)', () => {
       },
       ['get_tax_rate', 'calculate_tax'],
       true,
-      'calculate_tax'
+      'calculate_tax',
+      'get_tax_rate',
+      'CALLS'
     );
 
     // --- 2. TypeScript Benchmarks ---
@@ -437,7 +443,9 @@ describe('B-1b: Change-based Candidate Localizer (change-localizer)', () => {
       },
       ['verifyCredentials', 'handleRequest'],
       true,
-      'handleRequest'
+      'handleRequest',
+      'verifyCredentials',
+      'CALLS'
     );
 
     // --- 3. C++ Benchmarks ---
@@ -497,7 +505,9 @@ describe('B-1b: Change-based Candidate Localizer (change-localizer)', () => {
       },
       ['fetchStatus', 'processJob'],
       true,
-      'processJob'
+      'processJob',
+      'fetchStatus',
+      'CALLS'
     );
 
     console.log('\n=================== 기능 확인용(smoke) 12개 기본 예제 ===================');
@@ -2348,6 +2358,188 @@ bool isVoiceActive() { return true; }
       if (core) {
         await core.shutdown();
       }
+      if (oldData) process.env.AUTOPSY_DATA_DIR = oldData;
+      else delete process.env.AUTOPSY_DATA_DIR;
+      if (oldCache) process.env.AUTOPSY_CACHE_DIR = oldCache;
+      else delete process.env.AUTOPSY_CACHE_DIR;
+      fs.rmSync(repo, { recursive: true, force: true });
+      fs.rmSync(tempEnv, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('B-1c: AI Delivery Package (context-packer)', () => {
+  const gitEngine = new GitEngine();
+
+  test('Language-specific comment markers for Python, TS, and C++ with separate lines', async () => {
+    const repo = createTempGitRepo();
+    try {
+      // 1. Python file with deletion trace
+      fs.writeFileSync(
+        path.join(repo, 'calc.py'),
+        'def add(a, b):\n    unused_flag = 1\n    return a + b\n'
+      );
+      // 2. TypeScript file with addition
+      fs.writeFileSync(
+        path.join(repo, 'math.ts'),
+        'export function multiply(a: number, b: number): number {\n  return a * b;\n}\n'
+      );
+      execSync('git add . && git commit -m "initial"', { cwd: repo, stdio: 'ignore' });
+
+      // Modify calc.py (pure deletion of unused_flag)
+      fs.writeFileSync(
+        path.join(repo, 'calc.py'),
+        'def add(a, b):\n    return a + b\n'
+      );
+      // Modify math.ts (modify return)
+      fs.writeFileSync(
+        path.join(repo, 'math.ts'),
+        'export function multiply(a: number, b: number): number {\n  return a * b * 2;\n}\n'
+      );
+
+      const scopeResult = await locateChangeScope({ gitEngine }, { repoPath: repo, baselineSha: 'HEAD' });
+      const pkg = packChangeScopeFromScope(null, scopeResult, repo);
+
+      // Verify Python markers: # >>> AUTOPSY
+      assert.ok(pkg.packageText.includes('# >>> AUTOPSY 이 위치에서 줄 삭제됨'));
+
+      // Verify TypeScript markers: // >>> AUTOPSY
+      assert.ok(pkg.packageText.includes('// >>> AUTOPSY 변경된 줄'));
+
+      // Verify markers are separate lines before code lines, no diff "+ " prefix
+      assert.ok(!pkg.packageText.includes('+  return a * b * 2;'));
+      assert.ok(pkg.packageText.includes('    return a + b'));
+      assert.ok(pkg.packageText.includes('  return a * b * 2;'));
+    } finally {
+      fs.rmSync(repo, { recursive: true, force: true });
+    }
+  });
+
+  test('3-Step progressive truncation preserves all function names and locations even when budget exceeded', async () => {
+    const repo = createTempGitRepo();
+    try {
+      // Create 3 large functions in Python (>120 lines each)
+      const linesF1: string[] = ['def big_func_1():'];
+      for (let i = 1; i <= 120; i++) linesF1.push(`    val_${i} = ${i}`);
+      linesF1.push('    return val_120');
+
+      const linesF2: string[] = ['def big_func_2():'];
+      for (let i = 1; i <= 120; i++) linesF2.push(`    item_${i} = ${i}`);
+      linesF2.push('    return item_120');
+
+      const linesF3: string[] = ['def big_func_3():'];
+      for (let i = 1; i <= 120; i++) linesF3.push(`    data_${i} = ${i}`);
+      linesF3.push('    return data_120');
+
+      fs.writeFileSync(path.join(repo, 'big.py'), [linesF1.join('\n'), linesF2.join('\n'), linesF3.join('\n')].join('\n\n'));
+      execSync('git add . && git commit -m "initial"', { cwd: repo, stdio: 'ignore' });
+
+      // Modify line 50 in each function
+      linesF1[50] = '    val_50 = 99999';
+      linesF2[50] = '    item_50 = 88888';
+      linesF3[50] = '    data_50 = 77777';
+      fs.writeFileSync(path.join(repo, 'big.py'), [linesF1.join('\n'), linesF2.join('\n'), linesF3.join('\n')].join('\n\n'));
+
+      const scopeResult = await locateChangeScope({ gitEngine }, { repoPath: repo, baselineSha: 'HEAD' });
+      assert.equal(scopeResult.changedFunctions.length, 3);
+
+      // Step 1 check (>100 lines reduced to +-15 lines with restricted budget)
+      const pkgStep1 = packChangeScopeFromScope(null, scopeResult, repo, { maxCharacters: 4000 });
+      assert.ok(pkgStep1.truncationStep >= 1);
+      assert.ok(pkgStep1.packageText.includes('# ... (생략) ...'));
+      assert.ok(pkgStep1.packageText.includes('big_func_1'));
+      assert.ok(pkgStep1.packageText.includes('big_func_2'));
+      assert.ok(pkgStep1.packageText.includes('big_func_3'));
+
+      // Step 2 check (tight budget 2000 chars -> signature + +-5 lines)
+      const pkgStep2 = packChangeScopeFromScope(null, scopeResult, repo, { maxCharacters: 2000 });
+      assert.ok(pkgStep2.truncationStep >= 2);
+      assert.ok(pkgStep2.packageText.includes('big_func_1'));
+      assert.ok(pkgStep2.packageText.includes('big_func_2'));
+      assert.ok(pkgStep2.packageText.includes('big_func_3'));
+
+      // Step 3 check (extreme budget 900 chars -> bodies stripped, but all names and locations preserved!)
+      const pkgStep3 = packChangeScopeFromScope(null, scopeResult, repo, { maxCharacters: 900 });
+      assert.equal(pkgStep3.truncationStep, 3);
+      assert.ok(pkgStep3.packageText.includes('big_func_1'));
+      assert.ok(pkgStep3.packageText.includes('big_func_2'));
+      assert.ok(pkgStep3.packageText.includes('big_func_3'));
+      assert.ok(pkgStep3.packageText.includes('본문 생략됨'));
+      assert.ok(pkgStep3.packageText.includes('big.py:'));
+    } finally {
+      fs.rmSync(repo, { recursive: true, force: true });
+    }
+  });
+
+  test('Package text notice and absence of ranking or confirmed cause expressions', async () => {
+    const repo = createTempGitRepo();
+    try {
+      fs.writeFileSync(path.join(repo, 'app.py'), 'def calculate(x):\n    return x + 1\n');
+      execSync('git add . && git commit -m "initial"', { cwd: repo, stdio: 'ignore' });
+      fs.writeFileSync(path.join(repo, 'app.py'), 'def calculate(x):\n    return x + 2\n');
+
+      const scopeResult = await locateChangeScope({ gitEngine }, { repoPath: repo, baselineSha: 'HEAD' });
+      const pkg = packChangeScopeFromScope(null, scopeResult, repo);
+
+      // 1. Mandatory Notice text check
+      assert.ok(pkg.packageText.includes('아래는 기준 시점 이후 바뀐 함수와 그 호출 관계에 있는 함수다.'));
+      assert.ok(pkg.packageText.includes('순위가 아니며, 실행 증거로 확인된 원인도 아니다.'));
+      assert.ok(pkg.packageText.includes('큰 변경이 버그라는 뜻이 아니다. 계산식, 비교 연산자, 빠진 필드처럼 작은 변경도 확인하라.'));
+
+      // 2. Forbidden ranking and verdict expressions check
+      assert.ok(!pkg.packageText.includes('1위'));
+      assert.ok(!pkg.packageText.includes('1순위'));
+      assert.ok(!pkg.packageText.includes('원인 확정'));
+      assert.ok(!pkg.packageText.includes('CONFIRMED'));
+      assert.ok(!pkg.packageText.includes('점수'));
+    } finally {
+      fs.rmSync(repo, { recursive: true, force: true });
+    }
+  });
+
+  test('CoreManager getChangeScope integration with incident intents and provenance', async () => {
+    const tempEnv = fs.mkdtempSync(path.join(os.tmpdir(), 'autopsy_packer_env_'));
+    const oldData = process.env.AUTOPSY_DATA_DIR;
+    const oldCache = process.env.AUTOPSY_CACHE_DIR;
+    process.env.AUTOPSY_DATA_DIR = path.join(tempEnv, 'data');
+    process.env.AUTOPSY_CACHE_DIR = path.join(tempEnv, 'cache');
+
+    const repo = createTempGitRepo();
+    let core: CoreManager | undefined;
+    try {
+      fs.writeFileSync(path.join(repo, 'service.py'), 'def process_order(price):\n    return price * 1.0\n');
+      execSync('git add . && git commit -m "initial"', { cwd: repo, stdio: 'ignore' });
+
+      core = new CoreManager();
+      core.ensureProject(repo);
+
+      const cp = core.captureCheckpoint(repo, 'clean-baseline');
+
+      fs.writeFileSync(path.join(repo, 'service.py'), 'def process_order(price):\n    return price * 0.5\n');
+
+      const inc = await core.collectIncidentBundle(repo, {
+        title: 'Discount logic incorrect',
+        userReportText: '원래는 정상 정가 청구가 되어야 하는데 실제 주문 시 가격이 절반으로 깎여서 주문됩니다.',
+        agentName: 'antigravity',
+        expectedBehavior: '정상 정가 청구',
+        observedBehavior: '가격이 절반으로 깎여서 주문',
+        reproductionCondition: 'process_order 호출',
+        verificationMethod: '단위 테스트 확인',
+        userConfirmedIntent: true,
+      });
+
+      const res = await core.getChangeScope(inc.id);
+      assert.ok(res.packageText.length > 0);
+      assert.ok(res.packageText.includes('가격이 절반으로 깎여서 주문됩니다.'));
+      assert.ok(res.packageText.includes('기대 동작 [USER_QUOTE]: 정상 정가 청구'));
+      assert.ok(res.packageText.includes('실제 증상 [USER_QUOTE]: 가격이 절반으로 깎여서 주문'));
+      assert.ok(res.packageText.includes('재현 조건 [AI_INFERRED]: process_order 호출'));
+      assert.equal(res.scopeResult.changedFunctions.length, 1);
+      assert.equal(res.scopeResult.changedFunctions[0].name, 'process_order');
+      assert.ok(res.characterCount > 0);
+      assert.equal(res.truncationStep, 0);
+    } finally {
+      if (core) await core.shutdown();
       if (oldData) process.env.AUTOPSY_DATA_DIR = oldData;
       else delete process.env.AUTOPSY_DATA_DIR;
       if (oldCache) process.env.AUTOPSY_CACHE_DIR = oldCache;

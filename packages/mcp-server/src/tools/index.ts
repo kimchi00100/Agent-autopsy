@@ -7,6 +7,7 @@ import { registerRepairTools } from './repair.js';
 import { registerOrchestrationTools } from './orchestration.js';
 import { registerDirectivesTools } from './directives.js';
 import { registerHistoryTools } from './history.js';
+import { registerLocalizationTools } from './localization.js';
 
 export function registerAllTools(
   server: McpServer,
@@ -20,6 +21,7 @@ export function registerAllTools(
   registerOrchestrationTools(server, coreManager, resolvePath);
   registerDirectivesTools(server, coreManager, resolvePath);
   registerHistoryTools(server, coreManager, resolvePath);
+  registerLocalizationTools(server, coreManager, resolvePath);
 }
 
 export {
@@ -30,4 +32,5 @@ export {
   registerOrchestrationTools,
   registerDirectivesTools,
   registerHistoryTools,
+  registerLocalizationTools,
 };

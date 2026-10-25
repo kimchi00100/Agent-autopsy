@@ -1,13 +1,10 @@
 #!/usr/bin/env node
 import * as http from 'node:http';
-import * as fs from 'node:fs';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
-import { CoreManager, extractFunctions } from '@agent-autopsy/core';
+import { CoreManager } from '@agent-autopsy/core';
 import { registerAllTools } from './tools/index.js';
-
-export { extractFunctions };
 
 const coreManager = new CoreManager();
 
@@ -62,28 +59,13 @@ function resolvePath(p?: string): string {
 registerAllTools(server, coreManager, resolvePath);
 
 // Start stdio transport
-export async function main() {
-  if (process.argv.includes('--test-extract')) {
-    const idx = process.argv.indexOf('--test-extract');
-    const filePath = process.argv[idx + 1] || 'test.py';
-    const content = process.argv[idx + 2] || (fs.existsSync(filePath) ? fs.readFileSync(filePath, 'utf8') : '');
-    const result = await extractFunctions(filePath, content);
-    process.stdout.write(JSON.stringify(result, null, 2) + '\n');
-    return;
-  }
+async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
   process.stderr.write('Agent Autopsy MCP server running on stdio\n');
 }
 
-const isDirectRun =
-  typeof require !== 'undefined' && typeof module !== 'undefined'
-    ? require.main === module
-    : true;
-
-if (isDirectRun) {
-  main().catch((error) => {
-    process.stderr.write(`Fatal error running Agent Autopsy MCP server: ${error}\n`);
-    process.exit(1);
-  });
-}
+main().catch((error) => {
+  process.stderr.write(`Fatal error running Agent Autopsy MCP server: ${error}\n`);
+  process.exit(1);
+});

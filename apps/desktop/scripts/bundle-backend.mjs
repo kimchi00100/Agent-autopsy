@@ -2,6 +2,7 @@ import * as esbuild from 'esbuild';
 import * as path from 'node:path';
 import * as fs from 'node:fs';
 import { fileURLToPath } from 'node:url';
+import { createRequire } from 'node:module';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -55,12 +56,24 @@ async function bundle() {
     fs.mkdirSync(wasmOutDir, { recursive: true });
   }
 
-  const wtsWasmCandidates = [
-    path.resolve(root, 'packages/core/node_modules/web-tree-sitter/tree-sitter.wasm'),
-    path.resolve(root, 'node_modules/web-tree-sitter/tree-sitter.wasm'),
-    path.resolve(root, 'node_modules/.pnpm/web-tree-sitter@0.24.7/node_modules/web-tree-sitter/tree-sitter.wasm'),
-  ];
-  const wtsWasmSrc = wtsWasmCandidates.find((p) => fs.existsSync(p));
+  const req = createRequire(path.resolve(root, 'packages/core/package.json'));
+
+  // Resolve web-tree-sitter wasm dynamically
+  let wtsWasmSrc = null;
+  try {
+    const wtsPkg = req.resolve('web-tree-sitter');
+    const candidate = path.join(path.dirname(wtsPkg), 'tree-sitter.wasm');
+    if (fs.existsSync(candidate)) wtsWasmSrc = candidate;
+  } catch {}
+
+  if (!wtsWasmSrc) {
+    const fallbacks = [
+      path.resolve(root, 'packages/core/node_modules/web-tree-sitter/tree-sitter.wasm'),
+      path.resolve(root, 'node_modules/web-tree-sitter/tree-sitter.wasm'),
+    ];
+    wtsWasmSrc = fallbacks.find((p) => fs.existsSync(p));
+  }
+
   if (wtsWasmSrc) {
     fs.copyFileSync(wtsWasmSrc, path.resolve(wasmOutDir, 'tree-sitter.wasm'));
     console.log('✅ tree-sitter.wasm copied successfully');
@@ -68,12 +81,22 @@ async function bundle() {
     throw new Error('tree-sitter.wasm not found for bundling');
   }
 
-  const tswCandidates = [
-    path.resolve(root, 'packages/core/node_modules/tree-sitter-wasms/out'),
-    path.resolve(root, 'node_modules/tree-sitter-wasms/out'),
-    path.resolve(root, 'node_modules/.pnpm/tree-sitter-wasms@0.1.13/node_modules/tree-sitter-wasms/out'),
-  ];
-  const tswSrcDir = tswCandidates.find((p) => fs.existsSync(p));
+  // Resolve tree-sitter-wasms dynamically
+  let tswSrcDir = null;
+  try {
+    const tswPkg = req.resolve('tree-sitter-wasms/package.json');
+    const candidate = path.join(path.dirname(tswPkg), 'out');
+    if (fs.existsSync(candidate)) tswSrcDir = candidate;
+  } catch {}
+
+  if (!tswSrcDir) {
+    const fallbacks = [
+      path.resolve(root, 'packages/core/node_modules/tree-sitter-wasms/out'),
+      path.resolve(root, 'node_modules/tree-sitter-wasms/out'),
+    ];
+    tswSrcDir = fallbacks.find((p) => fs.existsSync(p));
+  }
+
   if (tswSrcDir) {
     const requiredWasms = [
       'tree-sitter-python.wasm',

@@ -324,12 +324,23 @@ export default function SettingsView({
                               탐색된 프로젝트 명령 ({diagnostics.discoveredCommands.projectType.toUpperCase()})
                             </span>
                             <span className={`text-[10px] font-bold ${diagnostics.discoveredCommands.isCommandSafe ? 'text-emerald-600' : 'text-rose-600'}`}>
-                              {diagnostics.discoveredCommands.isCommandSafe ? '안전 검증 완료' : '위험 명령 주의'}
+                              {diagnostics.discoveredCommands.isCommandSafe ? '형식 검사 통과(확정 아님)' : '위험 명령 주의'}
                             </span>
                           </div>
                           <div className="grid grid-cols-2 gap-2 text-[11px]">
                             <div>기본 회귀 테스트: <code className="mono bg-white px-1.5 py-0.5 rounded border border-slate-200">{diagnostics.discoveredCommands.fullRegressionCmd || '-'}</code></div>
                             <div>구문 검사 도구: <code className="mono bg-white px-1.5 py-0.5 rounded border border-slate-200">{diagnostics.discoveredCommands.codeCheckCmd || '기본 인터프리터'}</code></div>
+                          </div>
+                          <div className="pt-1.5 text-[11px] border-t border-slate-200/60">
+                            {overview.project?.testCommandSignature ? (
+                              <div className="text-slate-600">
+                                확정된 명령: <code className="mono bg-white px-1.5 py-0.5 rounded border border-slate-200 font-semibold text-emerald-700">{overview.project.testCommand}</code>
+                              </div>
+                            ) : (
+                              <div className="text-amber-700">
+                                아래 &apos;검증 테스트 명령 관리 및 전자서명&apos; 카드에서 [확인 및 서명]을 눌러야 확정됩니다.
+                              </div>
+                            )}
                           </div>
                         </div>
                       )}

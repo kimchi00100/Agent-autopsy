@@ -2674,4 +2674,88 @@ Expected equality of these values:
 
     session.close();
   });
+
+  test('56. Dashboard lastTestStatus excludes isolated worktree VERIFIED_PASS and requires actual resolution', async () => {
+    const s56Repo = path.join(testRoot, 's56_overview_repo');
+    fs.mkdirSync(s56Repo, { recursive: true });
+    execFileSync('git', ['init', '-b', 'main'], { cwd: s56Repo });
+    execFileSync('git', ['config', 'user.name', 'Tester'], { cwd: s56Repo });
+    execFileSync('git', ['config', 'user.email', 'test@local'], { cwd: s56Repo });
+    fs.writeFileSync(path.join(s56Repo, 'package.json'), JSON.stringify({ name: 's56', scripts: { test: 'node test.js' } }));
+    fs.writeFileSync(path.join(s56Repo, 'calc.js'), 'function div(a, b) { return a / b; }\nmodule.exports = { div };\n');
+    fs.writeFileSync(
+      path.join(s56Repo, 'test.js'),
+      'const { div } = require("./calc");\nif (div(4, 2) !== 2) process.exit(1);\nif (div(4, 0) !== 0) process.exit(1);\nconsole.log("PASS");\n'
+    );
+    execFileSync('git', ['add', '.'], { cwd: s56Repo });
+    execFileSync('git', ['commit', '-m', 'Initial commit'], { cwd: s56Repo });
+
+    // Confirm test command so proposeAndVerifyRepair is allowed
+    core.confirmTestCommand(s56Repo, 'node test.js');
+
+    // 1. Collect incident bundle (div(4, 0) fails on workspace)
+    const incident = await core.collectIncidentBundle(s56Repo, {
+      title: 'Zero division error in div(4, 0)',
+      userReportText: '0으로 나눌 때 에러가 발생합니다.',
+      expectedBehavior: '0 반환',
+      observedBehavior: 'Infinity 반환',
+      reproductionCondition: 'div(4, 0) 호출 시',
+      verificationMethod: 'node test.js 실행',
+    });
+
+    // Overview immediately after incident collection: open incident exists
+    const overviewAfterIncident = core.getOverview(s56Repo);
+    assert.strictEqual(overviewAfterIncident.stats.openIncidents, 1);
+    assert.strictEqual(overviewAfterIncident.stats.lastTestStatus, 'FAIL');
+
+    // 2. Propose and verify repair in isolated worktree -> VERIFIED_PASS
+    const { proposal } = await core.proposeAndVerifyRepair(
+      s56Repo,
+      incident.id,
+      'Fix division by zero to return 0',
+      [
+        {
+          filePath: 'calc.js',
+          replacements: [
+            {
+              search: 'return a / b;',
+              replace: 'if (b === 0) return 0;\n  return a / b;',
+            },
+          ],
+        },
+      ]
+    );
+
+    assert.strictEqual(proposal.verificationStatus, 'VERIFIED_PASS');
+    assert.strictEqual(proposal.approvalStatus, 'AWAITING_USER');
+
+    // CRITICAL: Overview while patch is only VERIFIED_PASS in isolated worktree (unapproved, unapplied)
+    // The workspace is still broken, and the incident is still open!
+    // lastTestStatus MUST NOT be 'PASS'!
+    const overviewAfterIsolatedPass = core.getOverview(s56Repo);
+    assert.strictEqual(overviewAfterIsolatedPass.stats.openIncidents, 1);
+    assert.notStrictEqual(
+      overviewAfterIsolatedPass.stats.lastTestStatus,
+      'PASS',
+      'lastTestStatus must NOT be PASS when isolated repair passed but workspace is still unpatched and incident is open'
+    );
+    assert.strictEqual(
+      overviewAfterIsolatedPass.stats.lastTestStatus,
+      'FAIL',
+      'lastTestStatus must reflect actual workspace incident status (FAIL)'
+    );
+
+    // 3. User approves and applies repair to workspace
+    core.approveProposal(proposal.id);
+    core.applyApprovedRepair(s56Repo, proposal.id);
+
+    // Overview after approval and application: incident is RESOLVED and openIncidents is 0
+    const overviewAfterApply = core.getOverview(s56Repo);
+    assert.strictEqual(overviewAfterApply.stats.openIncidents, 0);
+    assert.strictEqual(
+      overviewAfterApply.stats.lastTestStatus,
+      'PASS',
+      'lastTestStatus must be PASS after patch is applied to workspace and incident is RESOLVED'
+    );
+  });
 });

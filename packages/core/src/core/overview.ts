@@ -25,13 +25,9 @@ export function getOverview(ctx: CoreContext, repoPath: string): ProjectOverview
     const lastTestEvent = [...ctx.db.listAgentEvents(project.id, 50)].find(
       (e) => e.kind === 'TEST_PASS' || e.kind === 'TEST_FAIL'
     );
-    const latestProposal = proposals[0];
     const latestIncident = incidents[0];
     const candidates: Array<{ at: string; status: 'PASS' | 'FAIL' }> = [];
     if (lastTestEvent) candidates.push({ at: lastTestEvent.createdAt, status: lastTestEvent.kind === 'TEST_PASS' ? 'PASS' : 'FAIL' });
-    if (latestProposal && latestProposal.verificationStatus !== 'PENDING') {
-      candidates.push({ at: latestProposal.createdAt, status: latestProposal.verificationStatus === 'VERIFIED_PASS' ? 'PASS' : 'FAIL' });
-    }
     if (latestIncident) candidates.push({ at: latestIncident.createdAt, status: latestIncident.status === 'RESOLVED' ? 'PASS' : 'FAIL' });
     candidates.sort((a, b) => b.at.localeCompare(a.at));
     if (candidates[0]) lastTestStatus = candidates[0].status;

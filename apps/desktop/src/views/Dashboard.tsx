@@ -15,11 +15,18 @@ export default function Dashboard({
   const { stats, health } = overview;
 
   const test =
-    stats.lastTestStatus === 'PASS'
-      ? { icon: <CheckCircle2 className="h-5 w-5 text-emerald-600" />, label: '정상', tone: 'text-emerald-700', sub: '최근 테스트가 통과했습니다' }
-      : stats.lastTestStatus === 'FAIL'
-        ? { icon: <XCircle className="h-5 w-5 text-rose-600" />, label: '실패', tone: 'text-rose-700', sub: '해결되지 않은 오류가 있습니다' }
-        : { icon: <HelpCircle className="h-5 w-5 text-slate-400" />, label: '기록 없음', tone: 'text-slate-500', sub: '아직 테스트 결과가 없습니다' };
+    stats.openIncidents > 0
+      ? {
+          icon: <AlertTriangle className="h-5 w-5 text-amber-600" />,
+          label: '미해결 오류 있음',
+          tone: 'text-amber-700',
+          sub: `미해결 사건 ${stats.openIncidents}건 · 격리 검증 통과는 원본 반영 전입니다`,
+        }
+      : stats.lastTestStatus === 'PASS'
+        ? { icon: <CheckCircle2 className="h-5 w-5 text-emerald-600" />, label: '정상', tone: 'text-emerald-700', sub: '최근 테스트가 통과했습니다' }
+        : stats.lastTestStatus === 'FAIL'
+          ? { icon: <XCircle className="h-5 w-5 text-rose-600" />, label: '실패', tone: 'text-rose-700', sub: '해결되지 않은 오류가 있습니다' }
+          : { icon: <HelpCircle className="h-5 w-5 text-slate-400" />, label: '기록 없음', tone: 'text-slate-500', sub: '아직 테스트 결과가 없습니다' };
 
   return (
     <div className="fade-in space-y-5">

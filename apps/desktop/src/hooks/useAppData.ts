@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   api,
   Checkpoint,
@@ -80,10 +80,21 @@ export function useAppData({ view, notify }: UseAppDataOptions) {
     } catch {}
   }, []);
 
+  const isLoadingRef = useRef(false);
+  const hasPendingLoadRef = useRef(false);
+  const loadRef = useRef<() => Promise<void>>(() => Promise.resolve());
+
   const load = useCallback(async () => {
-    loadAgents();
-    if (!repoPath) return;
+    if (isLoadingRef.current) {
+      hasPendingLoadRef.current = true;
+      return;
+    }
+    isLoadingRef.current = true;
+    hasPendingLoadRef.current = false;
+
     try {
+      loadAgents();
+      if (!repoPath) return;
       const ov = await api.overview(repoPath);
       setOverview(ov);
       if (ov.project.verificationMode) {
@@ -105,15 +116,20 @@ export function useAppData({ view, notify }: UseAppDataOptions) {
       setIncidents(inc.incidents);
       setCheckpoints(cps.checkpoints);
       setIncidentId((cur) => cur ?? inc.incidents.find((i) => i.status !== 'RESOLVED')?.id ?? inc.incidents[0]?.id ?? null);
-
-      // Silent real-time update of project diagnostics
-      if (ov.project.id) {
-        api.diagnoseProject(ov.project.id).then((r) => setDiagnostics(r.diagnostics)).catch(() => {});
-      }
     } catch (e: any) {
       setError(e.message);
+    } finally {
+      isLoadingRef.current = false;
+      if (hasPendingLoadRef.current) {
+        hasPendingLoadRef.current = false;
+        loadRef.current();
+      }
     }
   }, [repoPath, loadAgents]);
+
+  useEffect(() => {
+    loadRef.current = load;
+  }, [load]);
 
   const runOnboarding = useCallback(async () => {
     if (!overview) return;
@@ -130,11 +146,14 @@ export function useAppData({ view, notify }: UseAppDataOptions) {
     }
   }, [overview, notify, runDiagnostics, load]);
 
+  const prevViewRef = useRef<View>(view);
   useEffect(() => {
-    if (view === 'settings' && overview && !diagnostics) {
+    const justOpenedSettings = view === 'settings' && prevViewRef.current !== 'settings';
+    prevViewRef.current = view;
+    if ((justOpenedSettings || (view === 'settings' && !diagnostics)) && overview?.project?.id) {
       runDiagnostics(overview.project.id);
     }
-  }, [view, overview, diagnostics, runDiagnostics]);
+  }, [view, overview?.project?.id, diagnostics, runDiagnostics]);
 
   const handleUpdateSettings = async (mode: VerificationMode, host: HostEnvironment) => {
     if (!overview) return;
@@ -214,6 +233,7 @@ export function useAppData({ view, notify }: UseAppDataOptions) {
       localStorage.setItem(STORAGE_KEY, picked);
       setOverview(null);
       setIncidentId(null);
+      setDiagnostics(null);
       setRepoPath(picked);
     }
   }

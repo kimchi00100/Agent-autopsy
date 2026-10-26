@@ -1,12 +1,12 @@
 # Agent Autopsy 패키징 EXE 실기 동작 검증 절차서
 
-본 문서는 `<procject 경로>\apps\desktop\release\win-unpacked\AgentAutopsy.exe` 빌드 결과물을 기반으로, 사용자가 직접 전 과정을 단계별로 따라 하며 시스템의 핵심 안전 메커니즘을 점검할 수 있도록 구성된 실기 검증 매뉴얼입니다.
+본 문서는 `<저장소 경로>\apps\desktop\release\win-unpacked\AgentAutopsy.exe` (예: `C:\dev\agent-autopsy\apps\desktop\release\win-unpacked\AgentAutopsy.exe`) 빌드 결과물을 기반으로, 사용자가 직접 전 과정을 단계별로 따라 하며 시스템의 핵심 안전 메커니즘을 점검할 수 있도록 구성된 실기 검증 매뉴얼입니다.
 
 ---
 
 ## 📋 사전 준비: 독립 데모 프로젝트 생성
 
-Agent Autopsy는 열린 폴더의 상위 `.git` 루트를 프로젝트 단위로 자동 인식하므로, `<procject 경로>` 내부의 `examples/shopping-cart`를 직접 열지 않고 **프로젝트 외부의 독립된 폴더**로 복사하여 Git 저장소를 초기화합니다.
+Agent Autopsy는 열린 폴더의 상위 `.git` 루트를 프로젝트 단위로 자동 인식하므로, `<저장소 경로>`(예: `C:\dev\agent-autopsy`) 내부의 `examples/shopping-cart`를 직접 열지 않고 **프로젝트 외부의 독립된 폴더**로 복사하여 Git 저장소를 초기화합니다.
 
 ### 데모 폴더 복사 및 Git 초기화 (PowerShell)
 ```powershell
@@ -14,7 +14,7 @@ Agent Autopsy는 열린 폴더의 상위 `.git` 루트를 프로젝트 단위로
 New-Item -ItemType Directory -Path "$HOME\Desktop\autopsy-demo" -Force
 
 # 2. shopping-cart 예제 코드 복사
-Copy-Item -Recurse "<procject 경로>\examples\shopping-cart\*" "$HOME\Desktop\autopsy-demo\"
+Copy-Item -Recurse "<저장소 경로>\examples\shopping-cart\*" "$HOME\Desktop\autopsy-demo\"
 
 # 3. 독립 Git 저장소 초기화 및 첫 커밋
 cd "$HOME\Desktop\autopsy-demo"
@@ -26,8 +26,8 @@ git commit -m "Initial commit: cart with WELCOME10 coupon bug"
 ```
 
 - **데모 프로젝트 경로**: `%USERPROFILE%\Desktop\autopsy-demo`
-- **패키징된 EXE 경로**: `<procject 경로>\apps\desktop\release\win-unpacked\AgentAutopsy.exe`
-- **번들된 배포용 MCP 서버**: `<procject 경로>\apps\desktop\release\win-unpacked\resources\bundled\mcp-server.cjs`
+- **패키징된 EXE 경로**: `<저장소 경로>\apps\desktop\release\win-unpacked\AgentAutopsy.exe` (예: `C:\dev\agent-autopsy\apps\desktop\release\win-unpacked\AgentAutopsy.exe`)
+- **번들된 배포용 MCP 서버**: `<저장소 경로>\apps\desktop\release\win-unpacked\resources\bundled\mcp-server.cjs` (예: `C:\dev\agent-autopsy\apps\desktop\release\win-unpacked\resources\bundled\mcp-server.cjs`)
 
 ---
 
@@ -35,10 +35,10 @@ git commit -m "Initial commit: cart with WELCOME10 coupon bug"
 
 ### 1.1 실행 방법
 1. 파일 탐색기에서 아래 경로로 이동합니다:
-   `<procject 경로>\apps\desktop\release\win-unpacked\`
+   `<저장소 경로>\apps\desktop\release\win-unpacked\` (예: `C:\dev\agent-autopsy\apps\desktop\release\win-unpacked\`)
 2. `AgentAutopsy.exe`를 더블 클릭하여 실행합니다.
 
-> ⚠️ **주의 (실행 경로)**: 최신 빌드 결과물은 반드시 `<procject 경로>\apps\desktop\release\win-unpacked\AgentAutopsy.exe`에 생성됩니다. 이전 배포 폴더나 바탕화면의 이전 바로가기를 실행할 경우 최신 UI와 기능이 반영되지 않은 구버전 화면이 표시될 수 있으므로, 반드시 위 경로의 최신 실행 파일을 직접 실행하세요.
+> ⚠️ **주의 (실행 경로)**: 최신 빌드 결과물은 반드시 `<저장소 경로>\apps\desktop\release\win-unpacked\AgentAutopsy.exe`에 생성됩니다. 이전 배포 폴더나 바탕화면의 이전 바로가기를 실행할 경우 최신 UI와 기능이 반영되지 않은 구버전 화면이 표시될 수 있으므로, 반드시 위 경로의 최신 실행 파일을 직접 실행하세요.
 
 ### 1.2 무엇이 보이면 성공인가?
 - ✅ **즉각적인 창 로딩**: 1초 이내에 독립된 Electron 애플리케이션 창이 정상적으로 표시됩니다.
@@ -89,7 +89,7 @@ git commit -m "Initial commit: cart with WELCOME10 coupon bug"
     "agent-autopsy": {
       "command": "node",
       "args": [
-        "<procject 경로>\\apps\\desktop\\release\\win-unpacked\\resources\\bundled\\mcp-server.cjs"
+        "<저장소 경로>\\apps\\desktop\\release\\win-unpacked\\resources\\bundled\\mcp-server.cjs"
       ]
     }
   }
@@ -121,8 +121,8 @@ MCP 도구 연결만으로는 에이전트가 문제를 조사하기 전에 코�
 
 ### 3.4 무엇이 보이면 성공인가?
 - ✅ 안티그래비티 대화 세션에서 MCP 서버 목록을 조회할 때 `agent-autopsy`가 정상 로드됩니다.
-- ✅ 사용 가능한 MCP 도구 목록에 아래 17개 Agent Autopsy 공식 도구가 활성화됩니다:
-  `capture_checkpoint`, `inspect_project_state`, `collect_incident_bundle`, `propose_test_command`, `propose_and_verify_repair`, `apply_approved_repair`, `rollback_to_checkpoint`, `record_agent_event`, `submit_orchestration_review`, `request_review_challenge`, `await_user_decision`, `get_pending_directives`, `acknowledge_directive`, `run_reproduction`, `search_history`, `get_incident_attempts`, `get_changes_since_good_checkpoint`
+- ✅ 사용 가능한 MCP 도구 목록에 아래 18개 Agent Autopsy 공식 도구가 활성화됩니다:
+  `capture_checkpoint`, `inspect_project_state`, `collect_incident_bundle`, `propose_test_command`, `get_change_scope`, `propose_and_verify_repair`, `apply_approved_repair`, `rollback_to_checkpoint`, `record_agent_event`, `submit_orchestration_review`, `request_review_challenge`, `await_user_decision`, `get_pending_directives`, `acknowledge_directive`, `run_reproduction`, `search_history`, `get_incident_attempts`, `get_changes_since_good_checkpoint`
 - ✅ `AgentAutopsy.exe` 앱 좌측 사이드바의 **`연결된 에이전트`** 영역에 안티그래비티 세션이 **`활성`** 상태(초록색 펄스 점)로 나타납니다.
 
 ---

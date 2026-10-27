@@ -2,7 +2,6 @@
 import * as http from 'node:http';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
-import { z } from 'zod';
 import { CoreManager } from '@agent-autopsy/core';
 import { registerAllTools } from './tools/index.js';
 

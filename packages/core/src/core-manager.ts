@@ -27,7 +27,7 @@ import {
   acknowledgeDirective,
 } from './core/directives.js';
 import { evaluateOrchestrationDecision, createReviewChallenge, submitOrchestrationReview } from './core/orchestration.js';
-import { runReproduction, buildReproductionCommand } from './core/reproduction.js';
+import { runReproduction } from './core/reproduction.js';
 import { searchHistory, getIncidentAttempts, getChangesSinceGoodCheckpoint } from './core/history.js';
 import { captureCheckpoint, rollbackToCheckpoint } from './core/checkpoint.js';
 import { packChangeScope, PackagedChangeScope, PackChangeScopeOptions } from './localization/context-packer.js';
@@ -36,8 +36,6 @@ import {
   discoverSafeTestCommands,
   detectTestCommand,
   ensureProject,
-  computePathFingerprint,
-  computeUnapprovedChangesFingerprint,
   inspectProjectState,
   inspectProjectStateAsync,
   diagnoseProject,
@@ -278,17 +276,6 @@ export class CoreManager {
     return captureCheckpoint(this.ctx, repoPath, label, agentName, sessionId);
   }
 
-  private computePathFingerprint(fullPath: string): string {
-    return computePathFingerprint(this.ctx, fullPath);
-  }
-
-  private computeUnapprovedChangesFingerprint(
-    repoPath: string,
-    unapprovedTracked: string[],
-    unapprovedUntracked: string[]
-  ): string {
-    return computeUnapprovedChangesFingerprint(this.ctx, repoPath, unapprovedTracked, unapprovedUntracked);
-  }
 
   public inspectProjectState(repoPathOrProject: string | Project): ProjectHealth {
     return inspectProjectState(this.ctx, repoPathOrProject);
@@ -528,9 +515,6 @@ export class CoreManager {
   }
 
 
-  private buildReproductionCommand(confirmedRunner: string, relTestPath: string): string {
-    return buildReproductionCommand(confirmedRunner, relTestPath);
-  }
 
   public getIncidentNextAction(incident: Incident): NextAction {
     return getIncidentNextAction(incident);

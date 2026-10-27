@@ -98,6 +98,15 @@ export class AutopsyDatabase {
     }
   }
 
+  public getDataVersion(): number {
+    try {
+      const row = this.db.prepare('PRAGMA data_version;').get() as { data_version: number } | undefined;
+      return row?.data_version ?? 0;
+    } catch {
+      return 0;
+    }
+  }
+
   private initPragmas(): void {
     this.db.exec('PRAGMA journal_mode = WAL;');
     this.db.exec('PRAGMA busy_timeout = 5000;');

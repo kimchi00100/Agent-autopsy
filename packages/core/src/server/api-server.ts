@@ -11,6 +11,7 @@ export class ApiServer {
   private pollTimer: NodeJS.Timeout | null = null;
   private assignedPort: number = 3847;
   private sessionToken: string;
+  private lastDataVersion: number = 0;
 
   constructor(
     private coreManager: CoreManager,
@@ -121,10 +122,16 @@ export class ApiServer {
             fs.writeFileSync(path.join(dataDir, 'runtime.json'), JSON.stringify(runtimeInfo, null, 2), 'utf8');
           } catch {}
 
-          // Start periodic sync (every 1.5s) to guarantee real-time updates across processes
+          this.lastDataVersion = this.coreManager.getDatabase().getDataVersion();
+
+          // Check PRAGMA data_version periodically (every 1.5s) to detect external database modifications
           this.pollTimer = setInterval(() => {
             if (this.sseClients.size > 0) {
-              this.broadcastSse('db_sync', { time: Date.now() });
+              const currentDataVersion = this.coreManager.getDatabase().getDataVersion();
+              if (currentDataVersion !== this.lastDataVersion) {
+                this.lastDataVersion = currentDataVersion;
+                this.broadcastSse('db_sync', { time: Date.now(), dataVersion: currentDataVersion });
+              }
             }
           }, 1500);
 
@@ -226,6 +233,7 @@ export class ApiServer {
     // POST /api/internal/notify (Cross-process notification from MCP server or external process)
     if (req.method === 'POST' && pathname === '/api/internal/notify') {
       const body = await this.parseJsonBody(req);
+      this.lastDataVersion = this.coreManager.getDatabase().getDataVersion();
       this.broadcastSse(body.type || 'db_sync', body.data || {});
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ success: true }));

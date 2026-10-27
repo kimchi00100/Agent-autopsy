@@ -202,7 +202,7 @@ export function useAppData({ view, notify }: UseAppDataOptions) {
     }
   }, [load]);
 
-  // Real-time SSE stream listener + periodic fallback polling (every 2.5s)
+  // Real-time SSE stream listener + periodic fallback polling (every 20s as fallback)
   useEffect(() => {
     load();
     const unsub = api.subscribeStream(() => {
@@ -210,7 +210,7 @@ export function useAppData({ view, notify }: UseAppDataOptions) {
     });
     const pollInterval = setInterval(() => {
       load();
-    }, 2500);
+    }, 20000);
     return () => {
       unsub();
       clearInterval(pollInterval);

@@ -4,6 +4,7 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as http from 'node:http';
 import * as url from 'node:url';
+import { DatabaseSync } from 'node:sqlite';
 import { execFileSync, execSync, spawn, ChildProcess } from 'node:child_process';
 import { CoreManager } from '../src/core-manager.js';
 import { Incident } from '../src/types.js';
@@ -2757,5 +2758,177 @@ Expected equality of these values:
       'PASS',
       'lastTestStatus must be PASS after patch is applied to workspace and incident is RESOLVED'
     );
+  });
+
+  test('57. Step-3-Check: PRAGMA data_version based db_sync emission on external write and MCP subprocess SSE notification', async () => {
+    const s57DataDir = path.join(testRoot, 's57_test_data');
+    fs.mkdirSync(s57DataDir, { recursive: true });
+    const s57DbPath = path.join(s57DataDir, 'autopsy.db');
+
+    const s57Core = new CoreManager({
+      customDbPath: s57DbPath,
+    });
+    s57Core.ensureProject(repoPath);
+
+    const prevDataDir = process.env.AUTOPSY_DATA_DIR;
+    process.env.AUTOPSY_DATA_DIR = s57DataDir;
+
+    const apiServer = new ApiServer(s57Core);
+    const port = await apiServer.start(3874);
+    const token = apiServer.getSessionToken();
+
+    let sseReq: http.ClientRequest | null = null;
+    try {
+      const allEvents: any[] = [];
+      const syncEvents: any[] = [];
+      sseReq = http.request(
+        {
+          hostname: '127.0.0.1',
+          port,
+          path: '/api/stream',
+          method: 'GET',
+          headers: {
+            'X-Autopsy-Token': token,
+          },
+        },
+        (res) => {
+          res.on('data', (chunk) => {
+            const lines = chunk.toString().split('\n');
+            for (const line of lines) {
+              if (line.startsWith('data: ')) {
+                try {
+                  const data = JSON.parse(line.slice(6));
+                  allEvents.push(data);
+                  if (data.type === 'db_sync') {
+                    syncEvents.push(data);
+                  }
+                } catch {}
+              }
+            }
+          });
+        }
+      );
+      sseReq.end();
+
+      // Wait 100ms for SSE connection to establish
+      await new Promise((r) => setTimeout(r, 100));
+
+      // 1. Idle check: over 2.2 seconds (longer than 1.5s interval), NO db_sync should be emitted if DB is unchanged
+      await new Promise((r) => setTimeout(r, 2200));
+      assert.strictEqual(
+        syncEvents.length,
+        0,
+        `Expected 0 db_sync events during idle, but received ${syncEvents.length}`
+      );
+
+      // 2. External DB write check: an independent SQLite connection writes to the database
+      const externalDb = new DatabaseSync(s57DbPath);
+      externalDb.exec("INSERT INTO agent_sessions (agent_name, session_id, last_seen_at, status, last_action) VALUES ('ext-agent-57', 'ext-sess-57', '2026-10-27T00:00:00Z', 'ACTIVE', 'TEST');");
+      externalDb.close();
+
+      // Within 2.0s (server sync timer is 1.5s), the server should detect data_version change and emit db_sync
+      await new Promise((r) => setTimeout(r, 2000));
+      assert.ok(
+        syncEvents.length >= 1,
+        `Expected at least 1 db_sync event within 2.0s after external DB write, but got ${syncEvents.length}`
+      );
+
+      // 3. Subsequent idle check: no further writes, so no new db_sync should be emitted
+      const countAfterWrite = syncEvents.length;
+      await new Promise((r) => setTimeout(r, 2200));
+      assert.strictEqual(
+        syncEvents.length,
+        countAfterWrite,
+        `Expected no new db_sync events during subsequent idle, but count increased from ${countAfterWrite} to ${syncEvents.length}`
+      );
+
+      // 4. Real MCP Server subprocess check (Criterion 2):
+      // When external MCP server subprocess registers an incident, it notifies the server and SSE delivers incident_created
+      const monorepoRoot = fs.existsSync(path.resolve(process.cwd(), 'packages/mcp-server'))
+        ? process.cwd()
+        : path.resolve(process.cwd(), '../..');
+      const mcpDistScript = path.resolve(monorepoRoot, 'packages/mcp-server/dist/index.js');
+
+      await new Promise<void>((resolve, reject) => {
+        const cp = spawn('node', [mcpDistScript], {
+          env: { ...process.env, AUTOPSY_DATA_DIR: s57DataDir },
+          stdio: ['pipe', 'pipe', 'pipe'],
+        });
+
+        let stdoutBuf = '';
+        let hasInitialized = false;
+
+        cp.stdout.on('data', (chunk) => {
+          stdoutBuf += chunk.toString();
+          const lines = stdoutBuf.split('\n');
+          stdoutBuf = lines.pop() || '';
+
+          for (const line of lines) {
+            if (!line.trim()) continue;
+            try {
+              const msg = JSON.parse(line);
+              if (msg.id === 1 && !hasInitialized) {
+                hasInitialized = true;
+                cp.stdin.write(JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' }) + '\n');
+                cp.stdin.write(
+                  JSON.stringify({
+                    jsonrpc: '2.0',
+                    id: 2,
+                    method: 'tools/call',
+                    params: {
+                      name: 'collect_incident_bundle',
+                      arguments: {
+                        repoPath,
+                        title: 'MCP 프로세스 실시간 SSE 알림 테스트 57',
+                        userReportText: 'MCP 프로세스 실시간 SSE 알림 테스트 원문',
+                        errorOutput: 'AssertionError: mcp sse test',
+                      },
+                    },
+                  }) + '\n'
+                );
+              } else if (msg.id === 2) {
+                setTimeout(() => {
+                  cp.kill();
+                  resolve();
+                }, 200);
+                return;
+              }
+            } catch {}
+          }
+        });
+
+        cp.on('error', reject);
+        cp.on('exit', (code) => {
+          if (!hasInitialized && code !== 0 && code !== null) {
+            reject(new Error(`MCP process exited with code ${code}`));
+          }
+        });
+
+        cp.stdin.write(
+          JSON.stringify({
+            jsonrpc: '2.0',
+            id: 1,
+            method: 'initialize',
+            params: {
+              protocolVersion: '2024-11-05',
+              capabilities: {},
+              clientInfo: { name: 'test-harness', version: '1.0' },
+            },
+          }) + '\n'
+        );
+      });
+
+      // Wait a short moment for cross-process SSE event propagation
+      await new Promise((r) => setTimeout(r, 600));
+      const incidentEvent = allEvents.find((e) => e.type === 'incident_created');
+      assert.ok(incidentEvent, 'Real MCP server subprocess must notify ApiServer and deliver incident_created over SSE');
+      assert.strictEqual(incidentEvent.data.title, 'MCP 프로세스 실시간 SSE 알림 테스트 57');
+    } finally {
+      process.env.AUTOPSY_DATA_DIR = prevDataDir;
+      if (sseReq) {
+        sseReq.destroy();
+      }
+      await apiServer.stop();
+    }
   });
 });

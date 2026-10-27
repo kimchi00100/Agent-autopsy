@@ -413,6 +413,11 @@ export function analyzeIncident(
         }
       } else if (repro.status === 'NOT_REPRODUCED') {
         counterEvidence.push(`[재현] 에이전트가 작성한 재현 테스트에서 실패가 재현되지 않음 (${repro.command})`);
+      } else if (repro.status === 'WRONG_FAILURE') {
+        const reason = repro.failureReason ? `: ${repro.failureReason}` : '';
+        counterEvidence.push(`[재현] 재현 테스트가 단언 실패가 아닌 다른 이유로 실패함${reason} (${repro.command})`);
+      } else if (repro.status === 'UNVERIFIED_FAILURE') {
+        counterEvidence.push(`[재현] 지원하지 않는 실행기로 실패 이유를 검증하지 못함 (${repro.command})`);
       } else {
         counterEvidence.push(`[재현] 재현 테스트 실행 불가 (${repro.command})`);
       }

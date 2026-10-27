@@ -148,12 +148,33 @@ server.tool(
       const targetPath = resolvePath(repoPath);
       const filePath = testFilePath || testCommandOrFile || '';
       const result = await coreManager.runReproduction(targetPath, incidentId, filePath);
-      const next_action: NextAction = {
-        actor: 'AGENT',
-        action: 'PROPOSE_REPAIR',
-        agent_should: '재현 테스트 결과가 기록되었습니다. 원인을 분석하고 propose_and_verify_repair로 수정안을 제출하세요.',
-        forbidden: ['원본 파일 직접 수정', 'DB 직접 수정'],
-      };
+      let message = `Reproduction test completed with status: ${result.status}`;
+      let next_action: NextAction;
+
+      if (result.status === 'WRONG_FAILURE') {
+        message = `Reproduction test completed with status: WRONG_FAILURE (${result.failureReason || result.failureKind})`;
+        next_action = {
+          actor: 'AGENT',
+          action: 'RUN_REPRODUCTION',
+          agent_should: '표준 단언문(assert, self.assertEqual, assert.strictEqual 등)으로 테스트를 고쳐 다시 실행하라',
+          forbidden: ['원본 파일 직접 수정', 'DB 직접 수정'],
+        };
+      } else if (result.status === 'UNVERIFIED_FAILURE') {
+        message = '이 실행기는 아직 실패 이유를 판정하지 못한다. 재현으로 인정되지 않는다';
+        next_action = {
+          actor: 'AGENT',
+          action: 'PROPOSE_REPAIR',
+          agent_should: '이 실행기는 아직 실패 이유를 판정하지 못한다. 재현으로 인정되지 않는다',
+          forbidden: ['원본 파일 직접 수정', 'DB 직접 수정'],
+        };
+      } else {
+        next_action = {
+          actor: 'AGENT',
+          action: 'PROPOSE_REPAIR',
+          agent_should: '재현 테스트 결과가 기록되었습니다. 원인을 분석하고 propose_and_verify_repair로 수정안을 제출하세요.',
+          forbidden: ['원본 파일 직접 수정', 'DB 직접 수정'],
+        };
+      }
       return {
         content: [
           {
@@ -161,7 +182,7 @@ server.tool(
             text: JSON.stringify(
               {
                 success: true,
-                message: `Reproduction test completed with status: ${result.status}`,
+                message,
                 reproduction: result,
                 next_action,
               },

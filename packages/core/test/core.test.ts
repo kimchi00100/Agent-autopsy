@@ -8,6 +8,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { execFileSync, execSync, spawn, ChildProcess } from 'node:child_process';
 import { CoreManager } from '../src/core-manager.js';
 import { detectUnapprovedFiles } from '../src/core/project.js';
+import { buildReproductionCommand } from '../src/core/reproduction.js';
 import { Incident } from '../src/types.js';
 import { ApiServer } from '../src/server/api-server.js';
 import { WorktreeRunner } from '../src/runner/worktree-runner.js';
@@ -3257,5 +3258,213 @@ Expected equality of these values:
       result.unapprovedFiles.includes('valid2.txt'),
       'valid2.txt must be detected as unapproved despite invalid path in batch'
     );
+  });
+
+  test('64. B-2 Step-1: Pytest structured failure diagnosis distinguishes assertion vs runtime vs import vs 0-test', async () => {
+    const pyRepo = path.join(testRoot, 'b2_pytest_repo');
+    fs.mkdirSync(path.join(pyRepo, 'src'), { recursive: true });
+    execFileSync('git', ['init', '-b', 'main'], { cwd: pyRepo });
+    execFileSync('git', ['config', 'user.name', 'Tester'], { cwd: pyRepo });
+    execFileSync('git', ['config', 'user.email', 'test@local'], { cwd: pyRepo });
+
+    fs.writeFileSync(path.join(pyRepo, 'src', 'calc.py'), 'def add(a, b):\n    return a + b\n');
+    execFileSync('git', ['add', '.'], { cwd: pyRepo });
+    execFileSync('git', ['commit', '-m', 'Init python calc'], { cwd: pyRepo });
+
+    // Confirm runner with "python -m pytest"
+    core.updateProjectSettings(pyRepo, { testCommand: 'python -m pytest' });
+
+    // Verify buildReproductionCommand keeps "python -m pytest" intact
+    const builtCmd = buildReproductionCommand('python -m pytest', 'tests/test_foo.py');
+    assert.strictEqual(builtCmd, 'python -m pytest "tests/test_foo.py"');
+
+    // Case 1: Assertion failure -> REPRODUCED, failureKind: ASSERTION
+    const inc1 = await core.collectIncidentBundle(pyRepo, '사건1 - pytest 단언 실패', 'AssertionError: assert 1 == 2');
+    fs.writeFileSync(path.join(pyRepo, 'test_assert.py'), 'def test_a():\n    assert 1 == 2\n');
+    const repro1 = await core.runReproduction(pyRepo, inc1.id, 'test_assert.py');
+    assert.strictEqual(repro1.status, 'REPRODUCED');
+    assert.strictEqual(repro1.failureKind, 'ASSERTION');
+    assert.strictEqual(repro1.testCount, 1);
+    assert.ok(repro1.failedLocation, 'failedLocation should be populated');
+
+    // Case 2: TypeError runtime error -> WRONG_FAILURE, failureKind: RUNTIME_ERROR, causeVerdict != CONFIRMED
+    const inc2 = await core.collectIncidentBundle(pyRepo, '사건2 - pytest TypeError', 'TypeError: invalid type');
+    fs.writeFileSync(path.join(pyRepo, 'test_type_error.py'), 'def test_b():\n    raise TypeError("invalid type")\n');
+    const repro2 = await core.runReproduction(pyRepo, inc2.id, 'test_type_error.py');
+    assert.strictEqual(repro2.status, 'WRONG_FAILURE');
+    assert.strictEqual(repro2.failureKind, 'RUNTIME_ERROR');
+    assert.strictEqual(repro2.testCount, 1);
+    const updatedInc2 = core.getDatabase().getIncident(inc2.id)!;
+    assert.notStrictEqual(updatedInc2.causeVerdict, 'CONFIRMED', 'causeVerdict must not elevate to CONFIRMED on WRONG_FAILURE');
+
+    // Case 3: Import failure -> WRONG_FAILURE, failureKind: COLLECTION_ERROR
+    const inc3 = await core.collectIncidentBundle(pyRepo, '사건3 - pytest 임포트 실패', 'ImportError: No module');
+    fs.writeFileSync(path.join(pyRepo, 'test_import_err.py'), 'import non_existent_pkg_xyz_123\ndef test_c():\n    pass\n');
+    const repro3 = await core.runReproduction(pyRepo, inc3.id, 'test_import_err.py');
+    assert.strictEqual(repro3.status, 'WRONG_FAILURE');
+    assert.strictEqual(repro3.failureKind, 'COLLECTION_ERROR');
+
+    // Case 4: 0 tests -> WRONG_FAILURE, failureKind: NO_TESTS
+    const inc4 = await core.collectIncidentBundle(pyRepo, '사건4 - pytest 0개 테스트', 'No tests');
+    fs.writeFileSync(path.join(pyRepo, 'test_no_tests.py'), 'def helper_func():\n    pass\n');
+    const repro4 = await core.runReproduction(pyRepo, inc4.id, 'test_no_tests.py');
+    assert.strictEqual(repro4.status, 'WRONG_FAILURE');
+    assert.strictEqual(repro4.failureKind, 'NO_TESTS');
+    assert.strictEqual(repro4.testCount, 0);
+
+    // Case 5: Passing test -> NOT_REPRODUCED
+    const inc5 = await core.collectIncidentBundle(pyRepo, '사건5 - pytest 통과', 'All ok');
+    fs.writeFileSync(path.join(pyRepo, 'test_pass.py'), 'def test_ok():\n    assert 1 == 1\n');
+    const repro5 = await core.runReproduction(pyRepo, inc5.id, 'test_pass.py');
+    assert.strictEqual(repro5.status, 'NOT_REPRODUCED');
+    assert.strictEqual(repro5.testCount, 1);
+  });
+
+  test('65. B-2 Step-1: Unittest structured failure diagnosis distinguishes assertion vs runtime vs import vs 0-test', async () => {
+    const pyRepo = path.join(testRoot, 'b2_unittest_repo');
+    fs.mkdirSync(path.join(pyRepo, 'src'), { recursive: true });
+    execFileSync('git', ['init', '-b', 'main'], { cwd: pyRepo });
+    execFileSync('git', ['config', 'user.name', 'Tester'], { cwd: pyRepo });
+    execFileSync('git', ['config', 'user.email', 'test@local'], { cwd: pyRepo });
+
+    fs.writeFileSync(path.join(pyRepo, 'src', 'calc.py'), 'def add(a, b):\n    return a + b\n');
+    execFileSync('git', ['add', '.'], { cwd: pyRepo });
+    execFileSync('git', ['commit', '-m', 'Init python calc'], { cwd: pyRepo });
+
+    // Confirm runner with "python -m unittest"
+    core.updateProjectSettings(pyRepo, { testCommand: 'python -m unittest' });
+
+    // Case 1: NameError runtime error -> WRONG_FAILURE, failureKind: RUNTIME_ERROR, causeVerdict != CONFIRMED
+    const inc1 = await core.collectIncidentBundle(pyRepo, '사건1 - unittest NameError', 'NameError: undefined');
+    fs.writeFileSync(
+      path.join(pyRepo, 'test_name_error.py'),
+      'import unittest\nclass T(unittest.TestCase):\n    def test_err(self):\n        raise NameError("undefined_var")\n'
+    );
+    const repro1 = await core.runReproduction(pyRepo, inc1.id, 'test_name_error.py');
+    assert.strictEqual(repro1.status, 'WRONG_FAILURE');
+    assert.strictEqual(repro1.failureKind, 'RUNTIME_ERROR');
+    const updatedInc1 = core.getDatabase().getIncident(inc1.id)!;
+    assert.notStrictEqual(updatedInc1.causeVerdict, 'CONFIRMED', 'causeVerdict must not elevate to CONFIRMED on WRONG_FAILURE');
+
+    // Case 2: Import failure -> WRONG_FAILURE, failureKind: COLLECTION_ERROR
+    const inc2 = await core.collectIncidentBundle(pyRepo, '사건2 - unittest 임포트 실패', 'ImportError');
+    fs.writeFileSync(
+      path.join(pyRepo, 'test_import_err.py'),
+      'import unittest\nimport non_existent_pkg_abc\nclass T(unittest.TestCase):\n    def test_x(self):\n        pass\n'
+    );
+    const repro2 = await core.runReproduction(pyRepo, inc2.id, 'test_import_err.py');
+    assert.strictEqual(repro2.status, 'WRONG_FAILURE');
+    assert.strictEqual(repro2.failureKind, 'COLLECTION_ERROR');
+
+    // Case 3: 0 tests -> WRONG_FAILURE, failureKind: NO_TESTS
+    const inc3 = await core.collectIncidentBundle(pyRepo, '사건3 - unittest 0개 테스트', 'No tests');
+    fs.writeFileSync(path.join(pyRepo, 'test_no_tests.py'), 'class Helper:\n    pass\n');
+    const repro3 = await core.runReproduction(pyRepo, inc3.id, 'test_no_tests.py');
+    assert.strictEqual(repro3.status, 'WRONG_FAILURE');
+    assert.strictEqual(repro3.failureKind, 'NO_TESTS');
+    assert.strictEqual(repro3.testCount, 0);
+
+    // Case 4: Passing test -> NOT_REPRODUCED
+    const inc4 = await core.collectIncidentBundle(pyRepo, '사건4 - unittest 통과', 'Pass');
+    fs.writeFileSync(
+      path.join(pyRepo, 'test_pass.py'),
+      'import unittest\nclass T(unittest.TestCase):\n    def test_ok(self):\n        self.assertEqual(1, 1)\n'
+    );
+    const repro4 = await core.runReproduction(pyRepo, inc4.id, 'test_pass.py');
+    assert.strictEqual(repro4.status, 'NOT_REPRODUCED');
+  });
+
+  test('66. B-2 Step-1: Node:test structured failure diagnosis distinguishes assertion vs runtime vs timeout vs 0-test', async () => {
+    const jsRepo = path.join(testRoot, 'b2_nodetest_repo');
+    fs.mkdirSync(jsRepo, { recursive: true });
+    execFileSync('git', ['init', '-b', 'main'], { cwd: jsRepo });
+    execFileSync('git', ['config', 'user.name', 'Tester'], { cwd: jsRepo });
+    execFileSync('git', ['config', 'user.email', 'test@local'], { cwd: jsRepo });
+
+    fs.writeFileSync(path.join(jsRepo, 'package.json'), JSON.stringify({ type: 'module' }));
+    fs.writeFileSync(path.join(jsRepo, 'index.js'), 'export function foo() { return 1; }\n');
+    execFileSync('git', ['add', '.'], { cwd: jsRepo });
+    execFileSync('git', ['commit', '-m', 'Init js repo'], { cwd: jsRepo });
+
+    // Confirm runner with "node --test"
+    core.updateProjectSettings(jsRepo, { testCommand: 'node --test' });
+
+    // Case 1: Assertion failure -> REPRODUCED, failureKind: ASSERTION
+    const inc1 = await core.collectIncidentBundle(jsRepo, '사건1 - node:test 단언 실패', 'ERR_ASSERTION');
+    fs.writeFileSync(
+      path.join(jsRepo, 'test_assert.mjs'),
+      'import test from "node:test";\nimport assert from "node:assert";\ntest("assert fail", () => { assert.strictEqual(1, 2); });\n'
+    );
+    const repro1 = await core.runReproduction(jsRepo, inc1.id, 'test_assert.mjs');
+    assert.strictEqual(repro1.status, 'REPRODUCED');
+    assert.strictEqual(repro1.failureKind, 'ASSERTION');
+    assert.strictEqual(repro1.testCount, 1);
+    assert.ok(repro1.failedLocation, 'failedLocation should be populated');
+
+    // Case 2: TypeError runtime error -> WRONG_FAILURE, failureKind: RUNTIME_ERROR, causeVerdict != CONFIRMED
+    const inc2 = await core.collectIncidentBundle(jsRepo, '사건2 - node:test TypeError', 'TypeError');
+    fs.writeFileSync(
+      path.join(jsRepo, 'test_type_error.mjs'),
+      'import test from "node:test";\ntest("type err", () => { const o = null; o.foo(); });\n'
+    );
+    const repro2 = await core.runReproduction(jsRepo, inc2.id, 'test_type_error.mjs');
+    assert.strictEqual(repro2.status, 'WRONG_FAILURE');
+    assert.strictEqual(repro2.failureKind, 'RUNTIME_ERROR');
+    assert.strictEqual(repro2.testCount, 1);
+    const updatedInc2 = core.getDatabase().getIncident(inc2.id)!;
+    assert.notStrictEqual(updatedInc2.causeVerdict, 'CONFIRMED', 'causeVerdict must not elevate to CONFIRMED on WRONG_FAILURE');
+
+    // Case 3: Import failure -> WRONG_FAILURE, failureKind: COLLECTION_ERROR
+    const inc3 = await core.collectIncidentBundle(jsRepo, '사건3 - node:test 임포트 실패', 'ERR_MODULE_NOT_FOUND');
+    fs.writeFileSync(
+      path.join(jsRepo, 'test_import_err.mjs'),
+      'import nonExistent from "./non_existent_pkg_xyz.mjs";\nimport test from "node:test";\ntest("import", () => {});\n'
+    );
+    const repro3 = await core.runReproduction(jsRepo, inc3.id, 'test_import_err.mjs');
+    assert.strictEqual(repro3.status, 'WRONG_FAILURE');
+    assert.strictEqual(repro3.failureKind, 'COLLECTION_ERROR');
+
+    // Case 4: 0 tests -> WRONG_FAILURE, failureKind: NO_TESTS
+    const inc4 = await core.collectIncidentBundle(jsRepo, '사건4 - node:test 0개 테스트', 'No tests');
+    fs.writeFileSync(path.join(jsRepo, 'test_no_tests.mjs'), 'console.log("no test functions in this file");\n');
+    const repro4 = await core.runReproduction(jsRepo, inc4.id, 'test_no_tests.mjs');
+    assert.strictEqual(repro4.status, 'WRONG_FAILURE');
+    assert.strictEqual(repro4.failureKind, 'NO_TESTS');
+    assert.strictEqual(repro4.testCount, 0);
+
+    // Case 5: Passing test -> NOT_REPRODUCED
+    const inc5 = await core.collectIncidentBundle(jsRepo, '사건5 - node:test 통과', 'Pass');
+    fs.writeFileSync(
+      path.join(jsRepo, 'test_pass.mjs'),
+      'import test from "node:test";\nimport assert from "node:assert";\ntest("ok", () => { assert.strictEqual(1, 1); });\n'
+    );
+    const repro5 = await core.runReproduction(jsRepo, inc5.id, 'test_pass.mjs');
+    assert.strictEqual(repro5.status, 'NOT_REPRODUCED');
+    assert.strictEqual(repro5.testCount, 1);
+  });
+
+  test('67. B-2 Step-1: Unsupported test runner failing test yields UNVERIFIED_FAILURE without fake CONFIRMED', async () => {
+    const unsuppRepo = path.join(testRoot, 'b2_unsupported_repo');
+    fs.mkdirSync(unsuppRepo, { recursive: true });
+    execFileSync('git', ['init', '-b', 'main'], { cwd: unsuppRepo });
+    execFileSync('git', ['config', 'user.name', 'Tester'], { cwd: unsuppRepo });
+    execFileSync('git', ['config', 'user.email', 'test@local'], { cwd: unsuppRepo });
+
+    fs.writeFileSync(path.join(unsuppRepo, 'dummy.txt'), 'hello');
+    execFileSync('git', ['add', '.'], { cwd: unsuppRepo });
+    execFileSync('git', ['commit', '-m', 'Init unsupp repo'], { cwd: unsuppRepo });
+
+    // Confirm runner with "node" (standalone script runner, unsupported for assertion checking)
+    core.updateProjectSettings(unsuppRepo, { testCommand: 'node' });
+
+    const inc = await core.collectIncidentBundle(unsuppRepo, '지원 안 하는 러너 사건', 'Crash');
+    fs.writeFileSync(path.join(unsuppRepo, 'fail_script.js'), 'console.error("something failed"); process.exit(1);\n');
+
+    const repro = await core.runReproduction(unsuppRepo, inc.id, 'fail_script.js');
+    assert.strictEqual(repro.status, 'UNVERIFIED_FAILURE');
+    assert.strictEqual(repro.failureKind, 'UNKNOWN_RUNNER');
+
+    const updatedInc = core.getDatabase().getIncident(inc.id)!;
+    assert.notStrictEqual(updatedInc.causeVerdict, 'CONFIRMED', 'UNVERIFIED_FAILURE must not elevate to CONFIRMED');
   });
 });

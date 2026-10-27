@@ -107,6 +107,7 @@ import {
   WorkspaceComparison,
   ReproductionResult,
   ReproductionStatus,
+  ReproductionFailureKind,
   IntentSource,
   IntentProvenance,
   StructuredIntents,

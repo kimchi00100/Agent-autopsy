@@ -94,7 +94,21 @@ export interface Checkpoint {
   createdAt: string;
 }
 
-export type ReproductionStatus = 'REPRODUCED' | 'NOT_REPRODUCED' | 'CANNOT_RUN';
+export type ReproductionStatus =
+  | 'REPRODUCED'
+  | 'NOT_REPRODUCED'
+  | 'CANNOT_RUN'
+  | 'WRONG_FAILURE'
+  | 'UNVERIFIED_FAILURE';
+
+export type ReproductionFailureKind =
+  | 'ASSERTION'
+  | 'RUNTIME_ERROR'
+  | 'COLLECTION_ERROR'
+  | 'TIMEOUT'
+  | 'NO_TESTS'
+  | 'NO_REPORT'
+  | 'UNKNOWN_RUNNER';
 
 export interface ReproductionResult {
   status: ReproductionStatus;
@@ -103,6 +117,9 @@ export interface ReproductionResult {
   output: string;
   failedLocation?: { filePath: string; line: number };
   executedAt: string;
+  failureKind?: ReproductionFailureKind;
+  failureReason?: string;
+  testCount?: number;
 }
 
 export type Severity = 'HIGH' | 'MEDIUM' | 'LOW' | 'UNASSESSED';

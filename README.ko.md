@@ -115,6 +115,8 @@ Node.js 22.5 이상, pnpm, Git 2.40 이상이 필요합니다. 패키징된 앱�
   <a href="docs/screenshots/dashboard.jpeg"><img src="docs/screenshots/dashboard.jpeg" alt="대시보드" width="100%" /></a>
 </p>
 
+측정 결과([자세히](docs/performance.md)), 변경 파일이 50개일 때 `POST /api/overview` 응답 시간은 4,351 ms → 199 ms(3회 측정의 중앙값)로 줄었고, 60초 동안 아무 작업도 안 할 때 실행된 git 프로세스 수는 1,104 → 9로 줄었습니다. 측정 조건(노트북 1대, 작은 예제 저장소)은 [performance.md](docs/performance.md)에 정리되어 있습니다.
+
 <sub>스크린샷은 예제 프로젝트(<code>idle-rpg</code>)로 찍었고, 최근 업데이트 이전 화면입니다.</sub>
 
 ## 동작 방식
@@ -167,7 +169,7 @@ agent-autopsy/
 │  └─ src/localization/              tree-sitter 함수 추출기, 변경 범위 분석기, AI 전달 패키지
 ├─ packages/mcp-server/              코딩 에이전트용 MCP 서버와 도구
 ├─ examples/                         예제 프로젝트
-└─ docs/                             스크린샷과 이미지
+└─ docs/                             스크린샷, 이미지, 성능 측정 기록
 ```
 
 ## 개발
@@ -189,8 +191,10 @@ pnpm test        # 코어와 변경 범위 테스트, 임시 데이터 폴더에
 - [x] 변경 범위: 지난 체크포인트 이후 바뀐 함수와 호출 관계 (Python, JS/TS, C/C++)
 - [ ] 재현 테스트 검증: 엉뚱한 이유로 실패하는 테스트 거르기
 - [ ] 변경 범위 안에서 커버리지 기반 순위 (Python, JS/TS, C/C++ 순서)
-- [ ] 변조 흔적이 남는 감사 기록, DB 직접 수정 감지
-- [ ] 더 빠른 대시보드, 영어 UI 완성
+- [x] 변조 흔적이 남는 감사 기록과 수정안 서명
+- [ ] DB 직접 수정 감지
+- [x] 더 빠른 대시보드 갱신 ([자세히](docs/performance.md))
+- [ ] 영어 UI 완성
 
 ## 연락처
 

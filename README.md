@@ -115,6 +115,8 @@ Then open your project in the desktop app and confirm its test command once. Unc
   <a href="docs/screenshots/dashboard.jpeg"><img src="docs/screenshots/dashboard.jpeg" alt="Dashboard" width="100%" /></a>
 </p>
 
+In benchmark runs ([details](docs/performance.md)), `POST /api/overview` response time with 50 changed files went from 4,351 ms → 199 ms (median of 3 rounds), and git processes spawned while idle for 60 seconds went from 1,104 → 9. Measurement conditions (a single laptop, small sample repositories) are documented in [performance.md](docs/performance.md).
+
 <sub>Screenshots are from a sample project (<code>idle-rpg</code>) and predate the latest updates. The dashboard UI is Korean-first today; full English UI is on the roadmap.</sub>
 
 ## How it works
@@ -167,7 +169,7 @@ agent-autopsy/
 │  └─ src/localization/              tree-sitter function extractor, change-scope localizer, context packer
 ├─ packages/mcp-server/              MCP server and tools for coding agents
 ├─ examples/                         Sample projects
-└─ docs/                             Screenshots and images
+└─ docs/                             Screenshots, images, performance notes
 ```
 
 ## Development
@@ -189,8 +191,10 @@ pnpm test        # core and localization tests, run against a temporary data dir
 - [x] Change scope: functions changed since the last checkpoint, with callers and callees (Python, JS/TS, C/C++)
 - [ ] Reproduction test gate: reject tests that fail for the wrong reason
 - [ ] Coverage-based ranking inside the change scope (Python, then JS/TS, then C/C++)
-- [ ] Tamper-evident audit log and detection of direct database writes
-- [ ] Faster dashboard and full English UI
+- [x] Tamper-evident audit log and signed patch proposals
+- [ ] Detection of direct database writes
+- [x] Faster dashboard refresh ([details](docs/performance.md))
+- [ ] Full English UI
 
 ## Contact
 

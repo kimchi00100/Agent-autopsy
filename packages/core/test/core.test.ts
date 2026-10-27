@@ -7,6 +7,7 @@ import * as url from 'node:url';
 import { DatabaseSync } from 'node:sqlite';
 import { execFileSync, execSync, spawn, ChildProcess } from 'node:child_process';
 import { CoreManager } from '../src/core-manager.js';
+import { detectUnapprovedFiles } from '../src/core/project.js';
 import { Incident } from '../src/types.js';
 import { ApiServer } from '../src/server/api-server.js';
 import { WorktreeRunner } from '../src/runner/worktree-runner.js';
@@ -3138,6 +3139,123 @@ Expected equality of these values:
     assert.ok(
       untracked.includes('fresh_untracked.txt'),
       'Working tree modifications must be reflected immediately in git status'
+    );
+  });
+
+  test('61. Step-4-TA1: non-ASCII Korean file name in git status matches the actual filename without octal escapes', () => {
+    const ta1Repo = path.join(testRoot, 'ta1_korean_status_repo');
+    fs.mkdirSync(ta1Repo, { recursive: true });
+    execFileSync('git', ['init', '-b', 'main'], { cwd: ta1Repo });
+    execFileSync('git', ['config', 'user.name', 'Tester'], { cwd: ta1Repo });
+    execFileSync('git', ['config', 'user.email', 'test@local'], { cwd: ta1Repo });
+
+    fs.writeFileSync(path.join(ta1Repo, 'init.txt'), 'init\n');
+    execFileSync('git', ['add', '.'], { cwd: ta1Repo });
+    execFileSync('git', ['commit', '-m', 'init commit'], { cwd: ta1Repo });
+
+    const koreanFile = '한글파일.js';
+    fs.writeFileSync(path.join(ta1Repo, koreanFile), 'console.log("hello");\n');
+
+    const statusSync = core.inspectProjectState(ta1Repo);
+    assert.deepStrictEqual(
+      statusSync.untrackedFiles,
+      [koreanFile],
+      'Sync inspectProjectState must return exact Korean filename in untrackedFiles'
+    );
+
+    execFileSync('git', ['add', '.'], { cwd: ta1Repo });
+    execFileSync('git', ['commit', '-m', 'add korean file'], { cwd: ta1Repo });
+    fs.appendFileSync(path.join(ta1Repo, koreanFile), '// edit\n');
+
+    const statusSyncDirty = core.inspectProjectState(ta1Repo);
+    assert.deepStrictEqual(
+      statusSyncDirty.changedFiles,
+      [koreanFile],
+      'Sync inspectProjectState must return exact Korean filename in changedFiles'
+    );
+  });
+
+  test('62. Step-4-TA2: ascii.js and 한글파일.js are both detected as unapproved when checkpoint has both and diff occurs', async () => {
+    const ta2Repo = path.join(testRoot, 'ta2_korean_unapproved_repo');
+    fs.mkdirSync(ta2Repo, { recursive: true });
+    execFileSync('git', ['init', '-b', 'main'], { cwd: ta2Repo });
+    execFileSync('git', ['config', 'user.name', 'Tester'], { cwd: ta2Repo });
+    execFileSync('git', ['config', 'user.email', 'test@local'], { cwd: ta2Repo });
+
+    const koreanFile = '한글파일.js';
+    fs.writeFileSync(path.join(ta2Repo, 'ascii.js'), 'console.log("ascii 1");\n');
+    fs.writeFileSync(path.join(ta2Repo, koreanFile), 'console.log("korean 1");\n');
+    execFileSync('git', ['add', '.'], { cwd: ta2Repo });
+    execFileSync('git', ['commit', '-m', 'initial commit with korean'], { cwd: ta2Repo });
+
+    // Both files modified before checkpoint
+    fs.appendFileSync(path.join(ta2Repo, 'ascii.js'), '// cp dirty\n');
+    fs.appendFileSync(path.join(ta2Repo, koreanFile), '// cp dirty\n');
+
+    core.ensureProject(ta2Repo);
+    await core.captureCheckpoint(ta2Repo, 'checkpoint with both files');
+
+    // Both files modified further after checkpoint -> both MUST be unapproved
+    fs.appendFileSync(path.join(ta2Repo, 'ascii.js'), '// further dirty\n');
+    fs.appendFileSync(path.join(ta2Repo, koreanFile), '// further dirty\n');
+
+    const healthSync = core.inspectProjectState(ta2Repo);
+    const unapprovedSync = (healthSync.unapprovedFiles || []).map((f) => f.replace(/\\/g, '/')).sort();
+
+    const healthAsync = await (core as any).inspectProjectStateAsync(ta2Repo);
+    const unapprovedAsync = (healthAsync.unapprovedFiles || []).map((f: string) => f.replace(/\\/g, '/')).sort();
+
+    const expected = ['ascii.js', koreanFile].sort();
+    assert.deepStrictEqual(
+      unapprovedSync,
+      expected,
+      'Both ascii.js and 한글파일.js must be caught as unapproved changes in sync path'
+    );
+    assert.deepStrictEqual(
+      unapprovedAsync,
+      expected,
+      'Both ascii.js and 한글파일.js must be caught as unapproved changes in async path'
+    );
+  });
+
+  test('63. Step-4-TA3: batch diff fallback to file-by-file preserves detection of valid files when invalid path is mixed in batch', () => {
+    const ta3Repo = path.join(testRoot, 'ta3_fallback_repo');
+    fs.mkdirSync(ta3Repo, { recursive: true });
+    execFileSync('git', ['init', '-b', 'main'], { cwd: ta3Repo });
+    execFileSync('git', ['config', 'user.name', 'Tester'], { cwd: ta3Repo });
+    execFileSync('git', ['config', 'user.email', 'test@local'], { cwd: ta3Repo });
+
+    fs.writeFileSync(path.join(ta3Repo, 'valid1.txt'), 'v1\n');
+    fs.writeFileSync(path.join(ta3Repo, 'valid2.txt'), 'v2\n');
+    execFileSync('git', ['add', '.'], { cwd: ta3Repo });
+    execFileSync('git', ['commit', '-m', 'commit valid files'], { cwd: ta3Repo });
+
+    const headSha = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: ta3Repo, encoding: 'utf8' }).trim();
+    const fakeCheckpoint: any = {
+      id: 'cp_fake',
+      changedFiles: ['valid1.txt', 'valid2.txt', '/355/invalid.js'],
+      untrackedFiles: [],
+      worktreeCommitSha: headSha,
+    };
+
+    fs.appendFileSync(path.join(ta3Repo, 'valid1.txt'), 'dirty\n');
+    fs.appendFileSync(path.join(ta3Repo, 'valid2.txt'), 'dirty\n');
+
+    const gitStatus: any = {
+      isClean: false,
+      changedFiles: ['valid1.txt', 'valid2.txt', '/355/invalid.js'],
+      untrackedFiles: [],
+    };
+
+    const result = detectUnapprovedFiles((core as any).gitEngine, ta3Repo, gitStatus, fakeCheckpoint, 50);
+
+    assert.ok(
+      result.unapprovedFiles.includes('valid1.txt'),
+      'valid1.txt must be detected as unapproved despite invalid path in batch'
+    );
+    assert.ok(
+      result.unapprovedFiles.includes('valid2.txt'),
+      'valid2.txt must be detected as unapproved despite invalid path in batch'
     );
   });
 });

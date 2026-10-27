@@ -453,6 +453,8 @@ import {
           const batch = candidates.slice(i, i + batchSize);
           try {
             const output = gitEngine.runGit(rootPath, [
+              '-c',
+              'core.quotepath=false',
               'diff',
               '--name-only',
               latestCheckpoint.worktreeCommitSha,
@@ -466,7 +468,26 @@ import {
               }
             }
           } catch {
-            // If diff fails, match previous behavior (return false/no diff)
+            // A1: If batch diff fails (e.g. invalid path in batch), fallback to file-by-file diff
+            for (const file of batch) {
+              try {
+                const singleOutput = gitEngine.runGit(rootPath, [
+                  '-c',
+                  'core.quotepath=false',
+                  'diff',
+                  '--name-only',
+                  latestCheckpoint.worktreeCommitSha,
+                  '--',
+                  file,
+                ]);
+                if (singleOutput) {
+                  for (const line of singleOutput.split('\n')) {
+                    const clean = line.trim().replace(/^"|"$/g, '').replace(/\\/g, '/');
+                    if (clean) diffFilesSet.add(clean);
+                  }
+                }
+              } catch {}
+            }
           }
         }
 
@@ -547,6 +568,8 @@ import {
           const batch = candidates.slice(i, i + batchSize);
           try {
             const output = await gitEngine.runGitAsync(rootPath, [
+              '-c',
+              'core.quotepath=false',
               'diff',
               '--name-only',
               latestCheckpoint.worktreeCommitSha,
@@ -560,7 +583,26 @@ import {
               }
             }
           } catch {
-            // If diff fails, match previous behavior (return false/no diff)
+            // A1: If batch diff fails (e.g. invalid path in batch), fallback to file-by-file diff
+            for (const file of batch) {
+              try {
+                const singleOutput = await gitEngine.runGitAsync(rootPath, [
+                  '-c',
+                  'core.quotepath=false',
+                  'diff',
+                  '--name-only',
+                  latestCheckpoint.worktreeCommitSha,
+                  '--',
+                  file,
+                ]);
+                if (singleOutput) {
+                  for (const line of singleOutput.split('\n')) {
+                    const clean = line.trim().replace(/^"|"$/g, '').replace(/\\/g, '/');
+                    if (clean) diffFilesSet.add(clean);
+                  }
+                }
+              } catch {}
+            }
           }
         }
 

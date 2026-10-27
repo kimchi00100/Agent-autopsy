@@ -153,12 +153,12 @@ export class GitEngine {
   }
 
   public getStatus(repoPath: string): GitStatusResult {
-    const output = this.runGit(repoPath, ['status', '--porcelain=v1']);
+    const output = this.runGit(repoPath, ['-c', 'core.quotepath=false', 'status', '--porcelain=v1']);
     return this.parseStatusOutput(output);
   }
 
   public async getStatusAsync(repoPath: string): Promise<GitStatusResult> {
-    const output = await this.runGitAsync(repoPath, ['status', '--porcelain=v1']);
+    const output = await this.runGitAsync(repoPath, ['-c', 'core.quotepath=false', 'status', '--porcelain=v1']);
     return this.parseStatusOutput(output);
   }
 
@@ -330,12 +330,12 @@ export class GitEngine {
 
   public getDiff(repoPath: string, fromRef?: string, toRef?: string): string {
     if (fromRef && toRef) {
-      return this.runGit(repoPath, ['diff', `${fromRef}..${toRef}`]);
+      return this.runGit(repoPath, ['-c', 'core.quotepath=false', 'diff', `${fromRef}..${toRef}`]);
     }
     if (fromRef) {
-      return this.runGit(repoPath, ['diff', fromRef]);
+      return this.runGit(repoPath, ['-c', 'core.quotepath=false', 'diff', fromRef]);
     }
-    return this.runGit(repoPath, ['diff']);
+    return this.runGit(repoPath, ['-c', 'core.quotepath=false', 'diff']);
   }
 
   public getRecentCommits(repoPath: string, limit: number = 10, headSha?: string): GitCommitInfo[] {

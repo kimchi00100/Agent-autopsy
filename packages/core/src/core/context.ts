@@ -53,7 +53,8 @@ export interface CoreContext {
     agentName?: string,
     sessionId?: string
   ) => Checkpoint;
-  inspectProjectState: (repoPath: string) => ProjectHealth;
+  inspectProjectState: (repoPathOrProject: string | Project) => ProjectHealth;
+  inspectProjectStateAsync?: (repoPathOrProject: string | Project) => Promise<ProjectHealth>;
   recordAgentEvent: (
     repoPath: string,
     kind: AgentEventKind,

@@ -1,4 +1,4 @@
-import { execFileSync } from 'node:child_process';
+import { execFileSync, execFile } from 'node:child_process';
 import * as path from 'node:path';
 import * as fs from 'node:fs';
 import * as crypto from 'node:crypto';
@@ -26,6 +26,31 @@ export interface SnapshotResult {
 }
 
 export class GitEngine {
+  /**
+   * Cache 1: Input path -> repository root (`git rev-parse --show-toplevel`).
+   * Invalidation condition:
+   * - A Git repository's top-level root does not change during application runtime
+   *   for any resolved folder path within that repository.
+   * - Keyed by normalized resolved input path.
+   */
+  private repoRootCache: Map<string, string> = new Map();
+
+  /**
+   * Cache 2: Recent commits log (`HEAD sha -> GitCommitInfo[]`).
+   * Invalidation condition:
+   * - Keyed by `${resolvedRepoPath}:${headSha}:${limit}`.
+   * - When a new commit is made (or HEAD changes via rollback/checkout/rebase),
+   *   the new HEAD SHA automatically produces a cache miss and fetches fresh commits from git.
+   * - Entries remain valid as long as HEAD SHA and limit remain identical for that repository.
+   * - STRICTLY FORBIDDEN: git status and git diff are NEVER cached.
+   */
+  private commitCache: Map<string, GitCommitInfo[]> = new Map();
+
+  public clearCache(): void {
+    this.repoRootCache.clear();
+    this.commitCache.clear();
+  }
+
   public runGit(repoPath: string, args: string[], env?: Record<string, string>): string {
     try {
       const output = execFileSync('git', args, {
@@ -42,17 +67,64 @@ export class GitEngine {
     }
   }
 
+  public runGitAsync(repoPath: string, args: string[], env?: Record<string, string>): Promise<string> {
+    return new Promise((resolve, reject) => {
+      execFile(
+        'git',
+        args,
+        {
+          cwd: repoPath,
+          encoding: 'utf8',
+          maxBuffer: 10 * 1024 * 1024,
+          env: env ? { ...process.env, ...env } : process.env,
+        },
+        (error, stdout, stderr) => {
+          if (error) {
+            const errOutput = stderr ? stderr.toString() : '';
+            reject(new Error(`Git command failed [git ${args.join(' ')}]: ${errOutput || error.message}`));
+          } else {
+            resolve((stdout || '').trim());
+          }
+        }
+      );
+    });
+  }
+
   public getRepoRoot(targetPath: string): string {
+    const normalized = path.resolve(targetPath);
+    const cached = this.repoRootCache.get(normalized);
+    if (cached) {
+      return cached;
+    }
     const root = this.runGit(targetPath, ['rev-parse', '--show-toplevel']);
-    return path.resolve(root);
+    const resolved = path.resolve(root);
+    this.repoRootCache.set(normalized, resolved);
+    this.repoRootCache.set(resolved, resolved);
+    return resolved;
+  }
+
+  public async getRepoRootAsync(targetPath: string): Promise<string> {
+    const normalized = path.resolve(targetPath);
+    const cached = this.repoRootCache.get(normalized);
+    if (cached) {
+      return cached;
+    }
+    const root = await this.runGitAsync(targetPath, ['rev-parse', '--show-toplevel']);
+    const resolved = path.resolve(root);
+    this.repoRootCache.set(normalized, resolved);
+    this.repoRootCache.set(resolved, resolved);
+    return resolved;
   }
 
   public getHeadSha(repoPath: string): string {
     return this.runGit(repoPath, ['rev-parse', 'HEAD']);
   }
 
-  public getStatus(repoPath: string): GitStatusResult {
-    const output = this.runGit(repoPath, ['status', '--porcelain=v1']);
+  public async getHeadShaAsync(repoPath: string): Promise<string> {
+    return this.runGitAsync(repoPath, ['rev-parse', 'HEAD']);
+  }
+
+  private parseStatusOutput(output: string): GitStatusResult {
     if (!output) {
       return { isClean: true, changedFiles: [], untrackedFiles: [] };
     }
@@ -78,6 +150,16 @@ export class GitEngine {
       changedFiles,
       untrackedFiles,
     };
+  }
+
+  public getStatus(repoPath: string): GitStatusResult {
+    const output = this.runGit(repoPath, ['status', '--porcelain=v1']);
+    return this.parseStatusOutput(output);
+  }
+
+  public async getStatusAsync(repoPath: string): Promise<GitStatusResult> {
+    const output = await this.runGitAsync(repoPath, ['status', '--porcelain=v1']);
+    return this.parseStatusOutput(output);
   }
 
   /**
@@ -256,17 +338,40 @@ export class GitEngine {
     return this.runGit(repoPath, ['diff']);
   }
 
-  public getRecentCommits(repoPath: string, limit: number = 10): GitCommitInfo[] {
-    const output = this.runGit(repoPath, [
-      'log',
-      `-n`,
-      limit.toString(),
-      '--pretty=format:%H|%an|%ad|%s',
-      '--date=iso',
-    ]);
-    if (!output) return [];
+  public getRecentCommits(repoPath: string, limit: number = 10, headSha?: string): GitCommitInfo[] {
+    let currentHead = headSha;
+    if (!currentHead) {
+      try {
+        currentHead = this.getHeadSha(repoPath);
+      } catch {
+        currentHead = '';
+      }
+    }
+    const cacheKey = `${path.resolve(repoPath)}:${currentHead}:${limit}`;
+    if (currentHead && this.commitCache.has(cacheKey)) {
+      return this.commitCache.get(cacheKey)!;
+    }
 
-    return output.split('\n').map((line) => {
+    let output = '';
+    try {
+      output = this.runGit(repoPath, [
+        'log',
+        `-n`,
+        limit.toString(),
+        '--pretty=format:%H|%an|%ad|%s',
+        '--date=iso',
+      ]);
+    } catch {
+      output = '';
+    }
+    if (!output) {
+      if (currentHead) {
+        this.commitCache.set(cacheKey, []);
+      }
+      return [];
+    }
+
+    const commits = output.split('\n').map((line) => {
       const [sha, author, date, ...rest] = line.split('|');
       return {
         sha,
@@ -275,5 +380,61 @@ export class GitEngine {
         message: rest.join('|'),
       };
     });
+    if (currentHead) {
+      this.commitCache.set(cacheKey, commits);
+    }
+    return commits;
+  }
+
+  public async getRecentCommitsAsync(
+    repoPath: string,
+    limit: number = 10,
+    headSha?: string
+  ): Promise<GitCommitInfo[]> {
+    let currentHead = headSha;
+    if (!currentHead) {
+      try {
+        currentHead = await this.getHeadShaAsync(repoPath);
+      } catch {
+        currentHead = '';
+      }
+    }
+    const cacheKey = `${path.resolve(repoPath)}:${currentHead}:${limit}`;
+    if (currentHead && this.commitCache.has(cacheKey)) {
+      return this.commitCache.get(cacheKey)!;
+    }
+
+    let output = '';
+    try {
+      output = await this.runGitAsync(repoPath, [
+        'log',
+        `-n`,
+        limit.toString(),
+        '--pretty=format:%H|%an|%ad|%s',
+        '--date=iso',
+      ]);
+    } catch {
+      output = '';
+    }
+    if (!output) {
+      if (currentHead) {
+        this.commitCache.set(cacheKey, []);
+      }
+      return [];
+    }
+
+    const commits = output.split('\n').map((line) => {
+      const [sha, author, date, ...rest] = line.split('|');
+      return {
+        sha,
+        author,
+        date,
+        message: rest.join('|'),
+      };
+    });
+    if (currentHead) {
+      this.commitCache.set(cacheKey, commits);
+    }
+    return commits;
   }
 }

@@ -273,7 +273,7 @@ export class ApiServer {
     // POST /api/overview  { repoPath }
     if (req.method === 'POST' && pathname === '/api/overview') {
       const body = await this.parseJsonBody(req);
-      const overview = this.coreManager.getOverview(body.repoPath || process.cwd());
+      const overview = await this.coreManager.getOverviewAsync(body.repoPath || process.cwd());
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify(overview));
       return;

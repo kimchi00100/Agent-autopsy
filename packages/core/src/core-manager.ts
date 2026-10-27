@@ -1,5 +1,6 @@
 import {
   getOverview,
+  getOverviewAsync,
   getTimeline,
   getRuntimeInfo,
   getWorkspaceComparison,
@@ -38,6 +39,7 @@ import {
   computePathFingerprint,
   computeUnapprovedChangesFingerprint,
   inspectProjectState,
+  inspectProjectStateAsync,
   diagnoseProject,
   getAgentsMdTemplate,
   onboardProject,
@@ -181,6 +183,7 @@ export class CoreManager {
       ensureProject: (r, c) => this.ensureProject(r, c),
       captureCheckpoint: (r, l, a, s) => this.captureCheckpoint(r, l, a, s),
       inspectProjectState: (r) => this.inspectProjectState(r),
+      inspectProjectStateAsync: (r) => this.inspectProjectStateAsync(r),
       recordAgentEvent: (r, k, t, d, f, a, s) => this.recordAgentEvent(r, k, t, d, f, a, s),
       evaluateOrchestrationDecision: (p, t, e, d, c, v, h, r) => this.evaluateOrchestrationDecision(p, t, e, d, c, v, h, r),
       detectTestCommand: (r) => this.detectTestCommand(r),
@@ -287,8 +290,12 @@ export class CoreManager {
     return computeUnapprovedChangesFingerprint(this.ctx, repoPath, unapprovedTracked, unapprovedUntracked);
   }
 
-  public inspectProjectState(repoPath: string): ProjectHealth {
-    return inspectProjectState(this.ctx, repoPath);
+  public inspectProjectState(repoPathOrProject: string | Project): ProjectHealth {
+    return inspectProjectState(this.ctx, repoPathOrProject);
+  }
+
+  public async inspectProjectStateAsync(repoPathOrProject: string | Project): Promise<ProjectHealth> {
+    return inspectProjectStateAsync(this.ctx, repoPathOrProject);
   }
 
   public diagnoseProject(repoPath: string): ProjectDiagnostics {
@@ -496,6 +503,10 @@ export class CoreManager {
 
   public getOverview(repoPath: string): ProjectOverview {
     return getOverview(this.ctx, repoPath);
+  }
+
+  public async getOverviewAsync(repoPath: string): Promise<ProjectOverview> {
+    return getOverviewAsync(this.ctx, repoPath);
   }
 
   public getTimeline(projectId: string, limit: number = 150): TimelineEvent[] {

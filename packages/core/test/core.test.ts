@@ -2962,4 +2962,182 @@ Expected equality of these values:
       await apiServer.stop();
     }
   });
+
+  test('58. Step-4-T2: unapproved files list matches expected baseline before and after diff batching', async () => {
+    const t2Repo = path.join(testRoot, 't2_unapproved_batch_repo');
+    fs.mkdirSync(t2Repo, { recursive: true });
+    execFileSync('git', ['init', '-b', 'main'], { cwd: t2Repo });
+    execFileSync('git', ['config', 'user.name', 'Tester'], { cwd: t2Repo });
+    execFileSync('git', ['config', 'user.email', 'tester@local'], { cwd: t2Repo });
+
+    fs.writeFileSync(path.join(t2Repo, 'file_a.txt'), 'line a1\nline a2\n');
+    fs.writeFileSync(path.join(t2Repo, 'file_b.txt'), 'line b1\nline b2\n');
+    fs.writeFileSync(path.join(t2Repo, 'file_c.txt'), 'line c1\nline c2\n');
+    fs.writeFileSync(path.join(t2Repo, 'file_d.txt'), 'line d1\nline d2\n');
+    execFileSync('git', ['add', '.'], { cwd: t2Repo });
+    execFileSync('git', ['commit', '-m', 'initial files'], { cwd: t2Repo });
+
+    core.ensureProject(t2Repo);
+    await core.captureCheckpoint(t2Repo, 't2 baseline checkpoint');
+
+    // 1. Modify file_a (tracked, modified from checkpoint) -> MUST be unapproved
+    fs.appendFileSync(path.join(t2Repo, 'file_a.txt'), 'modified line a3\n');
+
+    // 2. Keep file_b untouched
+    // 3. Keep file_c untouched
+
+    // 4. Modify file_d and git add it -> MUST be unapproved
+    fs.appendFileSync(path.join(t2Repo, 'file_d.txt'), 'modified line d3\n');
+    execFileSync('git', ['add', 'file_d.txt'], { cwd: t2Repo });
+
+    // 5. Create new tracked file (not in checkpoint) -> MUST be unapproved
+    fs.writeFileSync(path.join(t2Repo, 'new_tracked.txt'), 'new tracked file\n');
+    execFileSync('git', ['add', 'new_tracked.txt'], { cwd: t2Repo });
+
+    // 6. Create new untracked files (not in checkpoint) -> MUST be unapproved
+    fs.writeFileSync(path.join(t2Repo, 'untracked_1.txt'), 'untracked 1\n');
+    fs.writeFileSync(path.join(t2Repo, 'untracked_2.txt'), 'untracked 2\n');
+
+    const health = core.inspectProjectState(t2Repo);
+    const unapproved = (health.unapprovedFiles || []).map((f) => f.replace(/\\/g, '/')).sort();
+
+    const expected = [
+      'file_a.txt',
+      'file_d.txt',
+      'new_tracked.txt',
+      'untracked_1.txt',
+      'untracked_2.txt',
+    ].sort();
+
+    assert.deepStrictEqual(
+      unapproved,
+      expected,
+      'Unapproved files list must match the expected unbatched baseline'
+    );
+  });
+
+  test('59. Step-4-T1: getOverviewAsync results match synchronous getOverview across clean and dirty states', async () => {
+    // 1. Clean repository test
+    const cleanRepo = path.join(testRoot, 't1_clean_repo');
+    fs.mkdirSync(cleanRepo, { recursive: true });
+    execFileSync('git', ['init', '-b', 'main'], { cwd: cleanRepo });
+    execFileSync('git', ['config', 'user.name', 'Tester'], { cwd: cleanRepo });
+    execFileSync('git', ['config', 'user.email', 'tester@local'], { cwd: cleanRepo });
+    fs.writeFileSync(path.join(cleanRepo, 'clean.txt'), 'clean\n');
+    execFileSync('git', ['add', '.'], { cwd: cleanRepo });
+    execFileSync('git', ['commit', '-m', 'clean commit'], { cwd: cleanRepo });
+
+    const cleanSync = core.getOverview(cleanRepo);
+    const cleanAsync = await (core as any).getOverviewAsync(cleanRepo);
+
+    // Normalize: exclude dynamic / volatile fields (quarantineBackupRef, timestamp, etc.)
+    const normalize = (ov: any) => {
+      const copy = JSON.parse(JSON.stringify(ov));
+      if (copy.health) {
+        delete copy.health.quarantineBackupRef;
+      }
+      return copy;
+    };
+
+    assert.deepStrictEqual(
+      normalize(cleanAsync),
+      normalize(cleanSync),
+      'Clean repo: getOverviewAsync must match getOverview'
+    );
+
+    // 2. Dirty repository with checkpoint (3+ tracked changed, 2+ untracked)
+    const dirtyRepo = path.join(testRoot, 't1_dirty_repo');
+    fs.mkdirSync(dirtyRepo, { recursive: true });
+    execFileSync('git', ['init', '-b', 'main'], { cwd: dirtyRepo });
+    execFileSync('git', ['config', 'user.name', 'Tester'], { cwd: dirtyRepo });
+    execFileSync('git', ['config', 'user.email', 'tester@local'], { cwd: dirtyRepo });
+    for (let i = 1; i <= 5; i++) {
+      fs.writeFileSync(path.join(dirtyRepo, `file_${i}.txt`), `initial ${i}\n`);
+    }
+    execFileSync('git', ['add', '.'], { cwd: dirtyRepo });
+    execFileSync('git', ['commit', '-m', 'dirty initial commit'], { cwd: dirtyRepo });
+
+    core.ensureProject(dirtyRepo);
+    await core.captureCheckpoint(dirtyRepo, 'checkpoint before edits');
+
+    // 3 tracked files modified
+    fs.appendFileSync(path.join(dirtyRepo, 'file_1.txt'), 'edit 1\n');
+    fs.appendFileSync(path.join(dirtyRepo, 'file_2.txt'), 'edit 2\n');
+    fs.appendFileSync(path.join(dirtyRepo, 'file_3.txt'), 'edit 3\n');
+    // 2 untracked files added
+    fs.writeFileSync(path.join(dirtyRepo, 'untracked_a.txt'), 'untracked a\n');
+    fs.writeFileSync(path.join(dirtyRepo, 'untracked_b.txt'), 'untracked b\n');
+
+    const dirtySync = core.getOverview(dirtyRepo);
+    const dirtyAsync = await (core as any).getOverviewAsync(dirtyRepo);
+
+    assert.deepStrictEqual(
+      normalize(dirtyAsync),
+      normalize(dirtySync),
+      'Dirty repo with checkpoint: getOverviewAsync must match getOverview'
+    );
+
+    // 3. Dirty repository without checkpoint (3+ tracked changed, 2+ untracked)
+    const dirtyNoCpRepo = path.join(testRoot, 't1_dirty_nocp_repo');
+    fs.mkdirSync(dirtyNoCpRepo, { recursive: true });
+    execFileSync('git', ['init', '-b', 'main'], { cwd: dirtyNoCpRepo });
+    execFileSync('git', ['config', 'user.name', 'Tester'], { cwd: dirtyNoCpRepo });
+    execFileSync('git', ['config', 'user.email', 'tester@local'], { cwd: dirtyNoCpRepo });
+    for (let i = 1; i <= 4; i++) {
+      fs.writeFileSync(path.join(dirtyNoCpRepo, `doc_${i}.txt`), `doc ${i}\n`);
+    }
+    execFileSync('git', ['add', '.'], { cwd: dirtyNoCpRepo });
+    execFileSync('git', ['commit', '-m', 'nocp initial commit'], { cwd: dirtyNoCpRepo });
+
+    fs.appendFileSync(path.join(dirtyNoCpRepo, 'doc_1.txt'), 'mod 1\n');
+    fs.appendFileSync(path.join(dirtyNoCpRepo, 'doc_2.txt'), 'mod 2\n');
+    fs.appendFileSync(path.join(dirtyNoCpRepo, 'doc_3.txt'), 'mod 3\n');
+    fs.writeFileSync(path.join(dirtyNoCpRepo, 'new_1.txt'), 'new 1\n');
+    fs.writeFileSync(path.join(dirtyNoCpRepo, 'new_2.txt'), 'new 2\n');
+
+    const noCpSync = core.getOverview(dirtyNoCpRepo);
+    const noCpAsync = await (core as any).getOverviewAsync(dirtyNoCpRepo);
+
+    assert.deepStrictEqual(
+      normalize(noCpAsync),
+      normalize(noCpSync),
+      'Dirty repo without checkpoint: getOverviewAsync must match getOverview'
+    );
+  });
+
+  test('60. Step-4-T3: commit cache invalidates on new commit and status reflects working tree changes immediately', async () => {
+    const t3Repo = path.join(testRoot, 't3_cache_invalidation_repo');
+    fs.mkdirSync(t3Repo, { recursive: true });
+    execFileSync('git', ['init', '-b', 'main'], { cwd: t3Repo });
+    execFileSync('git', ['config', 'user.name', 'Tester'], { cwd: t3Repo });
+    execFileSync('git', ['config', 'user.email', 'tester@local'], { cwd: t3Repo });
+    fs.writeFileSync(path.join(t3Repo, 'base.txt'), 'base\n');
+    execFileSync('git', ['add', '.'], { cwd: t3Repo });
+    execFileSync('git', ['commit', '-m', 'commit #1 initial'], { cwd: t3Repo });
+
+    const ov1 = await (core as any).getOverviewAsync(t3Repo);
+    assert.strictEqual(ov1.health.recentCommits[0].message, 'commit #1 initial');
+
+    // Make new commit -> HEAD changes -> commit cache must invalidate
+    fs.writeFileSync(path.join(t3Repo, 'commit2.txt'), 'second\n');
+    execFileSync('git', ['add', '.'], { cwd: t3Repo });
+    execFileSync('git', ['commit', '-m', 'commit #2 new commit'], { cwd: t3Repo });
+
+    const ov2 = await (core as any).getOverviewAsync(t3Repo);
+    assert.strictEqual(
+      ov2.health.recentCommits[0].message,
+      'commit #2 new commit',
+      'Recent commits cache must invalidate when HEAD sha changes'
+    );
+
+    // Modify file without committing -> git status must NOT be cached
+    fs.writeFileSync(path.join(t3Repo, 'fresh_untracked.txt'), 'fresh untracked\n');
+
+    const ov3 = await (core as any).getOverviewAsync(t3Repo);
+    const untracked = (ov3.health.untrackedFiles || []).map((f: string) => f.replace(/\\/g, '/'));
+    assert.ok(
+      untracked.includes('fresh_untracked.txt'),
+      'Working tree modifications must be reflected immediately in git status'
+    );
+  });
 });

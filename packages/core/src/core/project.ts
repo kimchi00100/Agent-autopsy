@@ -3,7 +3,7 @@ import * as fs from 'node:fs';
 import * as crypto from 'node:crypto';
 import { CoreContext } from './context.js';
 import { AutoBaselineWatcher } from '../watcher/auto-watcher.js';
-import { GitEngine, GitStatusResult } from '../git/git-engine.js';
+import { GitEngine, GitStatusResult, GitCommitInfo } from '../git/git-engine.js';
 import {
   resolveDataDir,
   generateDeterministicProjectId,
@@ -398,10 +398,106 @@ import {
     unapprovedFiles: string[];
   }
 
+  export interface CandidatePartitionResult {
+    unapprovedTracked: string[];
+    unapprovedUntracked: string[];
+    trackedCandidates: string[];
+    untrackedCandidates: string[];
+    candidatesToDiff: string[];
+    isFullyResolved: boolean;
+  }
+
   /**
-   * Identifies unapproved working tree changes outside the baseline checkpoint.
-   * Batches `git diff --name-only` calls into chunks of 50 files to avoid Windows command-line length limits
-   * and eliminates 1-by-1 subprocess spawning.
+   * Shared candidate classifier: separates tracked and untracked files into immediately unapproved
+   * vs candidate files that need diffing against checkpoint worktree commit.
+   */
+  export function partitionUnapprovedCandidates(
+    gitStatus: GitStatusResult,
+    latestCheckpoint?: Checkpoint | null
+  ): CandidatePartitionResult {
+    if (!latestCheckpoint) {
+      return {
+        unapprovedTracked: [...gitStatus.changedFiles],
+        unapprovedUntracked: [...gitStatus.untrackedFiles],
+        trackedCandidates: [],
+        untrackedCandidates: [],
+        candidatesToDiff: [],
+        isFullyResolved: true,
+      };
+    }
+
+    const cpChangedSet = new Set(latestCheckpoint.changedFiles || []);
+    const cpUntrackedSet = new Set(latestCheckpoint.untrackedFiles || []);
+
+    const unapprovedTracked: string[] = [];
+    const trackedCandidates: string[] = [];
+
+    for (const f of gitStatus.changedFiles) {
+      if (!cpChangedSet.has(f)) {
+        unapprovedTracked.push(f);
+      } else {
+        trackedCandidates.push(f);
+      }
+    }
+
+    const unapprovedUntracked: string[] = [];
+    const untrackedCandidates: string[] = [];
+
+    for (const f of gitStatus.untrackedFiles) {
+      if (!cpUntrackedSet.has(f)) {
+        unapprovedUntracked.push(f);
+      } else {
+        untrackedCandidates.push(f);
+      }
+    }
+
+    const candidatesToDiff = latestCheckpoint.worktreeCommitSha
+      ? [...trackedCandidates, ...untrackedCandidates]
+      : [];
+
+    return {
+      unapprovedTracked,
+      unapprovedUntracked,
+      trackedCandidates,
+      untrackedCandidates,
+      candidatesToDiff,
+      isFullyResolved: candidatesToDiff.length === 0,
+    };
+  }
+
+  /**
+   * Shared diff result applicator: matches diff output paths against tracked/untracked candidate lists.
+   */
+  export function applyDiffResults(
+    partition: CandidatePartitionResult,
+    diffFilesSet: Set<string>
+  ): UnapprovedDetectionResult {
+    const unapprovedTracked = [...partition.unapprovedTracked];
+    const unapprovedUntracked = [...partition.unapprovedUntracked];
+
+    for (const f of partition.trackedCandidates) {
+      const norm = f.replace(/\\/g, '/');
+      if (diffFilesSet.has(norm)) {
+        unapprovedTracked.push(f);
+      }
+    }
+
+    for (const f of partition.untrackedCandidates) {
+      const norm = f.replace(/\\/g, '/');
+      if (diffFilesSet.has(norm)) {
+        unapprovedUntracked.push(f);
+      }
+    }
+
+    return {
+      unapprovedTracked,
+      unapprovedUntracked,
+      unapprovedFiles: [...unapprovedTracked, ...unapprovedUntracked],
+    };
+  }
+
+  /**
+   * Identifies unapproved working tree changes outside the baseline checkpoint (synchronous).
    */
   export function detectUnapprovedFiles(
     gitEngine: GitEngine,
@@ -410,113 +506,61 @@ import {
     latestCheckpoint?: Checkpoint | null,
     batchSize: number = 50
   ): UnapprovedDetectionResult {
-    if (!latestCheckpoint) {
-      const unapprovedTracked = [...gitStatus.changedFiles];
-      const unapprovedUntracked = [...gitStatus.untrackedFiles];
-      return {
-        unapprovedTracked,
-        unapprovedUntracked,
-        unapprovedFiles: [...unapprovedTracked, ...unapprovedUntracked],
-      };
+    const partition = partitionUnapprovedCandidates(gitStatus, latestCheckpoint);
+    if (partition.isFullyResolved) {
+      return applyDiffResults(partition, new Set());
     }
 
-    const cpChangedSet = new Set(latestCheckpoint.changedFiles || []);
-    const cpUntrackedSet = new Set(latestCheckpoint.untrackedFiles || []);
+    const worktreeCommitSha = latestCheckpoint!.worktreeCommitSha!;
+    const diffFilesSet = new Set<string>();
 
-    const unapprovedTracked: string[] = [];
-    const trackedCandidates: string[] = [];
-
-    for (const f of gitStatus.changedFiles) {
-      if (!cpChangedSet.has(f)) {
-        unapprovedTracked.push(f);
-      } else {
-        trackedCandidates.push(f);
-      }
-    }
-
-    const unapprovedUntracked: string[] = [];
-    const untrackedCandidates: string[] = [];
-
-    for (const f of gitStatus.untrackedFiles) {
-      if (!cpUntrackedSet.has(f)) {
-        unapprovedUntracked.push(f);
-      } else {
-        untrackedCandidates.push(f);
-      }
-    }
-
-    if (latestCheckpoint.worktreeCommitSha) {
-      const candidates = [...trackedCandidates, ...untrackedCandidates];
-      if (candidates.length > 0) {
-        const diffFilesSet = new Set<string>();
-        for (let i = 0; i < candidates.length; i += batchSize) {
-          const batch = candidates.slice(i, i + batchSize);
+    for (let i = 0; i < partition.candidatesToDiff.length; i += batchSize) {
+      const batch = partition.candidatesToDiff.slice(i, i + batchSize);
+      try {
+        const output = gitEngine.runGit(rootPath, [
+          '-c',
+          'core.quotepath=false',
+          'diff',
+          '--name-only',
+          worktreeCommitSha,
+          '--',
+          ...batch,
+        ]);
+        if (output) {
+          for (const line of output.split('\n')) {
+            const clean = line.trim().replace(/^"|"$/g, '').replace(/\\/g, '/');
+            if (clean) diffFilesSet.add(clean);
+          }
+        }
+      } catch {
+        // A1: Fallback to file-by-file diff if batch diff fails
+        for (const file of batch) {
           try {
-            const output = gitEngine.runGit(rootPath, [
+            const singleOutput = gitEngine.runGit(rootPath, [
               '-c',
               'core.quotepath=false',
               'diff',
               '--name-only',
-              latestCheckpoint.worktreeCommitSha,
+              worktreeCommitSha,
               '--',
-              ...batch,
+              file,
             ]);
-            if (output) {
-              for (const line of output.split('\n')) {
+            if (singleOutput) {
+              for (const line of singleOutput.split('\n')) {
                 const clean = line.trim().replace(/^"|"$/g, '').replace(/\\/g, '/');
                 if (clean) diffFilesSet.add(clean);
               }
             }
-          } catch {
-            // A1: If batch diff fails (e.g. invalid path in batch), fallback to file-by-file diff
-            for (const file of batch) {
-              try {
-                const singleOutput = gitEngine.runGit(rootPath, [
-                  '-c',
-                  'core.quotepath=false',
-                  'diff',
-                  '--name-only',
-                  latestCheckpoint.worktreeCommitSha,
-                  '--',
-                  file,
-                ]);
-                if (singleOutput) {
-                  for (const line of singleOutput.split('\n')) {
-                    const clean = line.trim().replace(/^"|"$/g, '').replace(/\\/g, '/');
-                    if (clean) diffFilesSet.add(clean);
-                  }
-                }
-              } catch {}
-            }
-          }
-        }
-
-        for (const f of trackedCandidates) {
-          const norm = f.replace(/\\/g, '/');
-          if (diffFilesSet.has(norm)) {
-            unapprovedTracked.push(f);
-          }
-        }
-
-        for (const f of untrackedCandidates) {
-          const norm = f.replace(/\\/g, '/');
-          if (diffFilesSet.has(norm)) {
-            unapprovedUntracked.push(f);
-          }
+          } catch {}
         }
       }
     }
 
-    return {
-      unapprovedTracked,
-      unapprovedUntracked,
-      unapprovedFiles: [...unapprovedTracked, ...unapprovedUntracked],
-    };
+    return applyDiffResults(partition, diffFilesSet);
   }
 
   /**
-   * Asynchronous version of detectUnapprovedFiles.
-   * Batches `git diff --name-only` calls into chunks of 50 files using runGitAsync.
+   * Identifies unapproved working tree changes outside the baseline checkpoint (asynchronous).
    */
   export async function detectUnapprovedFilesAsync(
     gitEngine: GitEngine,
@@ -525,213 +569,74 @@ import {
     latestCheckpoint?: Checkpoint | null,
     batchSize: number = 50
   ): Promise<UnapprovedDetectionResult> {
-    if (!latestCheckpoint) {
-      const unapprovedTracked = [...gitStatus.changedFiles];
-      const unapprovedUntracked = [...gitStatus.untrackedFiles];
-      return {
-        unapprovedTracked,
-        unapprovedUntracked,
-        unapprovedFiles: [...unapprovedTracked, ...unapprovedUntracked],
-      };
+    const partition = partitionUnapprovedCandidates(gitStatus, latestCheckpoint);
+    if (partition.isFullyResolved) {
+      return applyDiffResults(partition, new Set());
     }
 
-    const cpChangedSet = new Set(latestCheckpoint.changedFiles || []);
-    const cpUntrackedSet = new Set(latestCheckpoint.untrackedFiles || []);
+    const worktreeCommitSha = latestCheckpoint!.worktreeCommitSha!;
+    const diffFilesSet = new Set<string>();
 
-    const unapprovedTracked: string[] = [];
-    const trackedCandidates: string[] = [];
-
-    for (const f of gitStatus.changedFiles) {
-      if (!cpChangedSet.has(f)) {
-        unapprovedTracked.push(f);
-      } else {
-        trackedCandidates.push(f);
-      }
-    }
-
-    const unapprovedUntracked: string[] = [];
-    const untrackedCandidates: string[] = [];
-
-    for (const f of gitStatus.untrackedFiles) {
-      if (!cpUntrackedSet.has(f)) {
-        unapprovedUntracked.push(f);
-      } else {
-        untrackedCandidates.push(f);
-      }
-    }
-
-    if (latestCheckpoint.worktreeCommitSha) {
-      const candidates = [...trackedCandidates, ...untrackedCandidates];
-      if (candidates.length > 0) {
-        const diffFilesSet = new Set<string>();
-        for (let i = 0; i < candidates.length; i += batchSize) {
-          const batch = candidates.slice(i, i + batchSize);
+    for (let i = 0; i < partition.candidatesToDiff.length; i += batchSize) {
+      const batch = partition.candidatesToDiff.slice(i, i + batchSize);
+      try {
+        const output = await gitEngine.runGitAsync(rootPath, [
+          '-c',
+          'core.quotepath=false',
+          'diff',
+          '--name-only',
+          worktreeCommitSha,
+          '--',
+          ...batch,
+        ]);
+        if (output) {
+          for (const line of output.split('\n')) {
+            const clean = line.trim().replace(/^"|"$/g, '').replace(/\\/g, '/');
+            if (clean) diffFilesSet.add(clean);
+          }
+        }
+      } catch {
+        // A1: Fallback to file-by-file diff if batch diff fails
+        for (const file of batch) {
           try {
-            const output = await gitEngine.runGitAsync(rootPath, [
+            const singleOutput = await gitEngine.runGitAsync(rootPath, [
               '-c',
               'core.quotepath=false',
               'diff',
               '--name-only',
-              latestCheckpoint.worktreeCommitSha,
+              worktreeCommitSha,
               '--',
-              ...batch,
+              file,
             ]);
-            if (output) {
-              for (const line of output.split('\n')) {
+            if (singleOutput) {
+              for (const line of singleOutput.split('\n')) {
                 const clean = line.trim().replace(/^"|"$/g, '').replace(/\\/g, '/');
                 if (clean) diffFilesSet.add(clean);
               }
             }
-          } catch {
-            // A1: If batch diff fails (e.g. invalid path in batch), fallback to file-by-file diff
-            for (const file of batch) {
-              try {
-                const singleOutput = await gitEngine.runGitAsync(rootPath, [
-                  '-c',
-                  'core.quotepath=false',
-                  'diff',
-                  '--name-only',
-                  latestCheckpoint.worktreeCommitSha,
-                  '--',
-                  file,
-                ]);
-                if (singleOutput) {
-                  for (const line of singleOutput.split('\n')) {
-                    const clean = line.trim().replace(/^"|"$/g, '').replace(/\\/g, '/');
-                    if (clean) diffFilesSet.add(clean);
-                  }
-                }
-              } catch {}
-            }
-          }
-        }
-
-        for (const f of trackedCandidates) {
-          const norm = f.replace(/\\/g, '/');
-          if (diffFilesSet.has(norm)) {
-            unapprovedTracked.push(f);
-          }
-        }
-
-        for (const f of untrackedCandidates) {
-          const norm = f.replace(/\\/g, '/');
-          if (diffFilesSet.has(norm)) {
-            unapprovedUntracked.push(f);
-          }
+          } catch {}
         }
       }
     }
 
-    return {
-      unapprovedTracked,
-      unapprovedUntracked,
-      unapprovedFiles: [...unapprovedTracked, ...unapprovedUntracked],
-    };
+    return applyDiffResults(partition, diffFilesSet);
   }
 
   /**
-   * 2. inspect_project_state: Health, git status, recent commits, latest checkpoint.
+   * Shared ProjectHealth constructor & quarantine backup controller.
+   * Handles quarantine fingerprinting, caching, snapshot creation, and ProjectHealth object assembly.
    */
-  export function inspectProjectState(ctx: CoreContext, repoPathOrProject: string | Project): ProjectHealth {
-    const project = typeof repoPathOrProject === 'string' ? ctx.ensureProject(repoPathOrProject) : repoPathOrProject;
-    const gitStatus = ctx.gitEngine.getStatus(project.rootPath);
-    const headSha = ctx.gitEngine.getHeadSha(project.rootPath);
-    const recentCommits = ctx.gitEngine.getRecentCommits(project.rootPath, 5, headSha);
-    const latestCheckpoint = ctx.db.getLatestCheckpoint(project.id);
-    const activeIncidentsCount = ctx.db.getActiveIncidentsCount(project.id);
-
-    // Policy bypass check: Detect unapproved direct modifications outside checkpoint baseline (batched)
-    const { unapprovedTracked, unapprovedUntracked, unapprovedFiles } = detectUnapprovedFiles(
-      ctx.gitEngine,
-      project.rootPath,
-      gitStatus,
-      latestCheckpoint
-    );
-
-    const unapprovedModificationsDetected =
-      unapprovedFiles.length > 0 && activeIncidentsCount > 0 && !ctx.isApplyingApprovedPatch;
-
-    let quarantineBackupRef: string | undefined = undefined;
-    if (unapprovedModificationsDetected) {
-      // 0.5 Check: Compute exact fingerprint of unapproved changes (files list + content hashes)
-      const fingerprint = computeUnapprovedChangesFingerprint(ctx,
-        project.rootPath,
-        unapprovedTracked,
-        unapprovedUntracked
-      );
-
-      const cached = ctx.quarantineCache.get(project.id);
-      if (cached && cached.fingerprint === fingerprint) {
-        // Reuse previous backup ref without spawning any git commands
-        quarantineBackupRef = cached.backupRef;
-      } else if (project.lastQuarantineFingerprint === fingerprint && project.lastQuarantineRef) {
-        quarantineBackupRef = project.lastQuarantineRef;
-        ctx.quarantineCache.set(project.id, { fingerprint, backupRef: quarantineBackupRef });
-      } else {
-        // Non-destructive safety backup preserving untracked files without destroying user work.
-        // Created ONLY when unapproved changes differ from previous quarantine backup!
-        try {
-          const qId = `quarantine_${Date.now().toString(36)}`;
-          const qSnap = ctx.gitEngine.createSnapshot(
-            project.rootPath,
-            qId,
-            'Quarantine safety backup of unapproved working tree modifications'
-          );
-          quarantineBackupRef = qSnap.gitRef;
-          ctx.quarantineCache.set(project.id, { fingerprint, backupRef: quarantineBackupRef });
-          ctx.db.updateProjectQuarantine(project.id, fingerprint, quarantineBackupRef);
-        } catch {}
-      }
-    } else {
-      // No unapproved modifications: clear quarantine cache if previously set
-      if (ctx.quarantineCache.has(project.id) || project.lastQuarantineFingerprint) {
-        ctx.quarantineCache.delete(project.id);
-        ctx.db.updateProjectQuarantine(project.id, null, null);
-      }
-    }
-
-    return {
-      projectId: project.id,
-      projectName: project.name,
-      rootPath: project.rootPath,
-      isGitClean: gitStatus.isClean,
-      currentHeadSha: headSha,
-      changedFiles: gitStatus.changedFiles,
-      untrackedFiles: gitStatus.untrackedFiles,
-      unapprovedModificationsDetected,
-      unapprovedFiles,
-      quarantineBackupRef,
-      recentCommits,
-      latestCheckpoint,
-      activeIncidentsCount,
-    };
-  }
-
-  /**
-   * Asynchronous inspectProjectState: runs Git queries concurrently and asynchronously,
-   * avoiding blocking the Node event loop.
-   */
-  export async function inspectProjectStateAsync(
+  export function buildProjectHealthWithQuarantine(
     ctx: CoreContext,
-    repoPathOrProject: string | Project
-  ): Promise<ProjectHealth> {
-    const project = typeof repoPathOrProject === 'string' ? ctx.ensureProject(repoPathOrProject) : repoPathOrProject;
-    const [gitStatus, headSha] = await Promise.all([
-      ctx.gitEngine.getStatusAsync(project.rootPath),
-      ctx.gitEngine.getHeadShaAsync(project.rootPath),
-    ]);
-    const recentCommits = await ctx.gitEngine.getRecentCommitsAsync(project.rootPath, 5, headSha);
-    const latestCheckpoint = ctx.db.getLatestCheckpoint(project.id);
-    const activeIncidentsCount = ctx.db.getActiveIncidentsCount(project.id);
-
-    // Policy bypass check: Detect unapproved direct modifications outside checkpoint baseline (batched async)
-    const { unapprovedTracked, unapprovedUntracked, unapprovedFiles } = await detectUnapprovedFilesAsync(
-      ctx.gitEngine,
-      project.rootPath,
-      gitStatus,
-      latestCheckpoint
-    );
-
+    project: Project,
+    gitStatus: GitStatusResult,
+    headSha: string,
+    recentCommits: GitCommitInfo[],
+    latestCheckpoint: Checkpoint | null,
+    activeIncidentsCount: number,
+    unapprovedResult: UnapprovedDetectionResult
+  ): ProjectHealth {
+    const { unapprovedTracked, unapprovedUntracked, unapprovedFiles } = unapprovedResult;
     const unapprovedModificationsDetected =
       unapprovedFiles.length > 0 && activeIncidentsCount > 0 && !ctx.isApplyingApprovedPatch;
 
@@ -785,6 +690,72 @@ import {
       latestCheckpoint,
       activeIncidentsCount,
     };
+  }
+
+  /**
+   * 2. inspect_project_state: Synchronous inspection entry point.
+   */
+  export function inspectProjectState(ctx: CoreContext, repoPathOrProject: string | Project): ProjectHealth {
+    const project = typeof repoPathOrProject === 'string' ? ctx.ensureProject(repoPathOrProject) : repoPathOrProject;
+    const gitStatus = ctx.gitEngine.getStatus(project.rootPath);
+    const headSha = ctx.gitEngine.getHeadSha(project.rootPath);
+    const recentCommits = ctx.gitEngine.getRecentCommits(project.rootPath, 5, headSha);
+    const latestCheckpoint = ctx.db.getLatestCheckpoint(project.id);
+    const activeIncidentsCount = ctx.db.getActiveIncidentsCount(project.id);
+
+    const unapprovedResult = detectUnapprovedFiles(
+      ctx.gitEngine,
+      project.rootPath,
+      gitStatus,
+      latestCheckpoint
+    );
+
+    return buildProjectHealthWithQuarantine(
+      ctx,
+      project,
+      gitStatus,
+      headSha,
+      recentCommits,
+      latestCheckpoint,
+      activeIncidentsCount,
+      unapprovedResult
+    );
+  }
+
+  /**
+   * Asynchronous inspectProjectState: runs Git queries concurrently and asynchronously,
+   * avoiding blocking the Node event loop.
+   */
+  export async function inspectProjectStateAsync(
+    ctx: CoreContext,
+    repoPathOrProject: string | Project
+  ): Promise<ProjectHealth> {
+    const project = typeof repoPathOrProject === 'string' ? ctx.ensureProject(repoPathOrProject) : repoPathOrProject;
+    const [gitStatus, headSha] = await Promise.all([
+      ctx.gitEngine.getStatusAsync(project.rootPath),
+      ctx.gitEngine.getHeadShaAsync(project.rootPath),
+    ]);
+    const recentCommits = await ctx.gitEngine.getRecentCommitsAsync(project.rootPath, 5, headSha);
+    const latestCheckpoint = ctx.db.getLatestCheckpoint(project.id);
+    const activeIncidentsCount = ctx.db.getActiveIncidentsCount(project.id);
+
+    const unapprovedResult = await detectUnapprovedFilesAsync(
+      ctx.gitEngine,
+      project.rootPath,
+      gitStatus,
+      latestCheckpoint
+    );
+
+    return buildProjectHealthWithQuarantine(
+      ctx,
+      project,
+      gitStatus,
+      headSha,
+      recentCommits,
+      latestCheckpoint,
+      activeIncidentsCount,
+      unapprovedResult
+    );
   }
 
   /**

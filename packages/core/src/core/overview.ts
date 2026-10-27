@@ -4,6 +4,8 @@ import { CoreContext } from './context.js';
 import { inspectProjectStateAsync } from './project.js';
 import { resolveDataDir, resolveCacheDir } from '../utils/paths.js';
 import {
+  Project,
+  ProjectHealth,
   ProjectOverview,
   TimelineEvent,
   RuntimeInfo,
@@ -11,109 +13,76 @@ import {
 } from '../types.js';
 import { parseUnifiedDiffFiles, firstMeaningfulLine } from './helpers.js';
 
+/**
+ * Shared stats calculator & ProjectOverview assembler.
+ * Used identically by both synchronous getOverview and asynchronous getOverviewAsync.
+ */
+export function buildOverviewFromHealth(
+  ctx: CoreContext,
+  project: Project,
+  health: ProjectHealth
+): ProjectOverview {
+  const incidents = ctx.db.listIncidents(project.id, 200);
+  const proposals = ctx.db.listProposalsForProject(project.id, 200);
+
+  const applied = proposals.filter((p) => p.approvalStatus === 'APPLIED');
+  const verifiedPass = proposals.filter((p) => p.verificationStatus === 'VERIFIED_PASS');
+  const judged = proposals.filter((p) => p.verificationStatus !== 'PENDING');
+  const openIncidents = incidents.filter((i) => i.status !== 'RESOLVED');
+
+  let lastTestStatus: 'PASS' | 'FAIL' | 'UNKNOWN' = 'UNKNOWN';
+  const lastTestEvent = [...ctx.db.listAgentEvents(project.id, 50)].find(
+    (e) => e.kind === 'TEST_PASS' || e.kind === 'TEST_FAIL'
+  );
+  const latestIncident = incidents[0];
+  const candidates: Array<{ at: string; status: 'PASS' | 'FAIL' }> = [];
+  if (lastTestEvent) candidates.push({ at: lastTestEvent.createdAt, status: lastTestEvent.kind === 'TEST_PASS' ? 'PASS' : 'FAIL' });
+  if (latestIncident) candidates.push({ at: latestIncident.createdAt, status: latestIncident.status === 'RESOLVED' ? 'PASS' : 'FAIL' });
+  candidates.sort((a, b) => b.at.localeCompare(a.at));
+  if (candidates[0]) lastTestStatus = candidates[0].status;
+
+  const incidentById = new Map(incidents.map((i) => [i.id, i]));
+  const recentRecoveries = applied
+    .sort((a, b) => (b.appliedAt ?? '').localeCompare(a.appliedAt ?? ''))
+    .slice(0, 5)
+    .map((p) => ({
+      proposalId: p.id,
+      incidentTitle: incidentById.get(p.incidentId)?.title ?? '(알 수 없는 사고)',
+      summary: p.rootCauseAnalysis,
+      appliedAt: p.appliedAt ?? p.createdAt,
+      files: p.touchedFiles,
+    }));
+
+  return {
+    project,
+    health,
+    stats: {
+      totalProposals: proposals.length,
+      appliedProposals: applied.length,
+      verifiedPassProposals: verifiedPass.length,
+      successRate: judged.length > 0 ? Math.round((verifiedPass.length / judged.length) * 100) : null,
+      openIncidents: openIncidents.length,
+      resolvedIncidents: incidents.length - openIncidents.length,
+      lastTestStatus,
+    },
+    openIncidents: openIncidents.slice(0, 8),
+    recentRecoveries,
+  };
+}
+
 export function getOverview(ctx: CoreContext, repoPath: string): ProjectOverview {
-    const project = ctx.ensureProject(repoPath);
-    const health = ctx.inspectProjectState(project);
-    const incidents = ctx.db.listIncidents(project.id, 200);
-    const proposals = ctx.db.listProposalsForProject(project.id, 200);
-
-    const applied = proposals.filter((p) => p.approvalStatus === 'APPLIED');
-    const verifiedPass = proposals.filter((p) => p.verificationStatus === 'VERIFIED_PASS');
-    const judged = proposals.filter((p) => p.verificationStatus !== 'PENDING');
-    const openIncidents = incidents.filter((i) => i.status !== 'RESOLVED');
-
-    let lastTestStatus: 'PASS' | 'FAIL' | 'UNKNOWN' = 'UNKNOWN';
-    const lastTestEvent = [...ctx.db.listAgentEvents(project.id, 50)].find(
-      (e) => e.kind === 'TEST_PASS' || e.kind === 'TEST_FAIL'
-    );
-    const latestIncident = incidents[0];
-    const candidates: Array<{ at: string; status: 'PASS' | 'FAIL' }> = [];
-    if (lastTestEvent) candidates.push({ at: lastTestEvent.createdAt, status: lastTestEvent.kind === 'TEST_PASS' ? 'PASS' : 'FAIL' });
-    if (latestIncident) candidates.push({ at: latestIncident.createdAt, status: latestIncident.status === 'RESOLVED' ? 'PASS' : 'FAIL' });
-    candidates.sort((a, b) => b.at.localeCompare(a.at));
-    if (candidates[0]) lastTestStatus = candidates[0].status;
-
-    const incidentById = new Map(incidents.map((i) => [i.id, i]));
-    const recentRecoveries = applied
-      .sort((a, b) => (b.appliedAt ?? '').localeCompare(a.appliedAt ?? ''))
-      .slice(0, 5)
-      .map((p) => ({
-        proposalId: p.id,
-        incidentTitle: incidentById.get(p.incidentId)?.title ?? '(알 수 없는 사고)',
-        summary: p.rootCauseAnalysis,
-        appliedAt: p.appliedAt ?? p.createdAt,
-        files: p.touchedFiles,
-      }));
-
-    return {
-      project,
-      health,
-      stats: {
-        totalProposals: proposals.length,
-        appliedProposals: applied.length,
-        verifiedPassProposals: verifiedPass.length,
-        successRate: judged.length > 0 ? Math.round((verifiedPass.length / judged.length) * 100) : null,
-        openIncidents: openIncidents.length,
-        resolvedIncidents: incidents.length - openIncidents.length,
-        lastTestStatus,
-      },
-      openIncidents: openIncidents.slice(0, 8),
-      recentRecoveries,
-    };
-  }
+  const project = ctx.ensureProject(repoPath);
+  const health = ctx.inspectProjectState(project);
+  return buildOverviewFromHealth(ctx, project, health);
+}
 
 export async function getOverviewAsync(ctx: CoreContext, repoPath: string): Promise<ProjectOverview> {
-    const project = ctx.ensureProject(repoPath);
-    const health = ctx.inspectProjectStateAsync
-      ? await ctx.inspectProjectStateAsync(project)
-      : await inspectProjectStateAsync(ctx, project);
-    const incidents = ctx.db.listIncidents(project.id, 200);
-    const proposals = ctx.db.listProposalsForProject(project.id, 200);
-
-    const applied = proposals.filter((p) => p.approvalStatus === 'APPLIED');
-    const verifiedPass = proposals.filter((p) => p.verificationStatus === 'VERIFIED_PASS');
-    const judged = proposals.filter((p) => p.verificationStatus !== 'PENDING');
-    const openIncidents = incidents.filter((i) => i.status !== 'RESOLVED');
-
-    let lastTestStatus: 'PASS' | 'FAIL' | 'UNKNOWN' = 'UNKNOWN';
-    const lastTestEvent = [...ctx.db.listAgentEvents(project.id, 50)].find(
-      (e) => e.kind === 'TEST_PASS' || e.kind === 'TEST_FAIL'
-    );
-    const latestIncident = incidents[0];
-    const candidates: Array<{ at: string; status: 'PASS' | 'FAIL' }> = [];
-    if (lastTestEvent) candidates.push({ at: lastTestEvent.createdAt, status: lastTestEvent.kind === 'TEST_PASS' ? 'PASS' : 'FAIL' });
-    if (latestIncident) candidates.push({ at: latestIncident.createdAt, status: latestIncident.status === 'RESOLVED' ? 'PASS' : 'FAIL' });
-    candidates.sort((a, b) => b.at.localeCompare(a.at));
-    if (candidates[0]) lastTestStatus = candidates[0].status;
-
-    const incidentById = new Map(incidents.map((i) => [i.id, i]));
-    const recentRecoveries = applied
-      .sort((a, b) => (b.appliedAt ?? '').localeCompare(a.appliedAt ?? ''))
-      .slice(0, 5)
-      .map((p) => ({
-        proposalId: p.id,
-        incidentTitle: incidentById.get(p.incidentId)?.title ?? '(알 수 없는 사고)',
-        summary: p.rootCauseAnalysis,
-        appliedAt: p.appliedAt ?? p.createdAt,
-        files: p.touchedFiles,
-      }));
-
-    return {
-      project,
-      health,
-      stats: {
-        totalProposals: proposals.length,
-        appliedProposals: applied.length,
-        verifiedPassProposals: verifiedPass.length,
-        successRate: judged.length > 0 ? Math.round((verifiedPass.length / judged.length) * 100) : null,
-        openIncidents: openIncidents.length,
-        resolvedIncidents: incidents.length - openIncidents.length,
-        lastTestStatus,
-      },
-      openIncidents: openIncidents.slice(0, 8),
-      recentRecoveries,
-    };
-  }
+  const project = ctx.ensureProject(repoPath);
+  const health = ctx.inspectProjectStateAsync
+    ? await ctx.inspectProjectStateAsync(project)
+    : await inspectProjectStateAsync(ctx, project);
+  return buildOverviewFromHealth(ctx, project, health);
+}
 
   /**
    * AI Action Timeline

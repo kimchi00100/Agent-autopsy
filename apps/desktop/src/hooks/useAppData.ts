@@ -58,14 +58,16 @@ export function useAppData({ view, notify }: UseAppDataOptions) {
     checkAuditChain();
   }, [checkAuditChain]);
 
-  const runDiagnostics = useCallback(async (projId?: string) => {
+  const runDiagnostics = useCallback(async (projId?: string, options?: { silent?: boolean }) => {
     const id = projId || overview?.project?.id;
     if (!id) return;
     setDiagnosing(true);
     try {
       const res = await api.diagnoseProject(id);
       setDiagnostics(res.diagnostics);
-      notify('ok', '프로젝트 자체 진단을 완료했습니다.');
+      if (!options?.silent) {
+        notify('ok', '프로젝트 자체 진단을 완료했습니다.');
+      }
     } catch (e: any) {
       notify('error', `진단 실패: ${e.message}`);
     } finally {
@@ -151,7 +153,7 @@ export function useAppData({ view, notify }: UseAppDataOptions) {
     const justOpenedSettings = view === 'settings' && prevViewRef.current !== 'settings';
     prevViewRef.current = view;
     if ((justOpenedSettings || (view === 'settings' && !diagnostics)) && overview?.project?.id) {
-      runDiagnostics(overview.project.id);
+      runDiagnostics(overview.project.id, { silent: true });
     }
   }, [view, overview?.project?.id, diagnostics, runDiagnostics]);
 

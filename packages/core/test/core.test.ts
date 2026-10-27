@@ -2762,7 +2762,9 @@ Expected equality of these values:
 
   test('57. Step-3-Check: PRAGMA data_version based db_sync emission on external write and MCP subprocess SSE notification', async () => {
     const s57DataDir = path.join(testRoot, 's57_test_data');
+    const s57CacheDir = path.join(testRoot, 's57_test_cache');
     fs.mkdirSync(s57DataDir, { recursive: true });
+    fs.mkdirSync(s57CacheDir, { recursive: true });
     const s57DbPath = path.join(s57DataDir, 'autopsy.db');
 
     const s57Core = new CoreManager({
@@ -2771,7 +2773,9 @@ Expected equality of these values:
     s57Core.ensureProject(repoPath);
 
     const prevDataDir = process.env.AUTOPSY_DATA_DIR;
+    const prevCacheDir = process.env.AUTOPSY_CACHE_DIR;
     process.env.AUTOPSY_DATA_DIR = s57DataDir;
+    process.env.AUTOPSY_CACHE_DIR = s57CacheDir;
 
     const apiServer = new ApiServer(s57Core);
     const port = await apiServer.start(3874);
@@ -2848,75 +2852,101 @@ Expected equality of these values:
         ? process.cwd()
         : path.resolve(process.cwd(), '../..');
       const mcpDistScript = path.resolve(monorepoRoot, 'packages/mcp-server/dist/index.js');
+      if (!fs.existsSync(mcpDistScript)) {
+        throw new Error(`mcp-server를 먼저 빌드하라: "${mcpDistScript}" 파일이 존재하지 않습니다.`);
+      }
 
-      await new Promise<void>((resolve, reject) => {
-        const cp = spawn('node', [mcpDistScript], {
-          env: { ...process.env, AUTOPSY_DATA_DIR: s57DataDir },
-          stdio: ['pipe', 'pipe', 'pipe'],
-        });
-
-        let stdoutBuf = '';
-        let hasInitialized = false;
-
-        cp.stdout.on('data', (chunk) => {
-          stdoutBuf += chunk.toString();
-          const lines = stdoutBuf.split('\n');
-          stdoutBuf = lines.pop() || '';
-
-          for (const line of lines) {
-            if (!line.trim()) continue;
-            try {
-              const msg = JSON.parse(line);
-              if (msg.id === 1 && !hasInitialized) {
-                hasInitialized = true;
-                cp.stdin.write(JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' }) + '\n');
-                cp.stdin.write(
-                  JSON.stringify({
-                    jsonrpc: '2.0',
-                    id: 2,
-                    method: 'tools/call',
-                    params: {
-                      name: 'collect_incident_bundle',
-                      arguments: {
-                        repoPath,
-                        title: 'MCP 프로세스 실시간 SSE 알림 테스트 57',
-                        userReportText: 'MCP 프로세스 실시간 SSE 알림 테스트 원문',
-                        errorOutput: 'AssertionError: mcp sse test',
-                      },
-                    },
-                  }) + '\n'
-                );
-              } else if (msg.id === 2) {
-                setTimeout(() => {
-                  cp.kill();
-                  resolve();
-                }, 200);
-                return;
-              }
-            } catch {}
-          }
-        });
-
-        cp.on('error', reject);
-        cp.on('exit', (code) => {
-          if (!hasInitialized && code !== 0 && code !== null) {
-            reject(new Error(`MCP process exited with code ${code}`));
-          }
-        });
-
-        cp.stdin.write(
-          JSON.stringify({
-            jsonrpc: '2.0',
-            id: 1,
-            method: 'initialize',
-            params: {
-              protocolVersion: '2024-11-05',
-              capabilities: {},
-              clientInfo: { name: 'test-harness', version: '1.0' },
+      let timeoutId: NodeJS.Timeout | null = null;
+      try {
+        await new Promise<void>((resolve, reject) => {
+          const cp = spawn(process.execPath, [mcpDistScript], {
+            env: {
+              ...process.env,
+              AUTOPSY_DATA_DIR: s57DataDir,
+              AUTOPSY_CACHE_DIR: s57CacheDir,
             },
-          }) + '\n'
-        );
-      });
+            stdio: ['pipe', 'pipe', 'pipe'],
+          });
+
+          timeoutId = setTimeout(() => {
+            try {
+              cp.kill();
+            } catch {}
+            reject(new Error('MCP 자식 프로세스 실행 시간 초과 (30초)'));
+          }, 30000);
+
+          let stdoutBuf = '';
+          let hasInitialized = false;
+
+          cp.stdout.on('data', (chunk) => {
+            stdoutBuf += chunk.toString();
+            const lines = stdoutBuf.split('\n');
+            stdoutBuf = lines.pop() || '';
+
+            for (const line of lines) {
+              if (!line.trim()) continue;
+              try {
+                const msg = JSON.parse(line);
+                if (msg.id === 1 && !hasInitialized) {
+                  hasInitialized = true;
+                  cp.stdin.write(JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' }) + '\n');
+                  cp.stdin.write(
+                    JSON.stringify({
+                      jsonrpc: '2.0',
+                      id: 2,
+                      method: 'tools/call',
+                      params: {
+                        name: 'collect_incident_bundle',
+                        arguments: {
+                          repoPath,
+                          title: 'MCP 프로세스 실시간 SSE 알림 테스트 57',
+                          userReportText: 'MCP 프로세스 실시간 SSE 알림 테스트 원문',
+                          errorOutput: 'AssertionError: mcp sse test',
+                        },
+                      },
+                    }) + '\n'
+                  );
+                } else if (msg.id === 2) {
+                  if (timeoutId) clearTimeout(timeoutId);
+                  setTimeout(() => {
+                    try {
+                      cp.kill();
+                    } catch {}
+                    resolve();
+                  }, 200);
+                  return;
+                }
+              } catch {}
+            }
+          });
+
+          cp.on('error', (err) => {
+            if (timeoutId) clearTimeout(timeoutId);
+            reject(err);
+          });
+          cp.on('exit', (code) => {
+            if (!hasInitialized && code !== 0 && code !== null) {
+              if (timeoutId) clearTimeout(timeoutId);
+              reject(new Error(`MCP process exited with code ${code}`));
+            }
+          });
+
+          cp.stdin.write(
+            JSON.stringify({
+              jsonrpc: '2.0',
+              id: 1,
+              method: 'initialize',
+              params: {
+                protocolVersion: '2024-11-05',
+                capabilities: {},
+                clientInfo: { name: 'test-harness', version: '1.0' },
+              },
+            }) + '\n'
+          );
+        });
+      } finally {
+        if (timeoutId) clearTimeout(timeoutId);
+      }
 
       // Wait a short moment for cross-process SSE event propagation
       await new Promise((r) => setTimeout(r, 600));
@@ -2925,6 +2955,7 @@ Expected equality of these values:
       assert.strictEqual(incidentEvent.data.title, 'MCP 프로세스 실시간 SSE 알림 테스트 57');
     } finally {
       process.env.AUTOPSY_DATA_DIR = prevDataDir;
+      process.env.AUTOPSY_CACHE_DIR = prevCacheDir;
       if (sseReq) {
         sseReq.destroy();
       }

@@ -20,7 +20,7 @@ export default function Dashboard({
           icon: <AlertTriangle className="h-5 w-5 text-amber-600" />,
           label: '미해결 오류 있음',
           tone: 'text-amber-700',
-          sub: `미해결 사건 ${stats.openIncidents}건 · 격리 검증 통과는 원본 반영 전입니다`,
+          sub: `미해결 사건 ${stats.openIncidents}건`,
         }
       : stats.lastTestStatus === 'PASS'
         ? { icon: <CheckCircle2 className="h-5 w-5 text-emerald-600" />, label: '정상', tone: 'text-emerald-700', sub: '최근 테스트가 통과했습니다' }

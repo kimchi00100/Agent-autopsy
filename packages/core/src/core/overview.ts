@@ -77,6 +77,8 @@ export function getOverview(ctx: CoreContext, repoPath: string): ProjectOverview
 }
 
 export async function getOverviewAsync(ctx: CoreContext, repoPath: string): Promise<ProjectOverview> {
+  // Pre-fetch repository root asynchronously so that subsequent synchronous ensureProject hits repoRootCache without execFileSync
+  await ctx.gitEngine.getRepoRootAsync(repoPath);
   const project = ctx.ensureProject(repoPath);
   const health = ctx.inspectProjectStateAsync
     ? await ctx.inspectProjectStateAsync(project)

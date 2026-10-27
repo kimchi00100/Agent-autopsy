@@ -25,6 +25,12 @@ export interface SnapshotResult {
   untrackedFiles: string[];
 }
 
+interface CommitCacheEntry {
+  headSha: string;
+  limit: number;
+  commits: GitCommitInfo[];
+}
+
 export class GitEngine {
   /**
    * Cache 1: Input path -> repository root (`git rev-parse --show-toplevel`).
@@ -36,15 +42,14 @@ export class GitEngine {
   private repoRootCache: Map<string, string> = new Map();
 
   /**
-   * Cache 2: Recent commits log (`HEAD sha -> GitCommitInfo[]`).
+   * Cache 2: Recent commits log (`resolvedRepoPath -> { headSha, limit, commits }`).
    * Invalidation condition:
-   * - Keyed by `${resolvedRepoPath}:${headSha}:${limit}`.
+   * - Retains only the latest 1 HEAD entry per repository (never accumulates multiple revisions).
    * - When a new commit is made (or HEAD changes via rollback/checkout/rebase),
-   *   the new HEAD SHA automatically produces a cache miss and fetches fresh commits from git.
-   * - Entries remain valid as long as HEAD SHA and limit remain identical for that repository.
+   *   the new HEAD SHA causes a cache miss, fetches fresh commits, and overwrites the previous entry.
    * - STRICTLY FORBIDDEN: git status and git diff are NEVER cached.
    */
-  private commitCache: Map<string, GitCommitInfo[]> = new Map();
+  private commitCache: Map<string, CommitCacheEntry> = new Map();
 
   public clearCache(): void {
     this.repoRootCache.clear();
@@ -347,14 +352,19 @@ export class GitEngine {
         currentHead = '';
       }
     }
-    const cacheKey = `${path.resolve(repoPath)}:${currentHead}:${limit}`;
-    if (currentHead && this.commitCache.has(cacheKey)) {
-      return this.commitCache.get(cacheKey)!;
+    const resolvedRepo = path.resolve(repoPath);
+    if (currentHead) {
+      const cached = this.commitCache.get(resolvedRepo);
+      if (cached && cached.headSha === currentHead && cached.limit === limit) {
+        return cached.commits;
+      }
     }
 
     let output = '';
     try {
       output = this.runGit(repoPath, [
+        '-c',
+        'core.quotepath=false',
         'log',
         `-n`,
         limit.toString(),
@@ -366,7 +376,7 @@ export class GitEngine {
     }
     if (!output) {
       if (currentHead) {
-        this.commitCache.set(cacheKey, []);
+        this.commitCache.set(resolvedRepo, { headSha: currentHead, limit, commits: [] });
       }
       return [];
     }
@@ -381,7 +391,7 @@ export class GitEngine {
       };
     });
     if (currentHead) {
-      this.commitCache.set(cacheKey, commits);
+      this.commitCache.set(resolvedRepo, { headSha: currentHead, limit, commits });
     }
     return commits;
   }
@@ -399,14 +409,19 @@ export class GitEngine {
         currentHead = '';
       }
     }
-    const cacheKey = `${path.resolve(repoPath)}:${currentHead}:${limit}`;
-    if (currentHead && this.commitCache.has(cacheKey)) {
-      return this.commitCache.get(cacheKey)!;
+    const resolvedRepo = path.resolve(repoPath);
+    if (currentHead) {
+      const cached = this.commitCache.get(resolvedRepo);
+      if (cached && cached.headSha === currentHead && cached.limit === limit) {
+        return cached.commits;
+      }
     }
 
     let output = '';
     try {
       output = await this.runGitAsync(repoPath, [
+        '-c',
+        'core.quotepath=false',
         'log',
         `-n`,
         limit.toString(),
@@ -418,7 +433,7 @@ export class GitEngine {
     }
     if (!output) {
       if (currentHead) {
-        this.commitCache.set(cacheKey, []);
+        this.commitCache.set(resolvedRepo, { headSha: currentHead, limit, commits: [] });
       }
       return [];
     }
@@ -433,7 +448,7 @@ export class GitEngine {
       };
     });
     if (currentHead) {
-      this.commitCache.set(cacheKey, commits);
+      this.commitCache.set(resolvedRepo, { headSha: currentHead, limit, commits });
     }
     return commits;
   }

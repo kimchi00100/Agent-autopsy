@@ -4272,4 +4272,98 @@ def test_slow():
     const hasTestMul = scope.scopeResult.changedFunctions.some((f) => f.name === 'test_mul');
     assert.strictEqual(hasTestMul, true, 'Committed test file modification must be detected in scope');
   });
+
+  test('85. B-2 Step-2: Renaming repro test retains auto-expansion to Checkpoint A across multiple runs', async () => {
+    const pyRepo = path.join(testRoot, 'b2_s2_t85_repro_rename');
+    fs.mkdirSync(pyRepo, { recursive: true });
+    execFileSync('git', ['init', '-b', 'main'], { cwd: pyRepo });
+    execFileSync('git', ['config', 'user.name', 'Tester'], { cwd: pyRepo });
+    execFileSync('git', ['config', 'user.email', 'test@local'], { cwd: pyRepo });
+
+    // 1) 정상 코드 커밋 -> 체크포인트 A
+    fs.writeFileSync(path.join(pyRepo, 'calc.py'), 'def mul(a, b):\n    return a * b\n');
+    execFileSync('git', ['add', '.'], { cwd: pyRepo });
+    execFileSync('git', ['commit', '-m', 'Commit A: clean mul'], { cwd: pyRepo });
+    const cpA = core.captureCheckpoint(pyRepo, 'CP A clean');
+
+    // 2) 버그 커밋 -> 체크포인트 B
+    fs.writeFileSync(path.join(pyRepo, 'calc.py'), 'def mul(a, b):\n    return a * b + 10\n');
+    execFileSync('git', ['add', '.'], { cwd: pyRepo });
+    execFileSync('git', ['commit', '-m', 'Commit B: bug in mul'], { cwd: pyRepo });
+    const cpB = core.captureCheckpoint(pyRepo, 'CP B after bug');
+
+    // 3) 사건 등록 (기준 체크포인트 = B)
+    const inc = await core.collectIncidentBundle(pyRepo, '사건: mul 계산 오류', 'AssertionError');
+    core.updateProjectSettings(pyRepo, { testCommand: 'python -m pytest' });
+
+    // 4) test_mul.py 작성 -> get_change_scope: EXPANDED_TO_OLDER_CHECKPOINT(A), mul 포함 (정상)
+    fs.writeFileSync(path.join(pyRepo, 'test_mul.py'), 'from calc import mul\ndef test_mul():\n    assert mul(2, 3) == 6\n');
+    const scope4 = await core.getChangeScope(inc.id);
+    assert.strictEqual(scope4.baselineRule, 'EXPANDED_TO_OLDER_CHECKPOINT');
+    assert.strictEqual(scope4.scopeResult.changedFunctions.some(f => f.name === 'mul'), true);
+
+    // 5) test_mul.py를 런타임 오류 테스트로 고쳐 run_reproduction -> WRONG_FAILURE(RUNTIME_ERROR)
+    fs.writeFileSync(path.join(pyRepo, 'test_mul.py'), 'from calc import mul\ndef test_mul():\n    non_existent_function()\n');
+    const repro5 = await core.runReproduction(pyRepo, inc.id, 'test_mul.py');
+    assert.strictEqual(repro5.status, 'WRONG_FAILURE');
+
+    // 6) 새 이름 test_mul_fixed.py 작성(test_mul.py는 유지) -> get_change_scope: EXPANDED_TO_OLDER_CHECKPOINT(A), mul 포함
+    fs.writeFileSync(path.join(pyRepo, 'test_mul_fixed.py'), 'from calc import mul\ndef test_mul_fixed():\n    assert mul(2, 3) == 6\n');
+    const scope6 = await core.getChangeScope(inc.id);
+    assert.strictEqual(scope6.baselineRule, 'EXPANDED_TO_OLDER_CHECKPOINT');
+    assert.strictEqual(scope6.baselineSha, cpA.worktreeCommitSha || cpA.gitHeadSha);
+    assert.strictEqual(scope6.scopeResult.changedFunctions.some(f => f.name === 'mul'), true);
+
+    // 7) test_mul_fixed.py로 run_reproduction -> REPRODUCED, REGRESSION_CONFIRMED, EXPANDED_TO_OLDER_CHECKPOINT(A)
+    const repro7 = await core.runReproduction(pyRepo, inc.id, 'test_mul_fixed.py');
+    assert.strictEqual(repro7.status, 'REPRODUCED');
+    assert.strictEqual(repro7.baselineComparison?.verdict, 'REGRESSION_CONFIRMED');
+    assert.strictEqual(repro7.baselineComparison?.baselineRule, 'EXPANDED_TO_OLDER_CHECKPOINT');
+
+    // 8) 다시 get_change_scope -> EXPANDED_TO_OLDER_CHECKPOINT(A), mul 포함, 7)과 동일 baseline
+    const scope8 = await core.getChangeScope(inc.id);
+    assert.strictEqual(scope8.baselineRule, 'EXPANDED_TO_OLDER_CHECKPOINT');
+    assert.strictEqual(scope8.baselineSha, cpA.worktreeCommitSha || cpA.gitHeadSha);
+    assert.strictEqual(scope8.scopeResult.changedFunctions.some(f => f.name === 'mul'), true);
+    assert.strictEqual(scope8.baselineSha, repro7.baselineComparison?.baselineSha);
+    assert.strictEqual(scope8.baselineRule, repro7.baselineComparison?.baselineRule);
+  });
+
+  test('86. B-2 Step-2: Non-standard test file name (repro_check.py) recorded in incident still enables expansion via rule (a)', async () => {
+    const pyRepo = path.join(testRoot, 'b2_s2_t86_custom_test_name');
+    fs.mkdirSync(pyRepo, { recursive: true });
+    execFileSync('git', ['init', '-b', 'main'], { cwd: pyRepo });
+    execFileSync('git', ['config', 'user.name', 'Tester'], { cwd: pyRepo });
+    execFileSync('git', ['config', 'user.email', 'test@local'], { cwd: pyRepo });
+
+    // 1) 정상 코드 커밋 -> 체크포인트 A
+    fs.writeFileSync(path.join(pyRepo, 'calc.py'), 'def mul(a, b):\n    return a * b\n');
+    execFileSync('git', ['add', '.'], { cwd: pyRepo });
+    execFileSync('git', ['commit', '-m', 'Commit A: clean mul'], { cwd: pyRepo });
+    const cpA = core.captureCheckpoint(pyRepo, 'CP A clean');
+
+    // 2) 버그 커밋 -> 체크포인트 B
+    fs.writeFileSync(path.join(pyRepo, 'calc.py'), 'def mul(a, b):\n    return a * b + 10\n');
+    execFileSync('git', ['add', '.'], { cwd: pyRepo });
+    execFileSync('git', ['commit', '-m', 'Commit B: bug in mul'], { cwd: pyRepo });
+    const cpB = core.captureCheckpoint(pyRepo, 'CP B after bug');
+
+    // 3) 사건 등록 (기준 체크포인트 = B)
+    const inc = await core.collectIncidentBundle(pyRepo, '사건: mul 계산 오류', 'AssertionError');
+    core.updateProjectSettings(pyRepo, { testCommand: 'python -m pytest' });
+
+    // 4) 테스트 이름 규칙에 맞지 않는 이름(repro_check.py) 작성
+    fs.writeFileSync(path.join(pyRepo, 'repro_check.py'), 'from calc import mul\ndef test_custom():\n    assert mul(2, 3) == 6\n');
+
+    // 5) repro_check.py로 run_reproduction 1회 실행 -> incident에 testFilePath='repro_check.py' 기록
+    const repro = await core.runReproduction(pyRepo, inc.id, 'repro_check.py');
+    assert.strictEqual(repro.status, 'REPRODUCED');
+    assert.strictEqual(repro.baselineComparison?.baselineRule, 'EXPANDED_TO_OLDER_CHECKPOINT');
+
+    // 6) get_change_scope 호출 -> 규칙 (a)로 repro_check.py가 제외되어 CP A로 자동 확장
+    const scope = await core.getChangeScope(inc.id);
+    assert.strictEqual(scope.baselineRule, 'EXPANDED_TO_OLDER_CHECKPOINT');
+    assert.strictEqual(scope.baselineSha, cpA.worktreeCommitSha || cpA.gitHeadSha);
+    assert.strictEqual(scope.scopeResult.changedFunctions.some(f => f.name === 'mul'), true);
+  });
 });

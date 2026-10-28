@@ -349,30 +349,24 @@ export async function locateChangeScope(
   // Determine files to ignore specifically for baseline auto-expansion checks
   const ignoredForExpansionFiles = new Set<string>();
 
-  // (a) Recorded reproduction test file in incident (if untracked)
-  let hasRecordedTest = false;
+  // (a) Recorded reproduction test file in incident (if untracked, supports non-standard names like repro_check.py)
   if (incident?.reproductionResult?.testFilePath) {
     const recordedPath = incident.reproductionResult.testFilePath.replace(/\\/g, '/').replace(/^\.\//, '').toLowerCase();
     if (untrackedFiles.has(recordedPath)) {
       ignoredForExpansionFiles.add(recordedPath);
-      hasRecordedTest = true;
     }
   } else if (incident?.reproductionResult?.command) {
     for (const u of untrackedFiles) {
-      if (incident.reproductionResult.command.toLowerCase().includes(u) && isTestFileName(u)) {
+      if (incident.reproductionResult.command.toLowerCase().includes(u) && untrackedFiles.has(u)) {
         ignoredForExpansionFiles.add(u);
-        hasRecordedTest = true;
       }
     }
   }
 
-  // (b) Before reproduction has run (no record in incident):
-  // untracked newly created files matching test file naming conventions
-  if (!hasRecordedTest) {
-    for (const u of untrackedFiles) {
-      if (isTestFileName(u)) {
-        ignoredForExpansionFiles.add(u);
-      }
+  // (b) Always applied: untracked newly created files matching test file naming conventions
+  for (const u of untrackedFiles) {
+    if (isTestFileName(u)) {
+      ignoredForExpansionFiles.add(u);
     }
   }
 

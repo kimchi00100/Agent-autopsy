@@ -399,27 +399,30 @@ export function analyzeIncident(
 
     if (incident?.reproductionResult) {
       const repro = incident.reproductionResult;
+      const verdictSuffix = repro.baselineComparison
+        ? ` [비교: ${repro.baselineComparison.verdict}]`
+        : '';
       if (repro.status === 'REPRODUCED') {
         if (repro.failedLocation && samePath(file.filePath, repro.failedLocation.filePath)) {
           score += 90;
           supportingEvidence.push(
-            `[재현] 에이전트가 만든 재현 테스트가 이 줄(${repro.failedLocation.line}행)에서 실패함 (${repro.command})`
+            `[재현] 에이전트가 만든 재현 테스트가 이 줄(${repro.failedLocation.line}행)에서 실패함${verdictSuffix} (${repro.command})`
           );
         } else {
           score += 35;
           supportingEvidence.push(
-            `[재현] 에이전트가 만든 재현 테스트 실행으로 실패 재현됨 (${repro.command})`
+            `[재현] 에이전트가 만든 재현 테스트 실행으로 실패 재현됨${verdictSuffix} (${repro.command})`
           );
         }
       } else if (repro.status === 'NOT_REPRODUCED') {
-        counterEvidence.push(`[재현] 에이전트가 작성한 재현 테스트에서 실패가 재현되지 않음 (${repro.command})`);
+        counterEvidence.push(`[재현] 에이전트가 작성한 재현 테스트에서 실패가 재현되지 않음${verdictSuffix} (${repro.command})`);
       } else if (repro.status === 'WRONG_FAILURE') {
         const reason = repro.failureReason ? `: ${repro.failureReason}` : '';
-        counterEvidence.push(`[재현] 재현 테스트가 단언 실패가 아닌 다른 이유로 실패함${reason} (${repro.command})`);
+        counterEvidence.push(`[재현] 재현 테스트가 단언 실패가 아닌 다른 이유로 실패함${reason}${verdictSuffix} (${repro.command})`);
       } else if (repro.status === 'UNVERIFIED_FAILURE') {
-        counterEvidence.push(`[재현] 지원하지 않는 실행기로 실패 이유를 검증하지 못함 (${repro.command})`);
+        counterEvidence.push(`[재현] 지원하지 않는 실행기로 실패 이유를 검증하지 못함${verdictSuffix} (${repro.command})`);
       } else {
-        counterEvidence.push(`[재현] 재현 테스트 실행 불가 (${repro.command})`);
+        counterEvidence.push(`[재현] 재현 테스트 실행 불가${verdictSuffix} (${repro.command})`);
       }
     }
 

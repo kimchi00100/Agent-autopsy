@@ -2,87 +2,43 @@ import * as path from 'node:path';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import { CoreContext } from './context.js';
-import { ReproductionResult, ReproductionStatus, ReproductionFailureKind, Incident } from '../types.js';
+import {
+  ReproductionResult,
+  ReproductionStatus,
+  ReproductionFailureKind,
+  BaselineComparisonVerdict,
+  ReproductionRunRecord,
+  BaselineComparison,
+  Incident,
+} from '../types.js';
 import { parseStackFrames, analyzeIncident } from '../analysis/analyzer.js';
 import { verifyTestCommandSignature } from '../utils/security.js';
+import { resolveBaselineCheckpoint } from '../localization/change-localizer.js';
+import { SnapshotResult } from '../git/git-engine.js';
 
-  export async function runReproduction(ctx: CoreContext, 
-    repoPath: string,
-    incidentId: string,
-    testFilePath: string,
-    timeoutMs: number = 30000
-  ): Promise<ReproductionResult> {
-    const targetPath = path.resolve(repoPath);
-    const incident = ctx.db.getIncident(incidentId);
-    if (!incident) {
-      throw new Error(`Incident with ID "${incidentId}" not found.`);
-    }
+interface ExecutionRunsResult {
+  runs: ReproductionRunRecord[];
+  lastEval: EvaluationOutput;
+  lastTestResult: { exitCode: number; output: string };
+  durationNote?: string;
+}
 
-    const project = ctx.ensureProject(targetPath);
+async function executeTestRuns(
+  ctx: CoreContext,
+  sandboxDir: string,
+  hostFile: string,
+  relTestPath: string,
+  effectiveCommand: string,
+  runnerType: SupportedRunnerType,
+  timeoutMs: number,
+  childEnv: NodeJS.ProcessEnv
+): Promise<ExecutionRunsResult> {
+  const runs: ReproductionRunRecord[] = [];
+  let lastEval: EvaluationOutput = { status: 'CANNOT_RUN', testCount: 0 };
+  let lastTestResult: { exitCode: number; output: string } = { exitCode: 1, output: '' };
+  let durationNote: string | undefined;
 
-    // 1. Validate that input is strictly a file path and contains no shell metacharacters
-    const rawPath = String(testFilePath || '').trim().replace(/^["']|["']$/g, '');
-    if (!rawPath || /[\r\n;&|`$><]/.test(rawPath)) {
-      const reproductionResult: ReproductionResult = {
-        status: 'CANNOT_RUN',
-        command: '',
-        exitCode: 1,
-        output: '유효하지 않은 테스트 파일 경로입니다. 재현 테스트에는 임의의 셸 명령이나 제어 문자를 전달할 수 없으며 오직 단일 파일 경로만 허용됩니다.',
-        executedAt: new Date().toISOString(),
-      };
-      const causeEvidence = [...(incident.causeEvidence || []), `[실행 증거] 재현 테스트 실행 불가 - 파일 경로 유효성 검증 실패`];
-      ctx.db.updateIncidentReproduction(incidentId, reproductionResult, incident.causeVerdict, causeEvidence);
-      return reproductionResult;
-    }
-
-    // 2. Check if host test file exists
-    const hostFile = path.resolve(targetPath, rawPath);
-    if (!fs.existsSync(hostFile) || !fs.statSync(hostFile).isFile()) {
-      const reproductionResult: ReproductionResult = {
-        status: 'CANNOT_RUN',
-        command: '',
-        exitCode: 1,
-        output: `재현 테스트 파일이 존재하지 않습니다: ${rawPath}`,
-        executedAt: new Date().toISOString(),
-      };
-      const causeEvidence = [...(incident.causeEvidence || []), `[실행 증거] 재현 테스트 실행 불가 - 파일 없음: ${rawPath}`];
-      ctx.db.updateIncidentReproduction(incidentId, reproductionResult, incident.causeVerdict, causeEvidence);
-      return reproductionResult;
-    }
-
-    // 3. Check for confirmed test runner with valid signature
-    const isRunnerConfirmed = Boolean(
-      project.testCommand &&
-      project.testCommandSignature &&
-      verifyTestCommandSignature(project.id, project.testCommand, project.testCommandSignature)
-    );
-
-    if (!isRunnerConfirmed) {
-      const reproductionResult: ReproductionResult = {
-        status: 'CANNOT_RUN',
-        command: '',
-        exitCode: 1,
-        output: '확정된 테스트 러너가 없습니다. 앱 프로젝트 설정에서 테스트 명령을 먼저 확정한 후 재현 테스트를 실행할 수 있습니다.',
-        executedAt: new Date().toISOString(),
-      };
-      const causeEvidence = [...(incident.causeEvidence || []), `[실행 증거] 재현 테스트 실행 불가 - 확정된 테스트 러너 없음`];
-      ctx.db.updateIncidentReproduction(incidentId, reproductionResult, incident.causeVerdict, causeEvidence);
-      return reproductionResult;
-    }
-
-    // 4. Construct execution command using confirmed runner and relative file path
-    const relTestPath = path.relative(targetPath, hostFile).replace(/\\/g, '/');
-    const effectiveCommand = buildReproductionCommand(project.testCommand!, relTestPath);
-
-    // 5. Create isolated worktree for reproduction
-    const sandboxId = `repro-${incidentId.slice(0, 8)}-${Date.now()}`;
-    const baseCommit = incident.baseCheckpointId
-      ? ctx.db.getCheckpoint(incident.baseCheckpointId)?.worktreeCommitSha || 'HEAD'
-      : 'HEAD';
-
-    const { sandboxDir } = ctx.worktreeRunner.createWorktree(targetPath, sandboxId, baseCommit, [], effectiveCommand);
-
-    const runnerType = detectRunnerType(effectiveCommand);
+  for (let i = 0; i < 3; i++) {
     let runCommand = effectiveCommand;
     let tempReportDir: string | undefined;
     let reportFilePath: string | undefined;
@@ -90,37 +46,22 @@ import { verifyTestCommandSignature } from '../utils/security.js';
     if (runnerType === 'pytest' || runnerType === 'node:test') {
       tempReportDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-autopsy-repro-'));
       if (runnerType === 'pytest') {
-        reportFilePath = path.join(tempReportDir, 'report.xml');
-        if (fs.existsSync(reportFilePath)) {
-          fs.unlinkSync(reportFilePath);
-        }
+        reportFilePath = path.join(tempReportDir, `report-${i}.xml`);
         const normalizedReport = reportFilePath.replace(/\\/g, '/');
         runCommand = `${effectiveCommand} --junitxml="${normalizedReport}"`;
       } else if (runnerType === 'node:test') {
-        reportFilePath = path.join(tempReportDir, 'report.tap');
-        if (fs.existsSync(reportFilePath)) {
-          fs.unlinkSync(reportFilePath);
-        }
+        reportFilePath = path.join(tempReportDir, `report-${i}.tap`);
         const normalizedReport = reportFilePath.replace(/\\/g, '/');
         runCommand = `node --test --test-reporter=tap --test-reporter-destination="${normalizedReport}" --test-reporter=spec --test-reporter-destination=stdout "${relTestPath}"`;
       }
     }
 
+    const start = Date.now();
     try {
-      // 6. Copy reproduction test file from host repository into sandbox
-      const destFile = path.resolve(sandboxDir, relTestPath);
-      fs.mkdirSync(path.dirname(destFile), { recursive: true });
-      fs.copyFileSync(hostFile, destFile);
-
-      // 7. Run reproduction test in sandbox
-      // Pass dedicated child environment without NODE_TEST_CONTEXT or NODE_TEST_WORKER_ID (do not mutate process.env)
-      const childEnv: NodeJS.ProcessEnv = { ...process.env };
-      delete childEnv.NODE_TEST_CONTEXT;
-      delete childEnv.NODE_TEST_WORKER_ID;
-
       const testResult = await ctx.worktreeRunner.runTest(sandboxDir, runCommand, timeoutMs, childEnv);
+      const durationMs = Date.now() - start;
+      lastTestResult = testResult;
 
-      // 8. Determine reproduction status using structured runner evaluation
       let evalOutput: EvaluationOutput;
       if (runnerType === 'pytest') {
         evalOutput = evaluatePytestReproduction(reportFilePath, testResult);
@@ -132,80 +73,350 @@ import { verifyTestCommandSignature } from '../utils/security.js';
       } else {
         evalOutput = evaluateUnsupportedReproduction(effectiveCommand, testResult);
       }
+      lastEval = evalOutput;
 
-      const status: ReproductionStatus = evalOutput.status;
-      const failedLocation = evalOutput.failedLocation;
-      const failureKind = evalOutput.failureKind;
-      const failureReason = evalOutput.failureReason;
-      const testCount = evalOutput.testCount;
-
-      const reproductionResult: ReproductionResult = {
-        status,
-        command: effectiveCommand,
-        exitCode: testResult.exitCode,
-        output: testResult.output,
-        failedLocation,
-        executedAt: new Date().toISOString(),
-        failureKind,
-        failureReason,
-        testCount,
-      };
-
-      // 9. Update incident in DB with execution evidence & re-evaluate causeVerdict
-      const updatedIncident: Incident = {
-        ...incident,
-        reproductionResult,
-      };
-
-      const analysis = analyzeIncident(
-        incident.errorOutput,
-        incident.diffSummary,
-        targetPath,
-        project.name,
-        'HEAD',
-        updatedIncident
-      );
-
-      const causeEvidence = [...(incident.causeEvidence || [])];
-      if (status === 'REPRODUCED') {
-        const locNote = failedLocation ? ` (${failedLocation.filePath}:${failedLocation.line})` : '';
-        causeEvidence.push(`[실행 증거] 재현 테스트 실행으로 실패 재현 확인${locNote} - ${effectiveCommand}`);
-      } else if (status === 'NOT_REPRODUCED') {
-        causeEvidence.push(`[실행 증거] 재현 테스트에서 실패가 재현되지 않음 - ${effectiveCommand}`);
-      } else if (status === 'WRONG_FAILURE') {
-        const reason = failureReason ? `: ${failureReason}` : '';
-        causeEvidence.push(`[실행 증거] 재현 테스트가 단언 실패가 아닌 다른 이유로 실패함${reason} - ${effectiveCommand}`);
-      } else if (status === 'UNVERIFIED_FAILURE') {
-        causeEvidence.push(`[실행 증거] 지원하지 않는 실행기로 실패 이유를 검증하지 못함 - ${effectiveCommand}`);
-      } else {
-        causeEvidence.push(`[실행 증거] 재현 테스트 실행 불가 - ${effectiveCommand}`);
-      }
-
-      ctx.db.updateIncidentReproduction(
-        incidentId,
-        reproductionResult,
-        analysis.causeVerdict,
-        causeEvidence
-      );
-
-      ctx.emitChange('incident_updated', {
-        incidentId,
-        reproductionResult,
-        causeVerdict: analysis.causeVerdict,
+      runs.push({
+        runIndex: i + 1,
+        status: evalOutput.status,
+        failureKind: evalOutput.failureKind,
+        durationMs,
       });
 
-      return reproductionResult;
+      if (i === 0 && durationMs > 3000) {
+        durationNote = `첫 실행 소요 시간(${durationMs}ms)이 3초를 초과하여 반복 실행을 생략하고 1회만 실행함 (runCount: 1)`;
+        break;
+      }
     } finally {
-      ctx.worktreeRunner.cleanupWorktree(targetPath, sandboxDir);
       if (tempReportDir) {
         try {
           fs.rmSync(tempReportDir, { recursive: true, force: true });
-        } catch {
-          // ignore cleanup error
-        }
+        } catch {}
       }
     }
   }
+
+  return { runs, lastEval, lastTestResult, durationNote };
+}
+
+export async function runReproduction(
+  ctx: CoreContext,
+  repoPath: string,
+  incidentId: string,
+  testFilePath: string,
+  baselineCheckpointId?: string,
+  timeoutMs: number = 30000
+): Promise<ReproductionResult> {
+  const targetPath = path.resolve(repoPath);
+  const incident = ctx.db.getIncident(incidentId);
+  if (!incident) {
+    throw new Error(`Incident with ID "${incidentId}" not found.`);
+  }
+
+  const project = ctx.ensureProject(targetPath);
+
+  // 1. Validate that input is strictly a file path and contains no shell metacharacters
+  const rawPath = String(testFilePath || '').trim().replace(/^["']|["']$/g, '');
+  if (!rawPath || /[\r\n;&|`$><]/.test(rawPath)) {
+    const reproductionResult: ReproductionResult = {
+      status: 'CANNOT_RUN',
+      command: '',
+      exitCode: 1,
+      output: '유효하지 않은 테스트 파일 경로입니다. 재현 테스트에는 임의의 셸 명령이나 제어 문자를 전달할 수 없으며 오직 단일 파일 경로만 허용됩니다.',
+      executedAt: new Date().toISOString(),
+    };
+    const causeEvidence = [...(incident.causeEvidence || []), `[실행 증거] 재현 테스트 실행 불가 - 파일 경로 유효성 검증 실패`];
+    ctx.db.updateIncidentReproduction(incidentId, reproductionResult, incident.causeVerdict, causeEvidence);
+    return reproductionResult;
+  }
+
+  // 2. Check if host test file exists
+  const hostFile = path.resolve(targetPath, rawPath);
+  if (!fs.existsSync(hostFile) || !fs.statSync(hostFile).isFile()) {
+    const reproductionResult: ReproductionResult = {
+      status: 'CANNOT_RUN',
+      command: '',
+      exitCode: 1,
+      output: `재현 테스트 파일이 존재하지 않습니다: ${rawPath}`,
+      executedAt: new Date().toISOString(),
+    };
+    const causeEvidence = [...(incident.causeEvidence || []), `[실행 증거] 재현 테스트 실행 불가 - 파일 없음: ${rawPath}`];
+    ctx.db.updateIncidentReproduction(incidentId, reproductionResult, incident.causeVerdict, causeEvidence);
+    return reproductionResult;
+  }
+
+  // 3. Check for confirmed test runner with valid signature
+  const isRunnerConfirmed = Boolean(
+    project.testCommand &&
+    project.testCommandSignature &&
+    verifyTestCommandSignature(project.id, project.testCommand, project.testCommandSignature)
+  );
+
+  if (!isRunnerConfirmed) {
+    const reproductionResult: ReproductionResult = {
+      status: 'CANNOT_RUN',
+      command: '',
+      exitCode: 1,
+      output: '확정된 테스트 러너가 없습니다. 앱 프로젝트 설정에서 테스트 명령을 먼저 확정한 후 재현 테스트를 실행할 수 있습니다.',
+      executedAt: new Date().toISOString(),
+    };
+    const causeEvidence = [...(incident.causeEvidence || []), `[실행 증거] 재현 테스트 실행 불가 - 확정된 테스트 러너 없음`];
+    ctx.db.updateIncidentReproduction(incidentId, reproductionResult, incident.causeVerdict, causeEvidence);
+    return reproductionResult;
+  }
+
+  // 4. Construct execution command using confirmed runner and relative file path
+  const relTestPath = path.relative(targetPath, hostFile).replace(/\\/g, '/');
+  const effectiveCommand = buildReproductionCommand(project.testCommand!, relTestPath);
+  const runnerType = detectRunnerType(effectiveCommand);
+
+  // 5. Capture "현재" snapshot (live working directory including untracked & uncommitted changes)
+  let currentSnapshot: SnapshotResult | undefined;
+  const reproSnapshotId = `repro-snap-${incidentId.slice(0, 8)}-${Date.now()}`;
+  try {
+    currentSnapshot = ctx.gitEngine.createSnapshot(targetPath, reproSnapshotId, 'Reproduction transient snapshot');
+  } catch {}
+  const currentCommit = currentSnapshot?.worktreeCommitSha || 'HEAD';
+
+  // 6. Resolve baseline checkpoint and rule
+  const resolvedBaseline = resolveBaselineCheckpoint(ctx, {
+    repoPath: targetPath,
+    projectId: project.id,
+    incidentId,
+    baselineCheckpointId,
+    ignoreFilePath: relTestPath,
+  });
+
+  // Check if baseline tree is byte-for-byte identical to current snapshot tree
+  let treeIdentical = false;
+  if (resolvedBaseline.baselineSha && resolvedBaseline.baselineSha !== 'HEAD' && currentCommit) {
+    try {
+      const currentTree = ctx.gitEngine.runGit(targetPath, ['rev-parse', `${currentCommit}^{tree}`]).trim();
+      const baselineTree = ctx.gitEngine.runGit(targetPath, ['rev-parse', `${resolvedBaseline.baselineSha}^{tree}`]).trim();
+      if (currentTree && baselineTree && currentTree === baselineTree) {
+        treeIdentical = true;
+      } else {
+        const diffFiles = ctx.gitEngine.runGit(targetPath, ['diff', '--name-only', resolvedBaseline.baselineSha, currentCommit]);
+        const changedExcludingTest = diffFiles
+          .split(/\r?\n/)
+          .map((f) => f.trim().replace(/\\/g, '/'))
+          .filter((f) => f && f.toLowerCase() !== relTestPath.toLowerCase());
+        if (changedExcludingTest.length === 0) {
+          treeIdentical = true;
+        }
+      }
+    } catch {}
+  }
+
+  // Child environment without NODE_TEST_CONTEXT or NODE_TEST_WORKER_ID
+  const childEnv: NodeJS.ProcessEnv = { ...process.env };
+  delete childEnv.NODE_TEST_CONTEXT;
+  delete childEnv.NODE_TEST_WORKER_ID;
+
+  let currentSandboxDir: string | undefined;
+  let baselineSandboxDir: string | undefined;
+
+  try {
+    // 7. Run on "현재" (Current)
+    const currentSandboxId = `repro-cur-${incidentId.slice(0, 8)}-${Date.now()}`;
+    const curWorktree = ctx.worktreeRunner.createWorktree(targetPath, currentSandboxId, currentCommit, [], effectiveCommand);
+    currentSandboxDir = curWorktree.sandboxDir;
+
+    // Copy reproduction test file into sandbox
+    const curDestFile = path.resolve(currentSandboxDir, relTestPath);
+    fs.mkdirSync(path.dirname(curDestFile), { recursive: true });
+    fs.copyFileSync(hostFile, curDestFile);
+
+    const currentExec = await executeTestRuns(
+      ctx,
+      currentSandboxDir,
+      hostFile,
+      relTestPath,
+      effectiveCommand,
+      runnerType,
+      timeoutMs,
+      childEnv
+    );
+
+    const currentRuns = currentExec.runs;
+    let currentStatus: ReproductionStatus = currentExec.lastEval.status;
+    let currentFailureKind = currentExec.lastEval.failureKind;
+    let currentFailureReason = currentExec.lastEval.failureReason;
+
+    if (currentRuns.length > 1) {
+      const allReproduced = currentRuns.every((r) => r.status === 'REPRODUCED');
+      const allNotReproduced = currentRuns.every((r) => r.status === 'NOT_REPRODUCED');
+      const allSameStatus = currentRuns.every(
+        (r) => r.status === currentRuns[0].status && r.failureKind === currentRuns[0].failureKind
+      );
+
+      if (allReproduced) {
+        currentStatus = 'REPRODUCED';
+      } else if (allNotReproduced) {
+        currentStatus = 'NOT_REPRODUCED';
+      } else if (allSameStatus) {
+        currentStatus = currentRuns[0].status;
+        currentFailureKind = currentRuns[0].failureKind;
+      } else {
+        // Mixed results across runs -> FLAKY
+        currentStatus = 'WRONG_FAILURE';
+        currentFailureKind = 'FLAKY';
+        currentFailureReason = '실행마다 결과가 달라짐 (FLAKY)';
+      }
+    }
+
+    // 8. Baseline Comparison
+    let verdict: BaselineComparisonVerdict;
+    let baselineRuns: ReproductionRunRecord[] = [];
+    let note: string | undefined = currentExec.durationNote;
+
+    const canCompareBaseline =
+      !treeIdentical &&
+      Boolean(resolvedBaseline.baselineSha) &&
+      resolvedBaseline.baselineRule !== 'NO_CHECKPOINT_HEAD';
+
+    if (currentStatus !== 'REPRODUCED') {
+      verdict = 'SKIPPED';
+      const skipNote = '현재에서 재현(REPRODUCED)되지 않아 정상 시점 실행을 생략함';
+      note = note ? `${note}; ${skipNote}` : skipNote;
+    } else if (!canCompareBaseline) {
+      verdict = 'NO_BASELINE';
+      const noBaseNote = treeIdentical
+        ? '정상 시점과 현재 트리가 동일하여 비교 대상 없음'
+        : '정상 시점 체크포인트가 없어 비교 대상 없음';
+      note = note ? `${note}; ${noBaseNote}` : noBaseNote;
+    } else {
+      // Run baseline worktree
+      const baselineSandboxId = `repro-base-${incidentId.slice(0, 8)}-${Date.now()}`;
+      const baseWorktree = ctx.worktreeRunner.createWorktree(
+        targetPath,
+        baselineSandboxId,
+        resolvedBaseline.baselineSha,
+        [],
+        effectiveCommand
+      );
+      baselineSandboxDir = baseWorktree.sandboxDir;
+
+      const baseDestFile = path.resolve(baselineSandboxDir, relTestPath);
+      fs.mkdirSync(path.dirname(baseDestFile), { recursive: true });
+      fs.copyFileSync(hostFile, baseDestFile);
+
+      const baselineExec = await executeTestRuns(
+        ctx,
+        baselineSandboxDir,
+        hostFile,
+        relTestPath,
+        effectiveCommand,
+        runnerType,
+        timeoutMs,
+        childEnv
+      );
+
+      baselineRuns = baselineExec.runs;
+      if (baselineExec.durationNote) {
+        note = note ? `${note}; ${baselineExec.durationNote}` : baselineExec.durationNote;
+      }
+
+      const allBaselinePassed = baselineRuns.every((r) => r.status === 'NOT_REPRODUCED');
+      const allBaselineReproduced = baselineRuns.every((r) => r.status === 'REPRODUCED');
+      const allBaselineCannotRunOrWrong = baselineRuns.every(
+        (r) => r.status === 'WRONG_FAILURE' || r.status === 'CANNOT_RUN' || r.status === 'UNVERIFIED_FAILURE'
+      );
+
+      if (allBaselinePassed) {
+        verdict = 'REGRESSION_CONFIRMED';
+      } else if (allBaselineReproduced) {
+        verdict = 'PRE_EXISTING';
+      } else if (allBaselineCannotRunOrWrong) {
+        verdict = 'BASELINE_CANNOT_RUN';
+      } else {
+        verdict = 'BASELINE_FLAKY';
+      }
+    }
+
+    const baselineComparison: BaselineComparison = {
+      baselineCheckpointId: resolvedBaseline.baselineCheckpointId,
+      baselineSha: resolvedBaseline.baselineSha,
+      baselineRule: resolvedBaseline.baselineRule,
+      verdict,
+      runs: {
+        current: currentRuns,
+        baseline: baselineRuns.length > 0 ? baselineRuns : undefined,
+      },
+      note,
+    };
+
+    const reproductionResult: ReproductionResult = {
+      status: currentStatus,
+      command: effectiveCommand,
+      exitCode: currentExec.lastTestResult.exitCode,
+      output: currentExec.lastTestResult.output,
+      failedLocation: currentExec.lastEval.failedLocation,
+      executedAt: new Date().toISOString(),
+      failureKind: currentFailureKind,
+      failureReason: currentFailureReason,
+      testCount: currentExec.lastEval.testCount,
+      baselineComparison,
+    };
+
+    // 9. Update incident in DB with execution evidence & re-evaluate causeVerdict
+    const updatedIncident: Incident = {
+      ...incident,
+      reproductionResult,
+    };
+
+    const analysis = analyzeIncident(
+      incident.errorOutput,
+      incident.diffSummary,
+      targetPath,
+      project.name,
+      'HEAD',
+      updatedIncident
+    );
+
+    const causeEvidence = [...(incident.causeEvidence || [])];
+    const verdictSuffix = ` [비교: ${verdict}]`;
+    if (currentStatus === 'REPRODUCED') {
+      const locNote = reproductionResult.failedLocation ? ` (${reproductionResult.failedLocation.filePath}:${reproductionResult.failedLocation.line})` : '';
+      causeEvidence.push(`[실행 증거] 재현 테스트 실행으로 실패 재현 확인${locNote}${verdictSuffix} - ${effectiveCommand}`);
+    } else if (currentStatus === 'NOT_REPRODUCED') {
+      causeEvidence.push(`[실행 증거] 재현 테스트에서 실패가 재현되지 않음${verdictSuffix} - ${effectiveCommand}`);
+    } else if (currentStatus === 'WRONG_FAILURE') {
+      const reason = currentFailureReason ? `: ${currentFailureReason}` : '';
+      causeEvidence.push(`[실행 증거] 재현 테스트가 단언 실패가 아닌 다른 이유로 실패함${reason}${verdictSuffix} - ${effectiveCommand}`);
+    } else if (currentStatus === 'UNVERIFIED_FAILURE') {
+      causeEvidence.push(`[실행 증거] 지원하지 않는 실행기로 실패 이유를 검증하지 못함${verdictSuffix} - ${effectiveCommand}`);
+    } else {
+      causeEvidence.push(`[실행 증거] 재현 테스트 실행 불가${verdictSuffix} - ${effectiveCommand}`);
+    }
+
+    ctx.db.updateIncidentReproduction(
+      incidentId,
+      reproductionResult,
+      analysis.causeVerdict,
+      causeEvidence
+    );
+
+    ctx.emitChange('incident_updated', {
+      incidentId,
+      reproductionResult,
+      causeVerdict: analysis.causeVerdict,
+    });
+
+    return reproductionResult;
+  } finally {
+    if (currentSandboxDir) {
+      ctx.worktreeRunner.cleanupWorktree(targetPath, currentSandboxDir);
+    }
+    if (baselineSandboxDir) {
+      ctx.worktreeRunner.cleanupWorktree(targetPath, baselineSandboxDir);
+    }
+    if (currentSnapshot?.gitRef) {
+      try {
+        ctx.gitEngine.runGit(targetPath, ['update-ref', '-d', currentSnapshot.gitRef]);
+      } catch {}
+    }
+  }
+}
 
   /**
    * Helper to construct a single test execution command from confirmed test runner and relative test file path.

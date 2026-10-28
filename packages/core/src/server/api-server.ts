@@ -313,10 +313,12 @@ export class ApiServer {
       const repoPath = project ? project.rootPath : process.cwd();
       const body = await this.parseJsonBody(req);
       const testFilePath = body.testFilePath || body.testCommandOrFile || '';
+      const baselineCheckpointId = body.baselineCheckpointId || body.baseline_checkpoint_id;
       const result = await this.coreManager.runReproduction(
         repoPath,
         incidentId,
-        testFilePath
+        testFilePath,
+        baselineCheckpointId
       );
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ success: true, reproduction: result }));

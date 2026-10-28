@@ -204,7 +204,35 @@ export type ReproductionFailureKind =
   | 'TIMEOUT'
   | 'NO_TESTS'
   | 'NO_REPORT'
-  | 'UNKNOWN_RUNNER';
+  | 'UNKNOWN_RUNNER'
+  | 'FLAKY';
+
+export type BaselineComparisonVerdict =
+  | 'REGRESSION_CONFIRMED'
+  | 'PRE_EXISTING'
+  | 'BASELINE_CANNOT_RUN'
+  | 'BASELINE_FLAKY'
+  | 'NO_BASELINE'
+  | 'SKIPPED';
+
+export interface ReproductionRunRecord {
+  runIndex: number;
+  status: ReproductionStatus;
+  failureKind?: ReproductionFailureKind;
+  durationMs: number;
+}
+
+export interface BaselineComparison {
+  baselineCheckpointId?: string;
+  baselineSha?: string;
+  baselineRule?: string;
+  verdict: BaselineComparisonVerdict;
+  runs: {
+    current: ReproductionRunRecord[];
+    baseline?: ReproductionRunRecord[];
+  };
+  note?: string;
+}
 
 export interface ReproductionResult {
   status: ReproductionStatus;
@@ -216,6 +244,7 @@ export interface ReproductionResult {
   failureKind?: ReproductionFailureKind;
   failureReason?: string;
   testCount?: number;
+  baselineComparison?: BaselineComparison;
 }
 
 export type Severity = 'HIGH' | 'MEDIUM' | 'LOW' | 'UNASSESSED';

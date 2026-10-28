@@ -108,6 +108,9 @@ import {
   ReproductionResult,
   ReproductionStatus,
   ReproductionFailureKind,
+  BaselineComparisonVerdict,
+  ReproductionRunRecord,
+  BaselineComparison,
   IntentSource,
   IntentProvenance,
   StructuredIntents,
@@ -511,9 +514,14 @@ export class CoreManager {
     repoPath: string,
     incidentId: string,
     testFilePath: string,
+    baselineCheckpointIdOrTimeout?: string | number,
     timeoutMs: number = 30000
   ): Promise<ReproductionResult> {
-    return runReproduction(this.ctx, repoPath, incidentId, testFilePath, timeoutMs);
+    const baselineCheckpointId =
+      typeof baselineCheckpointIdOrTimeout === 'string' ? baselineCheckpointIdOrTimeout : undefined;
+    const effectiveTimeout =
+      typeof baselineCheckpointIdOrTimeout === 'number' ? baselineCheckpointIdOrTimeout : timeoutMs;
+    return runReproduction(this.ctx, repoPath, incidentId, testFilePath, baselineCheckpointId, effectiveTimeout);
   }
 
 

@@ -781,3 +781,189 @@ export async function locateChangeScope(
 }
 
 export const locateCandidates = locateChangeScope;
+
+export interface ResolvedBaselineCheckpoint {
+  baselineSha: string;
+  baselineCheckpointId?: string;
+  baselineRule:
+    | 'INCIDENT_BASE_CHECKPOINT'
+    | 'LAST_GOOD_CHECKPOINT'
+    | 'NO_CHECKPOINT_HEAD'
+    | 'EXPLICIT_BASELINE'
+    | 'EXPANDED_TO_OLDER_CHECKPOINT';
+}
+
+export function resolveBaselineCheckpoint(
+  ctx: CoreContext | { gitEngine: GitEngine; db?: any; ensureProject?: any },
+  options: {
+    repoPath: string;
+    projectId?: string;
+    incidentId?: string;
+    baselineCheckpointId?: string;
+    ignoreFilePath?: string;
+  }
+): ResolvedBaselineCheckpoint {
+  let projectId = options.projectId;
+  let incident: any = null;
+
+  if (options.incidentId && ctx.db) {
+    incident = ctx.db.getIncident(options.incidentId);
+    if (incident) {
+      projectId = projectId || incident.projectId;
+    }
+  }
+
+  if (options.repoPath && !projectId && ctx.db) {
+    if (ctx.ensureProject) {
+      try {
+        const p = ctx.ensureProject(options.repoPath);
+        projectId = p.id;
+      } catch {}
+    }
+    if (!projectId && ctx.db.getProjectByPath) {
+      const p = ctx.db.getProjectByPath(options.repoPath);
+      projectId = p?.id;
+    }
+  }
+
+  // 1. Explicit baselineCheckpointId provided
+  if (options.baselineCheckpointId) {
+    if (!ctx.db) {
+      throw new Error(`DB가 연결되지 않아 체크포인트 ID "${options.baselineCheckpointId}"를 조회할 수 없습니다.`);
+    }
+    const cp = ctx.db.getCheckpoint(options.baselineCheckpointId);
+    if (!cp) {
+      throw new Error(`체크포인트 ID "${options.baselineCheckpointId}"를 찾을 수 없습니다.`);
+    }
+    if (projectId && cp.projectId !== projectId) {
+      throw new Error(`체크포인트 "${options.baselineCheckpointId}"는 이 사건/프로젝트(ID: ${projectId})의 체크포인트가 아닙니다.`);
+    }
+    const baselineSha = cp.worktreeCommitSha || cp.gitHeadSha || '';
+    return {
+      baselineSha,
+      baselineCheckpointId: cp.id,
+      baselineRule: 'EXPLICIT_BASELINE',
+    };
+  }
+
+  // Helper to check if a commit has any meaningful changes against working directory (excluding ignoreFilePath)
+  const hasChangesAgainstWorking = (sha: string): boolean => {
+    try {
+      const diffOut = ctx.gitEngine.runGit(options.repoPath, ['diff', '--name-only', sha]);
+      const untrackedOut = ctx.gitEngine.runGit(options.repoPath, ['ls-files', '--others', '--exclude-standard']);
+      const normIgnore = options.ignoreFilePath ? options.ignoreFilePath.replace(/\\/g, '/').toLowerCase() : '';
+      const allFiles = [...diffOut.split(/\r?\n/), ...untrackedOut.split(/\r?\n/)]
+        .map((f) => f.trim().replace(/\\/g, '/'))
+        .filter((f) => {
+          if (!f) return false;
+          if (normIgnore && f.toLowerCase() === normIgnore) return false;
+          if (isExcludedFile(f)) return false;
+          return true;
+        });
+      return allFiles.length > 0;
+    } catch {
+      return false;
+    }
+  };
+
+  // 2. Incident base checkpoint
+  if (incident && ctx.db) {
+    let originalCheckpoint: any = null;
+    let baselineSha = '';
+
+    if (incident.baseCheckpointId) {
+      const cp = ctx.db.getCheckpoint(incident.baseCheckpointId);
+      if (cp) {
+        baselineSha = cp.worktreeCommitSha || cp.gitHeadSha || '';
+        if (baselineSha) {
+          originalCheckpoint = cp;
+        }
+      }
+    }
+
+    if (originalCheckpoint && baselineSha) {
+      const hasChanges = hasChangesAgainstWorking(baselineSha);
+      if (!hasChanges && projectId) {
+        // Auto-expand to older checkpoints (up to 10 earlier checkpoints)
+        const allCheckpoints: any[] = ctx.db.listCheckpoints(projectId, 100);
+        const origIdx = allCheckpoints.findIndex((c: any) => c.id === originalCheckpoint.id);
+        const earlierCandidates =
+          origIdx >= 0
+            ? allCheckpoints.slice(origIdx + 1)
+            : allCheckpoints.filter(
+                (c: any) => c.createdAt < originalCheckpoint.createdAt && c.id !== originalCheckpoint.id
+              );
+
+        let stepsBack = 0;
+        let lastTestedSha = baselineSha;
+
+        for (const candCp of earlierCandidates) {
+          if (stepsBack >= 10) break;
+          const candSha = candCp.worktreeCommitSha || candCp.gitHeadSha;
+          if (!candSha || candSha === lastTestedSha || candSha === baselineSha) continue;
+
+          stepsBack++;
+          lastTestedSha = candSha;
+
+          if (hasChangesAgainstWorking(candSha)) {
+            return {
+              baselineSha: candSha,
+              baselineCheckpointId: candCp.id,
+              baselineRule: 'EXPANDED_TO_OLDER_CHECKPOINT',
+            };
+          }
+        }
+      } else {
+        return {
+          baselineSha,
+          baselineCheckpointId: originalCheckpoint.id,
+          baselineRule: 'INCIDENT_BASE_CHECKPOINT',
+        };
+      }
+    }
+
+    // Fallback to LAST_GOOD_CHECKPOINT
+    if (projectId) {
+      const checkpoints = ctx.db.listCheckpoints(projectId, 50);
+      const goodCp =
+        checkpoints.find((cp: any) => cp.gitStashSha === null && cp.changedFiles.length === 0) ||
+        checkpoints[0];
+      if (goodCp) {
+        const goodSha = goodCp.worktreeCommitSha || goodCp.gitHeadSha || '';
+        if (goodSha) {
+          return {
+            baselineSha: goodSha,
+            baselineCheckpointId: goodCp.id,
+            baselineRule: 'LAST_GOOD_CHECKPOINT',
+          };
+        }
+      }
+    }
+  }
+
+  // Fallback to LAST_GOOD_CHECKPOINT if projectId available
+  if (options.repoPath && ctx.db && projectId) {
+    try {
+      const checkpoints = ctx.db.listCheckpoints(projectId, 50);
+      const goodCp =
+        checkpoints.find((cp: any) => cp.gitStashSha === null && cp.changedFiles.length === 0) ||
+        checkpoints[0];
+      if (goodCp) {
+        const goodSha = goodCp.worktreeCommitSha || goodCp.gitHeadSha || '';
+        if (goodSha) {
+          return {
+            baselineSha: goodSha,
+            baselineCheckpointId: goodCp.id,
+            baselineRule: 'LAST_GOOD_CHECKPOINT',
+          };
+        }
+      }
+    } catch {}
+  }
+
+  // Fallback to HEAD
+  return {
+    baselineSha: 'HEAD',
+    baselineRule: 'NO_CHECKPOINT_HEAD',
+  };
+}

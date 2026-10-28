@@ -3584,4 +3584,397 @@ def test_long_running():
       assert.strictEqual(envAfter[key], envBefore[key], `process.env[${key}] must be unmodified`);
     }
   });
+
+  test('70. B-2 Step-2: Pytest regression comparison confirms REGRESSION_CONFIRMED with 3/3 repeated runs and cleans up transient ref', async () => {
+    const pyRepo = path.join(testRoot, 'b2_s2_pytest_regress');
+    fs.mkdirSync(path.join(pyRepo, 'src'), { recursive: true });
+    execFileSync('git', ['init', '-b', 'main'], { cwd: pyRepo });
+    execFileSync('git', ['config', 'user.name', 'Tester'], { cwd: pyRepo });
+    execFileSync('git', ['config', 'user.email', 'test@local'], { cwd: pyRepo });
+
+    // 1. Initial clean state
+    fs.writeFileSync(path.join(pyRepo, 'src', 'calc.py'), 'def add(a, b):\n    return a + b\n');
+    execFileSync('git', ['add', '.'], { cwd: pyRepo });
+    execFileSync('git', ['commit', '-m', 'Init normal code'], { cwd: pyRepo });
+
+    // Capture baseline checkpoint CP1
+    const cp1 = core.captureCheckpoint(pyRepo, 'Clean baseline checkpoint');
+    assert.ok(cp1.id);
+
+    // 2. Introduce bug commit
+    fs.writeFileSync(path.join(pyRepo, 'src', 'calc.py'), 'def add(a, b):\n    return a + b + 1\n');
+    execFileSync('git', ['add', '.'], { cwd: pyRepo });
+    execFileSync('git', ['commit', '-m', 'Introduce regression bug'], { cwd: pyRepo });
+
+    // 3. Collect incident
+    const inc = await core.collectIncidentBundle(pyRepo, '회귀 버그 발생', 'AssertionError: assert 4 == 3');
+    assert.strictEqual(inc.baseCheckpointId, cp1.id);
+
+    // 4. Create reproduction test file
+    fs.writeFileSync(
+      path.join(pyRepo, 'test_repro.py'),
+      'from src.calc import add\ndef test_add():\n    assert add(1, 2) == 3\n'
+    );
+
+    core.updateProjectSettings(pyRepo, { testCommand: 'python -m pytest' });
+
+    const repro = await core.runReproduction(pyRepo, inc.id, 'test_repro.py');
+
+    // 5. Assertions
+    assert.strictEqual(repro.status, 'REPRODUCED');
+    assert.strictEqual(repro.failureKind, 'ASSERTION');
+    assert.ok(repro.baselineComparison);
+    assert.strictEqual(repro.baselineComparison.verdict, 'REGRESSION_CONFIRMED');
+    assert.strictEqual(repro.baselineComparison.baselineCheckpointId, cp1.id);
+    assert.strictEqual(repro.baselineComparison.runs.current.length, 3);
+    assert.ok(repro.baselineComparison.runs.baseline);
+    assert.strictEqual(repro.baselineComparison.runs.baseline.length, 3);
+    assert.ok(repro.baselineComparison.runs.current.every((r) => r.status === 'REPRODUCED'));
+    assert.ok(repro.baselineComparison.runs.baseline.every((r) => r.status === 'NOT_REPRODUCED'));
+
+    // Check evidence updated
+    const updatedInc = core.getDatabase().getIncident(inc.id)!;
+    assert.ok(updatedInc.causeEvidence?.some((e: string) => e.includes('[비교: REGRESSION_CONFIRMED]')));
+
+    // Check DB checkpoints: transient snapshot must NOT be in DB checkpoints
+    const project = core.ensureProject(pyRepo);
+    const cps = core.getDatabase().listCheckpoints(project.id);
+    assert.strictEqual(cps.length, 1);
+    assert.strictEqual(cps[0].id, cp1.id);
+
+    // Check git refs: transient ref must be deleted
+    const gitRefs = execFileSync('git', ['show-ref'], { cwd: pyRepo, encoding: 'utf8' });
+    assert.ok(!gitRefs.includes('repro-snap-'), 'Transient snapshot ref must be cleaned up from git refs');
+  });
+
+  test('71. B-2 Step-2: Node:test describe/it regression comparison confirms REGRESSION_CONFIRMED', async () => {
+    const jsRepo = path.join(testRoot, 'b2_s2_node_regress');
+    fs.mkdirSync(jsRepo, { recursive: true });
+    execFileSync('git', ['init', '-b', 'main'], { cwd: jsRepo });
+    execFileSync('git', ['config', 'user.name', 'Tester'], { cwd: jsRepo });
+    execFileSync('git', ['config', 'user.email', 'test@local'], { cwd: jsRepo });
+
+    // 1. Initial clean state
+    fs.writeFileSync(path.join(jsRepo, 'math.mjs'), 'export function mul(a, b) { return a * b; }\n');
+    execFileSync('git', ['add', '.'], { cwd: jsRepo });
+    execFileSync('git', ['commit', '-m', 'Init normal js math'], { cwd: jsRepo });
+
+    const cp1 = core.captureCheckpoint(jsRepo, 'Clean baseline js');
+
+    // 2. Introduce bug commit
+    fs.writeFileSync(path.join(jsRepo, 'math.mjs'), 'export function mul(a, b) { return a * b + 99; }\n');
+    execFileSync('git', ['add', '.'], { cwd: jsRepo });
+    execFileSync('git', ['commit', '-m', 'Buggy mul'], { cwd: jsRepo });
+
+    const inc = await core.collectIncidentBundle(jsRepo, 'JS 회귀 버그', 'AssertionError [ERR_ASSERTION]');
+
+    // 3. Reproduction test using describe/it
+    fs.writeFileSync(
+      path.join(jsRepo, 'test_repro.mjs'),
+      `import { describe, it } from 'node:test';
+import assert from 'node:assert/strict';
+import { mul } from './math.mjs';
+
+describe('multiplication', () => {
+  it('correctly multiplies', () => {
+    assert.strictEqual(mul(2, 3), 6);
+  });
+});
+`
+    );
+
+    core.updateProjectSettings(jsRepo, { testCommand: 'node --test' });
+
+    const repro = await core.runReproduction(jsRepo, inc.id, 'test_repro.mjs');
+
+    assert.strictEqual(repro.status, 'REPRODUCED');
+    assert.strictEqual(repro.failureKind, 'ASSERTION');
+    assert.ok(repro.baselineComparison);
+    assert.strictEqual(repro.baselineComparison.verdict, 'REGRESSION_CONFIRMED');
+    assert.strictEqual(repro.baselineComparison.baselineCheckpointId, cp1.id);
+    assert.strictEqual(repro.baselineComparison.runs.current.length, 3);
+    assert.ok(repro.baselineComparison.runs.baseline);
+    assert.strictEqual(repro.baselineComparison.runs.baseline.length, 3);
+    assert.ok(repro.baselineComparison.runs.current.every((r) => r.status === 'REPRODUCED'));
+    assert.ok(repro.baselineComparison.runs.baseline.every((r) => r.status === 'NOT_REPRODUCED'));
+  });
+
+  test('72. B-2 Step-2: Uncommitted bug after checkpoint reproduces in live current state and passes in baseline', async () => {
+    const pyRepo = path.join(testRoot, 'b2_s2_uncommitted_bug');
+    fs.mkdirSync(pyRepo, { recursive: true });
+    execFileSync('git', ['init', '-b', 'main'], { cwd: pyRepo });
+    execFileSync('git', ['config', 'user.name', 'Tester'], { cwd: pyRepo });
+    execFileSync('git', ['config', 'user.email', 'test@local'], { cwd: pyRepo });
+
+    fs.writeFileSync(path.join(pyRepo, 'calc.py'), 'def sub(a, b):\n    return a - b\n');
+    execFileSync('git', ['add', '.'], { cwd: pyRepo });
+    execFileSync('git', ['commit', '-m', 'Init sub function'], { cwd: pyRepo });
+
+    const cp1 = core.captureCheckpoint(pyRepo, 'Clean sub checkpoint');
+    const inc = await core.collectIncidentBundle(pyRepo, '미커밋 버그 발생 사건', 'AssertionError');
+
+    // Introduce UNCOMMITTED bug in working tree (do not git add, do not git commit)
+    fs.writeFileSync(path.join(pyRepo, 'calc.py'), 'def sub(a, b):\n    return a - b - 100\n');
+
+    fs.writeFileSync(
+      path.join(pyRepo, 'test_sub.py'),
+      'from calc import sub\ndef test_sub():\n    assert sub(10, 5) == 5\n'
+    );
+
+    core.updateProjectSettings(pyRepo, { testCommand: 'python -m pytest' });
+
+    const repro = await core.runReproduction(pyRepo, inc.id, 'test_sub.py');
+
+    // Live uncommitted bug must be reproduced!
+    assert.strictEqual(repro.status, 'REPRODUCED');
+    assert.strictEqual(repro.failureKind, 'ASSERTION');
+    assert.ok(repro.baselineComparison);
+    assert.strictEqual(repro.baselineComparison.verdict, 'REGRESSION_CONFIRMED');
+    assert.strictEqual(repro.baselineComparison.baselineCheckpointId, cp1.id);
+    assert.ok(repro.baselineComparison.runs.current.every((r) => r.status === 'REPRODUCED'));
+    assert.ok(repro.baselineComparison.runs.baseline?.every((r) => r.status === 'NOT_REPRODUCED'));
+  });
+
+  test('73. B-2 Step-2: Pre-existing bug present from initial checkpoint records PRE_EXISTING', async () => {
+    const pyRepo = path.join(testRoot, 'b2_s2_pre_existing');
+    fs.mkdirSync(pyRepo, { recursive: true });
+    execFileSync('git', ['init', '-b', 'main'], { cwd: pyRepo });
+    execFileSync('git', ['config', 'user.name', 'Tester'], { cwd: pyRepo });
+    execFileSync('git', ['config', 'user.email', 'test@local'], { cwd: pyRepo });
+
+    // Bug present from start: returns 0 instead of a // b
+    fs.writeFileSync(path.join(pyRepo, 'calc.py'), 'def divide(a, b):\n    return 0\n');
+    execFileSync('git', ['add', '.'], { cwd: pyRepo });
+    execFileSync('git', ['commit', '-m', 'Init with pre-existing bug'], { cwd: pyRepo });
+
+    const cp1 = core.captureCheckpoint(pyRepo, 'Initial checkpoint with bug');
+
+    // Make an unrelated commit so tree is not identical
+    fs.writeFileSync(path.join(pyRepo, 'readme.txt'), 'Updated readme\n');
+    execFileSync('git', ['add', '.'], { cwd: pyRepo });
+    execFileSync('git', ['commit', '-m', 'Docs update'], { cwd: pyRepo });
+
+    const inc = await core.collectIncidentBundle(pyRepo, '나눗셈 버그', 'AssertionError: assert 0 == 2');
+
+    fs.writeFileSync(
+      path.join(pyRepo, 'test_div.py'),
+      'from calc import divide\ndef test_div():\n    assert divide(4, 2) == 2\n'
+    );
+
+    core.updateProjectSettings(pyRepo, { testCommand: 'python -m pytest' });
+
+    const repro = await core.runReproduction(pyRepo, inc.id, 'test_div.py', cp1.id);
+
+    // Status stays REPRODUCED, comparison verdict is PRE_EXISTING
+    assert.strictEqual(repro.status, 'REPRODUCED');
+    assert.strictEqual(repro.failureKind, 'ASSERTION');
+    assert.ok(repro.baselineComparison);
+    assert.strictEqual(repro.baselineComparison.verdict, 'PRE_EXISTING');
+    assert.strictEqual(repro.baselineComparison.baselineCheckpointId, cp1.id);
+    assert.ok(repro.baselineComparison.runs.current.every((r) => r.status === 'REPRODUCED'));
+    assert.ok(repro.baselineComparison.runs.baseline?.every((r) => r.status === 'REPRODUCED'));
+  });
+
+  test('74. B-2 Step-2: Bug in newly added function missing in baseline records BASELINE_CANNOT_RUN', async () => {
+    const pyRepo = path.join(testRoot, 'b2_s2_new_func_bug');
+    fs.mkdirSync(pyRepo, { recursive: true });
+    execFileSync('git', ['init', '-b', 'main'], { cwd: pyRepo });
+    execFileSync('git', ['config', 'user.name', 'Tester'], { cwd: pyRepo });
+    execFileSync('git', ['config', 'user.email', 'test@local'], { cwd: pyRepo });
+
+    fs.writeFileSync(path.join(pyRepo, 'calc.py'), 'def add(a, b):\n    return a + b\n');
+    execFileSync('git', ['add', '.'], { cwd: pyRepo });
+    execFileSync('git', ['commit', '-m', 'Init basic add'], { cwd: pyRepo });
+
+    const cp1 = core.captureCheckpoint(pyRepo, 'Checkpoint before power function was created');
+
+    // Add new function with bug
+    fs.writeFileSync(
+      path.join(pyRepo, 'calc.py'),
+      'def add(a, b):\n    return a + b\ndef power(a, b):\n    return a * b\n'
+    );
+    execFileSync('git', ['add', '.'], { cwd: pyRepo });
+    execFileSync('git', ['commit', '-m', 'Add power function with bug'], { cwd: pyRepo });
+
+    const inc = await core.collectIncidentBundle(pyRepo, '거듭제곱 함수 버그', 'AssertionError');
+
+    fs.writeFileSync(
+      path.join(pyRepo, 'test_power.py'),
+      'from calc import power\ndef test_power():\n    assert power(2, 3) == 8\n'
+    );
+
+    core.updateProjectSettings(pyRepo, { testCommand: 'python -m pytest' });
+
+    const repro = await core.runReproduction(pyRepo, inc.id, 'test_power.py');
+
+    // Current fails assertion (power(2,3) == 6 != 8) -> REPRODUCED
+    // Baseline fails import (power does not exist in CP1) -> BASELINE_CANNOT_RUN
+    assert.strictEqual(repro.status, 'REPRODUCED');
+    assert.strictEqual(repro.failureKind, 'ASSERTION');
+    assert.ok(repro.baselineComparison);
+    assert.strictEqual(repro.baselineComparison.verdict, 'BASELINE_CANNOT_RUN');
+    assert.strictEqual(repro.baselineComparison.baselineCheckpointId, cp1.id);
+    assert.ok(repro.baselineComparison.runs.current.every((r) => r.status === 'REPRODUCED'));
+    assert.ok(repro.baselineComparison.runs.baseline?.every((r) => r.status === 'WRONG_FAILURE'));
+  });
+
+  test('75. B-2 Step-2: Flaky test alternating pass and fail is rejected with WRONG_FAILURE and failureKind FLAKY', async () => {
+    const pyRepo = path.join(testRoot, 'b2_s2_flaky_test');
+    fs.mkdirSync(pyRepo, { recursive: true });
+    execFileSync('git', ['init', '-b', 'main'], { cwd: pyRepo });
+    execFileSync('git', ['config', 'user.name', 'Tester'], { cwd: pyRepo });
+    execFileSync('git', ['config', 'user.email', 'test@local'], { cwd: pyRepo });
+
+    fs.writeFileSync(path.join(pyRepo, 'app.py'), 'def ok(): return True\n');
+    execFileSync('git', ['add', '.'], { cwd: pyRepo });
+    execFileSync('git', ['commit', '-m', 'Init app'], { cwd: pyRepo });
+
+    core.captureCheckpoint(pyRepo, 'Clean baseline for flaky test');
+    const inc = await core.collectIncidentBundle(pyRepo, '불안정한 테스트 사건', 'Flaky error');
+
+    // External counter file to make test deterministically alternate
+    const counterFile = path.join(testRoot, `flaky_counter_${Date.now()}.txt`);
+    fs.writeFileSync(counterFile, '0', 'utf8');
+    process.env.TEST_FLAKY_COUNTER_FILE = counterFile;
+
+    try {
+      const normalizedCounterFile = counterFile.replace(/\\/g, '/');
+      fs.writeFileSync(
+        path.join(pyRepo, 'test_flaky.py'),
+        `import os
+
+def test_flaky():
+    c_path = "${normalizedCounterFile}"
+    with open(c_path, 'r') as f:
+        val = int(f.read().strip())
+    with open(c_path, 'w') as f:
+        f.write(str(val + 1))
+    if val % 2 == 0:
+        assert 1 == 2, "flaky failure on even"
+    else:
+        assert 1 == 1, "flaky pass on odd"
+`
+      );
+
+      core.updateProjectSettings(pyRepo, { testCommand: 'python -m pytest' });
+
+      const repro = await core.runReproduction(pyRepo, inc.id, 'test_flaky.py');
+
+      // Alternating results must result in WRONG_FAILURE + FLAKY
+      assert.strictEqual(repro.status, 'WRONG_FAILURE');
+      assert.strictEqual(repro.failureKind, 'FLAKY');
+      assert.ok(repro.baselineComparison);
+      assert.strictEqual(repro.baselineComparison.verdict, 'SKIPPED');
+      assert.strictEqual(repro.baselineComparison.runs.current.length, 3);
+      // Run 1: fail (val=0) -> REPRODUCED
+      // Run 2: pass (val=1) -> NOT_REPRODUCED
+      // Run 3: fail (val=2) -> REPRODUCED
+      assert.strictEqual(repro.baselineComparison.runs.current[0].status, 'REPRODUCED');
+      assert.strictEqual(repro.baselineComparison.runs.current[1].status, 'NOT_REPRODUCED');
+      assert.strictEqual(repro.baselineComparison.runs.current[2].status, 'REPRODUCED');
+    } finally {
+      delete process.env.TEST_FLAKY_COUNTER_FILE;
+      try {
+        if (fs.existsSync(counterFile)) fs.unlinkSync(counterFile);
+      } catch {}
+    }
+  });
+
+  test('76. B-2 Step-2: Test exceeding 3 seconds executes only 1 time and records the reason in note', async () => {
+    const pyRepo = path.join(testRoot, 'b2_s2_slow_test');
+    fs.mkdirSync(pyRepo, { recursive: true });
+    execFileSync('git', ['init', '-b', 'main'], { cwd: pyRepo });
+    execFileSync('git', ['config', 'user.name', 'Tester'], { cwd: pyRepo });
+    execFileSync('git', ['config', 'user.email', 'test@local'], { cwd: pyRepo });
+
+    fs.writeFileSync(path.join(pyRepo, 'calc.py'), 'def f(): return 1\n');
+    execFileSync('git', ['add', '.'], { cwd: pyRepo });
+    execFileSync('git', ['commit', '-m', 'Init f'], { cwd: pyRepo });
+
+    const cp1 = core.captureCheckpoint(pyRepo, 'Baseline for slow test');
+
+    // Bug commit
+    fs.writeFileSync(path.join(pyRepo, 'calc.py'), 'def f(): return 2\n');
+    execFileSync('git', ['add', '.'], { cwd: pyRepo });
+    execFileSync('git', ['commit', '-m', 'Bug f'], { cwd: pyRepo });
+
+    const inc = await core.collectIncidentBundle(pyRepo, '느린 테스트 사건', 'AssertionError');
+
+    // Test sleeps for 3.2 seconds then asserts
+    fs.writeFileSync(
+      path.join(pyRepo, 'test_slow.py'),
+      `import time
+from calc import f
+
+def test_slow():
+    time.sleep(3.2)
+    assert f() == 1
+`
+    );
+
+    core.updateProjectSettings(pyRepo, { testCommand: 'python -m pytest' });
+
+    const repro = await core.runReproduction(pyRepo, inc.id, 'test_slow.py', 15000);
+
+    assert.strictEqual(repro.status, 'REPRODUCED');
+    assert.strictEqual(repro.failureKind, 'ASSERTION');
+    assert.ok(repro.baselineComparison);
+    // Over 3s: only 1 run in current!
+    assert.strictEqual(repro.baselineComparison.runs.current.length, 1);
+    assert.ok(repro.baselineComparison.runs.current[0].durationMs >= 3000);
+    assert.ok(
+      repro.baselineComparison.note?.includes('runCount: 1') ||
+      repro.baselineComparison.note?.includes('3초를 초과')
+    );
+  });
+
+  test('77. B-2 Step-2: Unsupported test runner does not run baseline and records SKIPPED', async () => {
+    const unsuppRepo = path.join(testRoot, 'b2_s2_unsupported_runner');
+    fs.mkdirSync(unsuppRepo, { recursive: true });
+    execFileSync('git', ['init', '-b', 'main'], { cwd: unsuppRepo });
+    execFileSync('git', ['config', 'user.name', 'Tester'], { cwd: unsuppRepo });
+    execFileSync('git', ['config', 'user.email', 'test@local'], { cwd: unsuppRepo });
+
+    fs.writeFileSync(path.join(unsuppRepo, 'script.sh'), '#!/bin/sh\nexit 1\n');
+    execFileSync('git', ['add', '.'], { cwd: unsuppRepo });
+    execFileSync('git', ['commit', '-m', 'Init script'], { cwd: unsuppRepo });
+
+    core.captureCheckpoint(unsuppRepo, 'Baseline unsupp');
+    const inc = await core.collectIncidentBundle(unsuppRepo, '미지원 러너 사건', 'script error');
+
+    fs.writeFileSync(path.join(unsuppRepo, 'fail.sh'), '#!/bin/sh\nexit 1\n');
+    core.updateProjectSettings(unsuppRepo, { testCommand: 'sh fail.sh' });
+
+    const repro = await core.runReproduction(unsuppRepo, inc.id, 'fail.sh');
+
+    assert.strictEqual(repro.status, 'UNVERIFIED_FAILURE');
+    assert.ok(repro.baselineComparison);
+    assert.strictEqual(repro.baselineComparison.verdict, 'SKIPPED');
+  });
+
+  test('78. B-2 Step-2: Identical tree between current and baseline records NO_BASELINE', async () => {
+    const pyRepo = path.join(testRoot, 'b2_s2_identical_tree');
+    fs.mkdirSync(pyRepo, { recursive: true });
+    execFileSync('git', ['init', '-b', 'main'], { cwd: pyRepo });
+    execFileSync('git', ['config', 'user.name', 'Tester'], { cwd: pyRepo });
+    execFileSync('git', ['config', 'user.email', 'test@local'], { cwd: pyRepo });
+
+    fs.writeFileSync(path.join(pyRepo, 'calc.py'), 'def add(a, b): return a + b\n');
+    execFileSync('git', ['add', '.'], { cwd: pyRepo });
+    execFileSync('git', ['commit', '-m', 'Init calc'], { cwd: pyRepo });
+
+    const cp1 = core.captureCheckpoint(pyRepo, 'Only checkpoint');
+    const inc = await core.collectIncidentBundle(pyRepo, '트리 동일 사건', 'AssertionError');
+
+    // No code was changed between CP1 and now
+    fs.writeFileSync(path.join(pyRepo, 'test_assert.py'), 'def test_a(): assert 1 == 2\n');
+    core.updateProjectSettings(pyRepo, { testCommand: 'python -m pytest' });
+
+    const repro = await core.runReproduction(pyRepo, inc.id, 'test_assert.py');
+
+    assert.strictEqual(repro.status, 'REPRODUCED');
+    assert.ok(repro.baselineComparison);
+    assert.strictEqual(repro.baselineComparison.verdict, 'NO_BASELINE');
+    assert.ok(repro.baselineComparison.note?.includes('트리') || repro.baselineComparison.note?.includes('비교 대상 없음'));
+  });
 });

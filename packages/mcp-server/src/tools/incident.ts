@@ -142,16 +142,27 @@ server.tool(
     testFilePath: z.string().describe('Relative path to the reproduction test file in the repository (e.g. "tests/test_repro.py" or "test/repro.test.js"). Only file paths are allowed; tests are executed using the user-confirmed test runner.'),
     testCommandOrFile: z.string().optional().describe('Deprecated fallback: please provide testFilePath instead'),
     repoPath: z.string().optional().describe('Root path of the git repository (defaults to current directory)'),
+    baseline_checkpoint_id: z.string().optional().describe('Optional baseline checkpoint ID to compare against'),
   },
-  async ({ incidentId, testFilePath, testCommandOrFile, repoPath }) => {
+  async ({ incidentId, testFilePath, testCommandOrFile, repoPath, baseline_checkpoint_id }) => {
     try {
       const targetPath = resolvePath(repoPath);
       const filePath = testFilePath || testCommandOrFile || '';
-      const result = await coreManager.runReproduction(targetPath, incidentId, filePath);
+      const result = await coreManager.runReproduction(targetPath, incidentId, filePath, baseline_checkpoint_id);
       let message = `Reproduction test completed with status: ${result.status}`;
       let next_action: NextAction;
 
-      if (result.status === 'WRONG_FAILURE') {
+      const verdict = result.baselineComparison?.verdict;
+
+      if (result.failureKind === 'FLAKY') {
+        message = `Reproduction test completed with status: WRONG_FAILURE (FLAKY)`;
+        next_action = {
+          actor: 'AGENT',
+          action: 'RUN_REPRODUCTION',
+          agent_should: '결과가 실행마다 달라졌다. 시간, 난수, 실행 순서에 의존하지 않게 테스트를 고쳐라',
+          forbidden: ['원본 파일 직접 수정', 'DB 직접 수정'],
+        };
+      } else if (result.status === 'WRONG_FAILURE') {
         message = `Reproduction test completed with status: WRONG_FAILURE (${result.failureReason || result.failureKind})`;
         next_action = {
           actor: 'AGENT',
@@ -165,6 +176,30 @@ server.tool(
           actor: 'AGENT',
           action: 'PROPOSE_REPAIR',
           agent_should: '이 실행기는 아직 실패 이유를 판정하지 못한다. 재현으로 인정되지 않는다',
+          forbidden: ['원본 파일 직접 수정', 'DB 직접 수정'],
+        };
+      } else if (verdict === 'PRE_EXISTING') {
+        message = `Reproduction test completed with status: ${result.status} (PRE_EXISTING)`;
+        next_action = {
+          actor: 'AGENT',
+          action: 'PROPOSE_REPAIR',
+          agent_should: '정상 시점에서도 같은 단언 실패가 난다. 원래부터 있던 버그이거나 기대값이 틀렸을 수 있다. 사용자에게 기대값을 확인하거나 더 이전 체크포인트를 baseline_checkpoint_id로 지정하라',
+          forbidden: ['원본 파일 직접 수정', 'DB 직접 수정'],
+        };
+      } else if (verdict === 'BASELINE_CANNOT_RUN') {
+        message = `Reproduction test completed with status: ${result.status} (BASELINE_CANNOT_RUN)`;
+        next_action = {
+          actor: 'AGENT',
+          action: 'PROPOSE_REPAIR',
+          agent_should: '정상 시점에는 테스트 대상이 없거나 실행할 수 없다. 새로 추가된 코드의 버그일 수 있다',
+          forbidden: ['원본 파일 직접 수정', 'DB 직접 수정'],
+        };
+      } else if (verdict === 'NO_BASELINE') {
+        message = `Reproduction test completed with status: ${result.status} (정상 시점 비교 없이 판정됨)`;
+        next_action = {
+          actor: 'AGENT',
+          action: 'PROPOSE_REPAIR',
+          agent_should: '정상 시점 비교 없이 판정됨. 재현 테스트 결과가 기록되었습니다. 원인을 분석하고 propose_and_verify_repair로 수정안을 제출하세요.',
           forbidden: ['원본 파일 직접 수정', 'DB 직접 수정'],
         };
       } else {

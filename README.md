@@ -121,6 +121,27 @@ In benchmark runs ([details](docs/performance.md)), `POST /api/overview` respons
 
 ## How it works
 
+What happens after you report a bug:
+
+```mermaid
+flowchart TD
+    A[You report a bug] --> B[Incident registered<br/>your original words saved]
+    B --> C{Expected, observed,<br/>repro or check missing?}
+    C -- yes --> D[Agent asks you only<br/>for the missing items] --> B
+    C -- no --> E[Change scope<br/>functions changed since the checkpoint]
+    E --> F[Reproduction test runs<br/>in an isolated git worktree]
+    F --> G{Why did it fail?}
+    G -- assertion failed --> H[REPRODUCED<br/>counts as execution evidence]
+    G -- runtime error or 0 tests --> I[WRONG_FAILURE<br/>agent must rewrite the test] --> F
+    H --> J[Patch verified in a worktree<br/>syntax, target test, full regression]
+    J --> K[You approve in the desktop app]
+    K --> L[Signature re-checked,<br/>patch applied to your files]
+```
+
+The failure-reason check currently covers pytest, unittest, and `node:test`. Failures from other runners are recorded as unverified and never count as evidence.
+
+How the pieces connect:
+
 ```text
 +--------------+   MCP    +---------------------- Agent Autopsy (local) -------+
 | Coding agent | -------> |                                                    |
@@ -189,7 +210,7 @@ pnpm test        # core and localization tests, run against a temporary data dir
 - [x] Language-agnostic evidence collector (stack locations, confirmed-runner reproduction runs)
 - [x] Incident history tools and structured next steps for agents
 - [x] Change scope: functions changed since the last checkpoint, with callers and callees (Python, JS/TS, C/C++)
-- [ ] Reproduction test gate: reject tests that fail for the wrong reason
+- [ ] Reproduction test gate: reject tests that fail for the wrong reason (failure-reason check done for pytest, unittest, `node:test`; baseline comparison next)
 - [ ] Coverage-based ranking inside the change scope (Python, then JS/TS, then C/C++)
 - [x] Tamper-evident audit log and signed patch proposals
 - [ ] Detection of direct database writes

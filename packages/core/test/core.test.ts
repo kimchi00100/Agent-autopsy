@@ -4741,4 +4741,275 @@ def test_slow():
     const worktreeLines = wtOutput.split('\n').filter((l: string) => l.startsWith('worktree '));
     assert.strictEqual(worktreeLines.length, 1, 'Only main worktree should remain');
   });
+
+  test('97. B-2 Step-3: pre-flip test has constant true assertion (assert True) -> FLIP_CHANGED_NON_ASSERTION', async () => {
+    const pyRepo = path.join(testRoot, 'b2_s3_t97_assert_true');
+    fs.mkdirSync(pyRepo, { recursive: true });
+    execFileSync('git', ['init', '-b', 'main'], { cwd: pyRepo });
+    execFileSync('git', ['config', 'user.name', 'Tester'], { cwd: pyRepo });
+    execFileSync('git', ['config', 'user.email', 'test@local'], { cwd: pyRepo });
+
+    fs.writeFileSync(path.join(pyRepo, 'calc.py'), 'def add(a, b):\n    return a + b + 1\n');
+    execFileSync('git', ['add', '.'], { cwd: pyRepo });
+    execFileSync('git', ['commit', '-m', 'Initial buggy add'], { cwd: pyRepo });
+    core.captureCheckpoint(pyRepo, 'Bug state');
+
+    const inc = await core.collectIncidentBundle(pyRepo, 'pytest assertion bug', 'AssertionError');
+    core.updateProjectSettings(pyRepo, { testCommand: 'python -m pytest' });
+
+    fs.writeFileSync(
+      path.join(pyRepo, 'pre_test.py'),
+      'from calc import add\n\ndef test_add():\n    x = add(1, 2)\n    assert True\n'
+    );
+    fs.writeFileSync(
+      path.join(pyRepo, 'test_repro.py'),
+      'from calc import add\n\ndef test_add():\n    x = add(1, 2)\n    assert x == 3\n'
+    );
+
+    const repro = await core.runReproduction(pyRepo, inc.id, 'test_repro.py', {
+      preFlipTestFilePath: 'pre_test.py',
+    });
+
+    assert.strictEqual(repro.status, 'REPRODUCED');
+    assert.ok(repro.assertFlip, 'assertFlip must be defined');
+    assert.strictEqual(repro.assertFlip.verdict, 'FLIP_CHANGED_NON_ASSERTION');
+    assert.ok(repro.assertFlip.note?.includes('상수 단언'), `note must include 상수 단언: ${repro.assertFlip.note}`);
+    assert.ok(repro.assertFlip.nonAssertionChangedLines && repro.assertFlip.nonAssertionChangedLines.length > 0);
+    assert.ok(repro.assertFlip.nonAssertionChangedLines.some((l) => l.content.includes('assert True')));
+  });
+
+  test('98. B-2 Step-3: pre-flip test has no assertion line -> FLIP_CHANGED_NON_ASSERTION', async () => {
+    const pyRepo = path.join(testRoot, 'b2_s3_t98_no_assertion');
+    fs.mkdirSync(pyRepo, { recursive: true });
+    execFileSync('git', ['init', '-b', 'main'], { cwd: pyRepo });
+    execFileSync('git', ['config', 'user.name', 'Tester'], { cwd: pyRepo });
+    execFileSync('git', ['config', 'user.email', 'test@local'], { cwd: pyRepo });
+
+    fs.writeFileSync(path.join(pyRepo, 'calc.py'), 'def add(a, b):\n    return a + b + 1\n');
+    execFileSync('git', ['add', '.'], { cwd: pyRepo });
+    execFileSync('git', ['commit', '-m', 'Initial buggy add'], { cwd: pyRepo });
+    core.captureCheckpoint(pyRepo, 'Bug state');
+
+    const inc = await core.collectIncidentBundle(pyRepo, 'pytest assertion bug', 'AssertionError');
+    core.updateProjectSettings(pyRepo, { testCommand: 'python -m pytest' });
+
+    fs.writeFileSync(
+      path.join(pyRepo, 'pre_test.py'),
+      'from calc import add\n\ndef test_add():\n    x = add(1, 2)\n'
+    );
+    fs.writeFileSync(
+      path.join(pyRepo, 'test_repro.py'),
+      'from calc import add\n\ndef test_add():\n    x = add(1, 2)\n    assert x == 3\n'
+    );
+
+    const repro = await core.runReproduction(pyRepo, inc.id, 'test_repro.py', {
+      preFlipTestFilePath: 'pre_test.py',
+    });
+
+    assert.strictEqual(repro.status, 'REPRODUCED');
+    assert.ok(repro.assertFlip, 'assertFlip must be defined');
+    assert.strictEqual(repro.assertFlip.verdict, 'FLIP_CHANGED_NON_ASSERTION');
+    assert.ok(repro.assertFlip.note?.includes('짝 개수 불일치'), `note must include 짝 개수 불일치: ${repro.assertFlip.note}`);
+  });
+
+  test('99. B-2 Step-3: unittest multiline assertion with only expected value changed -> FLIP_CONFIRMED', async () => {
+    const pyRepo = path.join(testRoot, 'b2_s3_t99_unittest_multiline');
+    fs.mkdirSync(pyRepo, { recursive: true });
+    execFileSync('git', ['init', '-b', 'main'], { cwd: pyRepo });
+    execFileSync('git', ['config', 'user.name', 'Tester'], { cwd: pyRepo });
+    execFileSync('git', ['config', 'user.email', 'test@local'], { cwd: pyRepo });
+
+    fs.writeFileSync(path.join(pyRepo, 'calc.py'), 'def add(a, b):\n    return a + b + 1\n');
+    execFileSync('git', ['add', '.'], { cwd: pyRepo });
+    execFileSync('git', ['commit', '-m', 'Initial buggy add unittest'], { cwd: pyRepo });
+    core.captureCheckpoint(pyRepo, 'Unittest Bug state');
+
+    const inc = await core.collectIncidentBundle(pyRepo, 'unittest multiline bug', 'AssertionError');
+    core.updateProjectSettings(pyRepo, { testCommand: 'python -m unittest' });
+
+    fs.writeFileSync(
+      path.join(pyRepo, 'pre_test.py'),
+      'import unittest\nfrom calc import add\n\nclass TestCalc(unittest.TestCase):\n    def test_add(self):\n        self.assertEqual(\n            add(1, 2),\n            4\n        )\n'
+    );
+    fs.writeFileSync(
+      path.join(pyRepo, 'test_repro.py'),
+      'import unittest\nfrom calc import add\n\nclass TestCalc(unittest.TestCase):\n    def test_add(self):\n        self.assertEqual(\n            add(1, 2),\n            3\n        )\n'
+    );
+
+    const repro = await core.runReproduction(pyRepo, inc.id, 'test_repro.py', {
+      preFlipTestFilePath: 'pre_test.py',
+    });
+
+    assert.strictEqual(repro.status, 'REPRODUCED');
+    assert.ok(repro.assertFlip, 'assertFlip must be defined');
+    assert.strictEqual(repro.assertFlip.verdict, 'FLIP_CONFIRMED');
+    assert.strictEqual(repro.assertFlip.changedLineCount, 2);
+  });
+
+  test('100. B-2 Step-3: comparison flips across pytest, unittest, and node:test -> all FLIP_CONFIRMED', async () => {
+    // 1) pytest: assert x != 3 -> assert x == 3
+    const pyRepo = path.join(testRoot, 'b2_s3_t100_pytest_cmp');
+    fs.mkdirSync(pyRepo, { recursive: true });
+    execFileSync('git', ['init', '-b', 'main'], { cwd: pyRepo });
+    execFileSync('git', ['config', 'user.name', 'Tester'], { cwd: pyRepo });
+    execFileSync('git', ['config', 'user.email', 'test@local'], { cwd: pyRepo });
+
+    fs.writeFileSync(path.join(pyRepo, 'calc.py'), 'def add(a, b):\n    return a + b + 1\n');
+    execFileSync('git', ['add', '.'], { cwd: pyRepo });
+    execFileSync('git', ['commit', '-m', 'Initial'], { cwd: pyRepo });
+    core.captureCheckpoint(pyRepo, 'CP');
+
+    const inc1 = await core.collectIncidentBundle(pyRepo, 'pytest cmp bug', 'AssertionError');
+    core.updateProjectSettings(pyRepo, { testCommand: 'python -m pytest' });
+
+    // on buggy code add(1, 2) is 4. So x != 3 is True (passes), x == 3 is False (fails with AssertionError)
+    fs.writeFileSync(
+      path.join(pyRepo, 'pre_test.py'),
+      'from calc import add\n\ndef test_add():\n    x = add(1, 2)\n    assert x != 3\n'
+    );
+    fs.writeFileSync(
+      path.join(pyRepo, 'test_repro.py'),
+      'from calc import add\n\ndef test_add():\n    x = add(1, 2)\n    assert x == 3\n'
+    );
+
+    const repro1 = await core.runReproduction(pyRepo, inc1.id, 'test_repro.py', {
+      preFlipTestFilePath: 'pre_test.py',
+    });
+    assert.strictEqual(repro1.status, 'REPRODUCED');
+    assert.strictEqual(repro1.assertFlip?.verdict, 'FLIP_CONFIRMED');
+
+    // 2) unittest: assertNotEqual -> assertEqual
+    const inc2 = await core.collectIncidentBundle(pyRepo, 'unittest cmp bug', 'AssertionError');
+    core.updateProjectSettings(pyRepo, { testCommand: 'python -m unittest' });
+
+    fs.writeFileSync(
+      path.join(pyRepo, 'pre_unit.py'),
+      'import unittest\nfrom calc import add\n\nclass TestCalc(unittest.TestCase):\n    def test_add(self):\n        x = add(1, 2)\n        self.assertNotEqual(x, 3)\n'
+    );
+    fs.writeFileSync(
+      path.join(pyRepo, 'repro_unit.py'),
+      'import unittest\nfrom calc import add\n\nclass TestCalc(unittest.TestCase):\n    def test_add(self):\n        x = add(1, 2)\n        self.assertEqual(x, 3)\n'
+    );
+
+    const repro2 = await core.runReproduction(pyRepo, inc2.id, 'repro_unit.py', {
+      preFlipTestFilePath: 'pre_unit.py',
+    });
+    assert.strictEqual(repro2.status, 'REPRODUCED');
+    assert.strictEqual(repro2.assertFlip?.verdict, 'FLIP_CONFIRMED');
+
+    // 3) node:test: notStrictEqual -> strictEqual
+    const jsRepo = path.join(testRoot, 'b2_s3_t100_node_cmp');
+    fs.mkdirSync(jsRepo, { recursive: true });
+    execFileSync('git', ['init', '-b', 'main'], { cwd: jsRepo });
+    execFileSync('git', ['config', 'user.name', 'Tester'], { cwd: jsRepo });
+    execFileSync('git', ['config', 'user.email', 'test@local'], { cwd: jsRepo });
+
+    fs.writeFileSync(path.join(jsRepo, 'calc.js'), 'function add(a, b) { return a + b + 1; }\nmodule.exports = { add };\n');
+    execFileSync('git', ['add', '.'], { cwd: jsRepo });
+    execFileSync('git', ['commit', '-m', 'Initial js'], { cwd: jsRepo });
+    core.captureCheckpoint(jsRepo, 'JS CP');
+
+    const inc3 = await core.collectIncidentBundle(jsRepo, 'node cmp bug', 'ERR_ASSERTION');
+    core.updateProjectSettings(jsRepo, { testCommand: 'node --test' });
+
+    fs.writeFileSync(
+      path.join(jsRepo, 'pre_node.js'),
+      "const test = require('node:test');\nconst assert = require('node:assert');\nconst { add } = require('./calc');\n\ntest('adds', () => {\n  assert.notStrictEqual(add(1, 2), 3);\n});\n"
+    );
+    fs.writeFileSync(
+      path.join(jsRepo, 'repro_node.js'),
+      "const test = require('node:test');\nconst assert = require('node:assert');\nconst { add } = require('./calc');\n\ntest('adds', () => {\n  assert.strictEqual(add(1, 2), 3);\n});\n"
+    );
+
+    const repro3 = await core.runReproduction(jsRepo, inc3.id, 'repro_node.js', {
+      preFlipTestFilePath: 'pre_node.js',
+    });
+    assert.strictEqual(repro3.status, 'REPRODUCED');
+    assert.strictEqual(repro3.assertFlip?.verdict, 'FLIP_CONFIRMED');
+  });
+
+  test('101. B-2 Step-3: setup code and assertion changed together -> FLIP_CHANGED_NON_ASSERTION', async () => {
+    const pyRepo = path.join(testRoot, 'b2_s3_t101_setup_and_assert');
+    fs.mkdirSync(pyRepo, { recursive: true });
+    execFileSync('git', ['init', '-b', 'main'], { cwd: pyRepo });
+    execFileSync('git', ['config', 'user.name', 'Tester'], { cwd: pyRepo });
+    execFileSync('git', ['config', 'user.email', 'test@local'], { cwd: pyRepo });
+
+    fs.writeFileSync(path.join(pyRepo, 'calc.py'), 'def add(a, b):\n    return a + b + 1\n');
+    execFileSync('git', ['add', '.'], { cwd: pyRepo });
+    execFileSync('git', ['commit', '-m', 'Initial buggy add'], { cwd: pyRepo });
+    core.captureCheckpoint(pyRepo, 'Bug state');
+
+    const inc = await core.collectIncidentBundle(pyRepo, 'pytest bug', 'AssertionError');
+    core.updateProjectSettings(pyRepo, { testCommand: 'python -m pytest' });
+
+    // Both setup code (val = add(1, 2) -> val = add(2, 2)) and assertion (assert val == 4 -> assert val == 3) changed
+    fs.writeFileSync(
+      path.join(pyRepo, 'pre_test.py'),
+      'from calc import add\n\ndef test_add():\n    val = add(1, 2)\n    assert val == 4\n'
+    );
+    fs.writeFileSync(
+      path.join(pyRepo, 'test_repro.py'),
+      'from calc import add\n\ndef test_add():\n    val = add(2, 2)\n    assert val == 3\n'
+    );
+
+    const repro = await core.runReproduction(pyRepo, inc.id, 'test_repro.py', {
+      preFlipTestFilePath: 'pre_test.py',
+    });
+
+    assert.ok(repro.assertFlip);
+    assert.strictEqual(repro.assertFlip.verdict, 'FLIP_CHANGED_NON_ASSERTION');
+    assert.ok(repro.assertFlip.note?.includes('값·비교 말고 다른 부분이 바뀜'), `note: ${repro.assertFlip.note}`);
+    assert.ok(repro.assertFlip.nonAssertionChangedLines && repro.assertFlip.nonAssertionChangedLines.length > 0);
+  });
+
+  test('102. B-2 Step-3: path outside repo for testFilePath and preFlipTestFilePath returns CANNOT_RUN and creates no files', async () => {
+    const pyRepo = path.join(testRoot, 'b2_s3_t102_outside_path');
+    fs.mkdirSync(pyRepo, { recursive: true });
+    execFileSync('git', ['init', '-b', 'main'], { cwd: pyRepo });
+    execFileSync('git', ['config', 'user.name', 'Tester'], { cwd: pyRepo });
+    execFileSync('git', ['config', 'user.email', 'test@local'], { cwd: pyRepo });
+
+    fs.writeFileSync(path.join(pyRepo, 'calc.py'), 'def add(a, b):\n    return a + b + 1\n');
+    execFileSync('git', ['add', '.'], { cwd: pyRepo });
+    execFileSync('git', ['commit', '-m', 'Initial'], { cwd: pyRepo });
+    core.captureCheckpoint(pyRepo, 'CP');
+
+    const inc = await core.collectIncidentBundle(pyRepo, 'outside path incident', 'AssertionError');
+    core.updateProjectSettings(pyRepo, { testCommand: 'python -m pytest' });
+
+    // Create outside file in parent directory of pyRepo
+    const outsideDir = path.dirname(pyRepo);
+    const outsideTestFile = path.join(outsideDir, 'outside_test.py');
+    fs.writeFileSync(outsideTestFile, 'def test_outside():\n    assert False\n');
+
+    const filesBefore = fs.readdirSync(outsideDir);
+
+    // 1) ../outside_test.py as testFilePath
+    const repro1 = await core.runReproduction(pyRepo, inc.id, '../outside_test.py');
+    assert.strictEqual(repro1.status, 'CANNOT_RUN');
+    assert.strictEqual(repro1.output, '저장소 밖 경로는 재현 테스트로 쓸 수 없음');
+
+    const incRecord1 = (core as any).ctx.db.getIncident(inc.id);
+    assert.ok(
+      incRecord1?.causeEvidence?.some((e: string) => e.includes('저장소 밖 경로는 재현 테스트로 쓸 수 없음')),
+      'causeEvidence must contain outside path rejection notice'
+    );
+
+    // 2) Inside file as testFilePath, but ../outside_test.py as preFlipTestFilePath
+    fs.writeFileSync(path.join(pyRepo, 'test_repro.py'), 'from calc import add\ndef test_add():\n    assert add(1, 2) == 3\n');
+    const repro2 = await core.runReproduction(pyRepo, inc.id, 'test_repro.py', {
+      preFlipTestFilePath: '../outside_test.py',
+    });
+    assert.strictEqual(repro2.status, 'CANNOT_RUN');
+    assert.strictEqual(repro2.output, '저장소 밖 경로는 재현 테스트로 쓸 수 없음');
+
+    // Clean up created outside file
+    fs.unlinkSync(outsideTestFile);
+
+    // Verify no unexpected files were created in outsideDir
+    const filesAfter = fs.readdirSync(outsideDir);
+    const diffFiles = filesAfter.filter((f) => !filesBefore.includes(f));
+    assert.deepStrictEqual(diffFiles, [], 'No files should be created outside the repository');
+  });
 });

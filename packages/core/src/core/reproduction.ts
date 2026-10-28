@@ -64,6 +64,101 @@ function isAssertionLine(rawLine: string, runnerType: SupportedRunnerType): bool
 }
 
 // 간단한 줄 패턴 검사
+function isPathOutsideRepo(repoPath: string, targetFilePath: string): boolean {
+  const rel = path.relative(path.resolve(repoPath), path.resolve(targetFilePath));
+  return rel.startsWith('..') || path.isAbsolute(rel);
+}
+
+function isConstantTrueAssertion(rawLine: string): boolean {
+  const line = rawLine.trim();
+  if (/^assert\s+(?:True|1|['"][^'"]+['"])(?:\s*,.*)?$/.test(line)) return true;
+  if (/^assert\s*\(\s*(?:True|1|true|['"][^'"]+['"])\s*(?:,.*)?\)$/.test(line)) return true;
+  if (/^assert\s+(?:True\s*==\s*True|1\s*==\s*1|0\s*==\s*0)(?:\s*,.*)?$/.test(line)) return true;
+
+  if (/^self\.assertTrue\s*\(\s*(?:True|1)\s*(?:,.*)?\)$/.test(line)) return true;
+  if (/^self\.assertFalse\s*\(\s*(?:False|0)\s*(?:,.*)?\)$/.test(line)) return true;
+  if (/^self\.assertEqual\s*\(\s*(?:(True|False|None|\d+|['"][^'"]*['"]))\s*,\s*\1\s*(?:,.*)?\)$/.test(line)) return true;
+
+  const unwrapped = line.startsWith('await ') ? line.slice(6).trim() : line;
+  if (/^assert(?:\.ok)?\s*\(\s*(?:true|1|['"][^'"]+['"])\s*(?:,.*)?\)$/.test(unwrapped)) return true;
+  if (/^assert\.(?:strictEqual|equal|deepStrictEqual)\s*\(\s*(?:(true|false|null|undefined|\d+|['"][^'"]*['"]))\s*,\s*\1\s*(?:,.*)?\)$/.test(unwrapped)) return true;
+
+  return false;
+}
+
+function isSetupOrAssignmentLine(rawLine: string): boolean {
+  const line = rawLine.trim();
+  // Python assignment: var = ..., var: type = ..., a, b = ...
+  if (/^[a-zA-Z_]\w*(?:\s*,\s*[a-zA-Z_]\w*)*\s*(?::\s*[^=]+)?\s*=(?!=)/.test(line)) {
+    return true;
+  }
+  // JS/TS assignment: const/let/var x = ..., x = ...
+  if (/^(?:const|let|var)\s+[a-zA-Z_$]\w*/.test(line)) {
+    return true;
+  }
+  if (/^[a-zA-Z_$]\w*\s*=(?!=)/.test(line)) {
+    return true;
+  }
+  // Standalone call statement that is not an assertion
+  const unwrapped = line.startsWith('await ') ? line.slice(6).trim() : line;
+  if (/^[a-zA-Z_$][\w.]*\s*\(/.test(unwrapped)) {
+    if (
+      /^assert\b/.test(unwrapped) ||
+      /^expect\b/.test(unwrapped) ||
+      /^self\.assert\w*/.test(unwrapped)
+    ) {
+      return false;
+    }
+    return true;
+  }
+  return false;
+}
+
+function normalizeValueTokens(line: string): string {
+  return line
+    .replace(/(["'`])(?:(?=(\\?))\2[\s\S])*?\1/g, '<VAL>')
+    .replace(/\b(?:True|False|None|true|false|null|undefined)\b/g, '<VAL>')
+    .replace(/\b\d+(?:\.\d+)?\b/g, '<VAL>');
+}
+
+function isInvertedComparisonPair(preRaw: string, flippedRaw: string, runnerType: SupportedRunnerType): boolean {
+  if (!isAssertionLine(preRaw, runnerType) || !isAssertionLine(flippedRaw, runnerType)) {
+    return false;
+  }
+  const pre = preRaw.trim();
+  const flipped = flippedRaw.trim();
+
+  // ok(x) <-> ok(!x)
+  const okPreToFlipped = pre.replace(/\(\s*!([^)]+)\)/, '($1)');
+  const okFlippedToPre = flipped.replace(/\(\s*!([^)]+)\)/, '($1)');
+  if (okPreToFlipped === flipped || okFlippedToPre === pre) {
+    return true;
+  }
+
+  const tokenPairs: [RegExp, string, RegExp, string][] = [
+    [/\bdeepStrictEqual\b/g, 'notDeepStrictEqual', /\bnotDeepStrictEqual\b/g, 'deepStrictEqual'],
+    [/\bstrictEqual\b/g, 'notStrictEqual', /\bnotStrictEqual\b/g, 'strictEqual'],
+    [/\bequal\b/g, 'notEqual', /\bnotEqual\b/g, 'equal'],
+    [/\bassertEqual\b/g, 'assertNotEqual', /\bassertNotEqual\b/g, 'assertEqual'],
+    [/\bassertIsNone\b/g, 'assertIsNotNone', /\bassertIsNotNone\b/g, 'assertIsNone'],
+    [/\bassertIsNot\b/g, 'assertIs', /\bassertIs\b/g, 'assertIsNot'],
+    [/\bassertNotIn\b/g, 'assertIn', /\bassertIn\b/g, 'assertNotIn'],
+    [/\bassertTrue\b/g, 'assertFalse', /\bassertFalse\b/g, 'assertTrue'],
+    [/===/g, '!==', /!==/g, '==='],
+    [/(?<!=)==(?!=)/g, '!=', /(?<!=)!=(?!=)/g, '=='],
+    [/\bis not\b/g, 'is', /\bis\b/g, 'is not'],
+    [/\bnot in\b/g, 'in', /\bin\b/g, 'not in'],
+  ];
+
+  for (const [reA, strB, reB, strA] of tokenPairs) {
+    if (pre.replace(reA, strB) === flipped) return true;
+    if (pre.replace(reB, strA) === flipped) return true;
+  }
+
+  return false;
+}
+
+// 간단한 줄 패턴 검사: 변경 덩어리(hunk) 안에서 1:1 짝을 맞춰 값 또는 비교 뒤집기 검사
 function diffAssertionLines(
   preFlipContent: string,
   flippedContent: string,
@@ -71,6 +166,7 @@ function diffAssertionLines(
 ): {
   changedLineCount: number;
   nonAssertionChangedLines: AssertFlipNonAssertionLine[];
+  note?: string;
 } {
   const lines1 = preFlipContent.replace(/\r\n/g, '\n').split('\n').map((l) => l.trimEnd());
   const lines2 = flippedContent.replace(/\r\n/g, '\n').split('\n').map((l) => l.trimEnd());
@@ -91,41 +187,128 @@ function diffAssertionLines(
     }
   }
 
-  const preChanged: AssertFlipNonAssertionLine[] = [];
-  const flippedChanged: AssertFlipNonAssertionLine[] = [];
+  interface DiffOp {
+    type: 'keep' | 'delete' | 'insert';
+    line1?: number;
+    line2?: number;
+    content: string;
+  }
 
+  const ops: DiffOp[] = [];
   let i = n;
   let j = m;
   while (i > 0 || j > 0) {
     if (i > 0 && j > 0 && lines1[i - 1] === lines2[j - 1]) {
+      ops.push({ type: 'keep', line1: i, line2: j, content: lines1[i - 1] });
       i--;
       j--;
     } else if (j > 0 && (i === 0 || dp[i][j - 1] >= dp[i - 1][j])) {
-      flippedChanged.unshift({ line: j, content: lines2[j - 1] });
+      ops.push({ type: 'insert', line2: j, content: lines2[j - 1] });
       j--;
-    } else if (i > 0 && (j === 0 || dp[i][j - 1] < dp[i - 1][j])) {
-      preChanged.unshift({ line: i, content: lines1[i - 1] });
+    } else {
+      ops.push({ type: 'delete', line1: i, content: lines1[i - 1] });
       i--;
     }
   }
+  ops.reverse();
 
-  const totalChangedCount = preChanged.length + flippedChanged.length;
-  const nonAssertionChangedLines: AssertFlipNonAssertionLine[] = [];
+  interface Hunk {
+    preLines: AssertFlipNonAssertionLine[];
+    flippedLines: AssertFlipNonAssertionLine[];
+  }
 
-  for (const item of preChanged) {
-    if (!isAssertionLine(item.content, runnerType)) {
-      nonAssertionChangedLines.push(item);
+  const hunks: Hunk[] = [];
+  let currentHunk: Hunk | null = null;
+
+  for (const op of ops) {
+    if (op.type === 'keep') {
+      if (currentHunk) {
+        hunks.push(currentHunk);
+        currentHunk = null;
+      }
+    } else if (op.type === 'delete') {
+      if (!currentHunk) currentHunk = { preLines: [], flippedLines: [] };
+      currentHunk.preLines.push({ line: op.line1!, content: op.content });
+    } else if (op.type === 'insert') {
+      if (!currentHunk) currentHunk = { preLines: [], flippedLines: [] };
+      currentHunk.flippedLines.push({ line: op.line2!, content: op.content });
     }
   }
-  for (const item of flippedChanged) {
-    if (!isAssertionLine(item.content, runnerType)) {
-      nonAssertionChangedLines.push(item);
+  if (currentHunk) {
+    hunks.push(currentHunk);
+  }
+
+  let totalChangedCount = 0;
+  for (const hunk of hunks) {
+    totalChangedCount += hunk.preLines.length + hunk.flippedLines.length;
+  }
+
+  // 1. Check if total pairs is 0
+  if (totalChangedCount === 0 || hunks.length === 0) {
+    return {
+      changedLineCount: 0,
+      nonAssertionChangedLines: [{ line: 0, content: '(내용 변경 없음)' }],
+      note: '바뀐 줄이 0쌍임 (짝 개수 불일치)',
+    };
+  }
+
+  // 2. Check if any hunk has mismatched line counts
+  for (const hunk of hunks) {
+    if (hunk.preLines.length !== hunk.flippedLines.length) {
+      const failingLines = [...hunk.preLines, ...hunk.flippedLines];
+      return {
+        changedLineCount: totalChangedCount,
+        nonAssertionChangedLines: failingLines,
+        note: '바뀐 줄의 짝 개수 불일치 (한쪽에만 줄이 있음)',
+      };
+    }
+  }
+
+  // 3. For each pair within each hunk, check rules
+  const nonAssertionChangedLines: AssertFlipNonAssertionLine[] = [];
+  let note: string | undefined;
+
+  for (const hunk of hunks) {
+    for (let k = 0; k < hunk.preLines.length; k++) {
+      const pre = hunk.preLines[k];
+      const flipped = hunk.flippedLines[k];
+
+      // Check constant true assertion on pre-flip side
+      if (isConstantTrueAssertion(pre.content)) {
+        nonAssertionChangedLines.push(pre);
+        if (!note) {
+          note = '뒤집기 전 테스트에 항상 참인 단언이 포함됨 (상수 단언)';
+        }
+        continue;
+      }
+
+      // Check inverted comparison (나)
+      if (isInvertedComparisonPair(pre.content, flipped.content, runnerType)) {
+        continue;
+      }
+
+      // Check value-only difference (가)
+      // Must not be a setup/assignment statement line
+      if (!isSetupOrAssignmentLine(pre.content) && !isSetupOrAssignmentLine(flipped.content)) {
+        const normPre = normalizeValueTokens(pre.content);
+        const normFlipped = normalizeValueTokens(flipped.content);
+        if (normPre === normFlipped) {
+          continue;
+        }
+      }
+
+      // Failed both (가) and (나)
+      nonAssertionChangedLines.push(pre, flipped);
+      if (!note) {
+        note = '단언 줄에서 값·비교 말고 다른 부분이 바뀜';
+      }
     }
   }
 
   return {
     changedLineCount: totalChangedCount,
     nonAssertionChangedLines,
+    note,
   };
 }
 
@@ -244,6 +427,21 @@ export async function runReproduction(
     return reproductionResult;
   }
 
+  const hostFile = path.resolve(targetPath, rawPath);
+  if (isPathOutsideRepo(targetPath, hostFile)) {
+    const reproductionResult: ReproductionResult = {
+      status: 'CANNOT_RUN',
+      command: '',
+      testFilePath: rawPath,
+      exitCode: 1,
+      output: '저장소 밖 경로는 재현 테스트로 쓸 수 없음',
+      executedAt: new Date().toISOString(),
+    };
+    const causeEvidence = [...(incident.causeEvidence || []), `[실행 증거] 재현 테스트 실행 불가 - 저장소 밖 경로는 재현 테스트로 쓸 수 없음`];
+    ctx.db.updateIncidentReproduction(incidentId, reproductionResult, incident.causeVerdict, causeEvidence);
+    return reproductionResult;
+  }
+
   // 1b. Validate preFlipTestFilePath if provided
   let relPreFlipPath: string | undefined;
   let hostPreFlipFile: string | undefined;
@@ -263,6 +461,19 @@ export async function runReproduction(
       return reproductionResult;
     }
     hostPreFlipFile = path.resolve(targetPath, rawPreFlip);
+    if (isPathOutsideRepo(targetPath, hostPreFlipFile)) {
+      const reproductionResult: ReproductionResult = {
+        status: 'CANNOT_RUN',
+        command: '',
+        testFilePath: rawPath,
+        exitCode: 1,
+        output: '저장소 밖 경로는 재현 테스트로 쓸 수 없음',
+        executedAt: new Date().toISOString(),
+      };
+      const causeEvidence = [...(incident.causeEvidence || []), `[실행 증거] 재현 테스트 실행 불가 - 저장소 밖 경로는 재현 테스트로 쓸 수 없음`];
+      ctx.db.updateIncidentReproduction(incidentId, reproductionResult, incident.causeVerdict, causeEvidence);
+      return reproductionResult;
+    }
     if (!fs.existsSync(hostPreFlipFile) || !fs.statSync(hostPreFlipFile).isFile()) {
       const reproductionResult: ReproductionResult = {
         status: 'CANNOT_RUN',
@@ -280,7 +491,6 @@ export async function runReproduction(
   }
 
   // 2. Check if host test file exists
-  const hostFile = path.resolve(targetPath, rawPath);
   if (!fs.existsSync(hostFile) || !fs.statSync(hostFile).isFile()) {
     const reproductionResult: ReproductionResult = {
       status: 'CANNOT_RUN',
@@ -574,7 +784,7 @@ export async function runReproduction(
           nonAssertionChangedLines: diffResult.nonAssertionChangedLines.slice(0, 5),
           note: diffResult.changedLineCount > 10
             ? `바뀐 줄 수(${diffResult.changedLineCount}줄)가 상한(10줄)을 초과함`
-            : '단언 줄이 아닌 줄이 변경됨',
+            : (diffResult.note || '단언 줄이 아닌 줄이 변경됨'),
         };
       } else if (!allSameStatus) {
         assertFlip = {

@@ -9,7 +9,8 @@ import { verifyTestCommandSignature } from '../utils/security.js';
   export async function runReproduction(ctx: CoreContext, 
     repoPath: string,
     incidentId: string,
-    testFilePath: string
+    testFilePath: string,
+    timeoutMs: number = 30000
   ): Promise<ReproductionResult> {
     const targetPath = path.resolve(repoPath);
     const incident = ctx.db.getIncident(incidentId);
@@ -112,23 +113,12 @@ import { verifyTestCommandSignature } from '../utils/security.js';
       fs.copyFileSync(hostFile, destFile);
 
       // 7. Run reproduction test in sandbox
-      // Prevent parent test runner environment variables from leaking into child node:test runner
-      const prevTestContext = process.env.NODE_TEST_CONTEXT;
-      const prevTestWorkerId = process.env.NODE_TEST_WORKER_ID;
-      delete process.env.NODE_TEST_CONTEXT;
-      delete process.env.NODE_TEST_WORKER_ID;
+      // Pass dedicated child environment without NODE_TEST_CONTEXT or NODE_TEST_WORKER_ID (do not mutate process.env)
+      const childEnv: NodeJS.ProcessEnv = { ...process.env };
+      delete childEnv.NODE_TEST_CONTEXT;
+      delete childEnv.NODE_TEST_WORKER_ID;
 
-      let testResult;
-      try {
-        testResult = await ctx.worktreeRunner.runTest(sandboxDir, runCommand, 30000);
-      } finally {
-        if (prevTestContext !== undefined) {
-          process.env.NODE_TEST_CONTEXT = prevTestContext;
-        }
-        if (prevTestWorkerId !== undefined) {
-          process.env.NODE_TEST_WORKER_ID = prevTestWorkerId;
-        }
-      }
+      const testResult = await ctx.worktreeRunner.runTest(sandboxDir, runCommand, timeoutMs, childEnv);
 
       // 8. Determine reproduction status using structured runner evaluation
       let evalOutput: EvaluationOutput;
@@ -334,6 +324,14 @@ import { verifyTestCommandSignature } from '../utils/security.js';
     }
 
     // Unsuccessful run
+    if (testResult.exitCode === 124 || /시간이 초과되었습니다|timed out|timeout/i.test(output)) {
+      return {
+        status: 'WRONG_FAILURE',
+        failureKind: 'TIMEOUT',
+        failureReason: 'pytest 실행 시간 초과 (timeout)',
+      };
+    }
+
     if (!reportFilePath || !fs.existsSync(reportFilePath)) {
       return {
         status: 'WRONG_FAILURE',
@@ -607,8 +605,8 @@ import { verifyTestCommandSignature } from '../utils/security.js';
       };
     }
 
-    const failureParts = tap.split(/(?:^|\n)not ok \d+ - /m).slice(1);
-    if (failureParts.length === 0) {
+    const allFailureParts = tap.split(/(?:^|\n)\s*not ok \d+ - /m).slice(1);
+    if (allFailureParts.length === 0) {
       return {
         status: 'WRONG_FAILURE',
         failureKind: 'RUNTIME_ERROR',
@@ -617,11 +615,17 @@ import { verifyTestCommandSignature } from '../utils/security.js';
       };
     }
 
+    // Filter out parent aggregate failure blocks (e.g. describe suite or parent test with failureType: 'subtestsFailed')
+    const failureParts = allFailureParts.filter(
+      (part) => !/failureType:\s*['"]?subtestsFailed['"]?/i.test(part)
+    );
+    const partsToEvaluate = failureParts.length > 0 ? failureParts : allFailureParts;
+
     let allAssertions = true;
     let nonAssertionReason = '';
     let failedLocation: { filePath: string; line: number } | undefined;
 
-    for (const part of failureParts) {
+    for (const part of partsToEvaluate) {
       const isAssertion = /code:\s*'ERR_ASSERTION'/i.test(part) || /name:\s*'AssertionError'/i.test(part);
       if (!isAssertion) {
         allAssertions = false;

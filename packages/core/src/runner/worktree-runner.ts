@@ -125,7 +125,8 @@ export class WorktreeRunner {
   public runCommand(
     worktreePath: string,
     command: string,
-    timeoutMs: number = 60000
+    timeoutMs: number = 60000,
+    env?: NodeJS.ProcessEnv
   ): Promise<TestExecutionResult> {
     return new Promise((resolve) => {
       const startTime = Date.now();
@@ -142,6 +143,7 @@ export class WorktreeRunner {
           windowsHide: true,
           detached: !isWindows,
           stdio: ['ignore', 'pipe', 'pipe'],
+          env: env || process.env,
         });
       } catch (err: any) {
         return resolve({
@@ -221,9 +223,10 @@ export class WorktreeRunner {
   public async runTest(
     worktreePath: string,
     testCommand: string,
-    timeoutMs: number = 60000
+    timeoutMs: number = 60000,
+    env?: NodeJS.ProcessEnv
   ): Promise<TestExecutionResult> {
-    return this.runCommand(worktreePath, testCommand, timeoutMs);
+    return this.runCommand(worktreePath, testCommand, timeoutMs, env);
   }
 
   /**

@@ -3467,4 +3467,121 @@ Expected equality of these values:
     const updatedInc = core.getDatabase().getIncident(inc.id)!;
     assert.notStrictEqual(updatedInc.causeVerdict, 'CONFIRMED', 'UNVERIFIED_FAILURE must not elevate to CONFIRMED');
   });
+
+  test('68. B-2 Step-1 Fix: node:test describe/it and t.test subtests correctly distinguish assertion vs runtime errors', async () => {
+    const jsRepo = path.join(testRoot, 'b2_subtest_repo');
+    fs.mkdirSync(jsRepo, { recursive: true });
+    execFileSync('git', ['init', '-b', 'main'], { cwd: jsRepo });
+    execFileSync('git', ['config', 'user.name', 'Tester'], { cwd: jsRepo });
+    execFileSync('git', ['config', 'user.email', 'test@local'], { cwd: jsRepo });
+
+    fs.writeFileSync(path.join(jsRepo, 'package.json'), JSON.stringify({ type: 'module' }));
+    fs.writeFileSync(path.join(jsRepo, 'calc.js'), 'export function add(a, b) { return a - b; }\n');
+    execFileSync('git', ['add', '.'], { cwd: jsRepo });
+    execFileSync('git', ['commit', '-m', 'Init js repo'], { cwd: jsRepo });
+
+    core.updateProjectSettings(jsRepo, { testCommand: 'node --test' });
+
+    // 1) describe/it inside assert.strictEqual failure -> REPRODUCED, ASSERTION
+    const inc1 = await core.collectIncidentBundle(jsRepo, 'describe it 단언 실패', 'AssertionError');
+    fs.writeFileSync(
+      path.join(jsRepo, 'test_describe_assert.mjs'),
+      `import { describe, it } from 'node:test';
+import assert from 'node:assert';
+import { add } from './calc.js';
+
+describe('calc', () => {
+  it('adds', () => {
+    assert.strictEqual(add(1, 1), 2);
+  });
+});
+`
+    );
+    const repro1 = await core.runReproduction(jsRepo, inc1.id, 'test_describe_assert.mjs');
+    assert.strictEqual(repro1.status, 'REPRODUCED', 'describe/it assertion failure must yield REPRODUCED');
+    assert.strictEqual(repro1.failureKind, 'ASSERTION', 'failureKind must be ASSERTION');
+    assert.ok(repro1.failedLocation, 'failedLocation must be populated');
+
+    // 2) describe/it inside TypeError -> WRONG_FAILURE, RUNTIME_ERROR
+    const inc2 = await core.collectIncidentBundle(jsRepo, 'describe it TypeError', 'TypeError');
+    fs.writeFileSync(
+      path.join(jsRepo, 'test_describe_typeerr.mjs'),
+      `import { describe, it } from 'node:test';
+
+describe('calc', () => {
+  it('adds', () => {
+    const x = null;
+    x.foo();
+  });
+});
+`
+    );
+    const repro2 = await core.runReproduction(jsRepo, inc2.id, 'test_describe_typeerr.mjs');
+    assert.strictEqual(repro2.status, 'WRONG_FAILURE', 'describe/it TypeError must yield WRONG_FAILURE');
+    assert.strictEqual(repro2.failureKind, 'RUNTIME_ERROR', 'failureKind must be RUNTIME_ERROR');
+    const updatedInc2 = core.getDatabase().getIncident(inc2.id)!;
+    assert.notStrictEqual(updatedInc2.causeVerdict, 'CONFIRMED', 'causeVerdict must not elevate to CONFIRMED');
+
+    // 3) test() with t.test() subtest assertion failure -> REPRODUCED, ASSERTION
+    const inc3 = await core.collectIncidentBundle(jsRepo, 't.test subtest 단언 실패', 'AssertionError');
+    fs.writeFileSync(
+      path.join(jsRepo, 'test_ttest_assert.mjs'),
+      `import test from 'node:test';
+import assert from 'node:assert';
+import { add } from './calc.js';
+
+test('outer test', async (t) => {
+  await t.test('inner subtest', () => {
+    assert.strictEqual(add(1, 1), 2);
+  });
+});
+`
+    );
+    const repro3 = await core.runReproduction(jsRepo, inc3.id, 'test_ttest_assert.mjs');
+    assert.strictEqual(repro3.status, 'REPRODUCED', 't.test subtest assertion failure must yield REPRODUCED');
+    assert.strictEqual(repro3.failureKind, 'ASSERTION', 'failureKind must be ASSERTION');
+    assert.ok(repro3.failedLocation, 'failedLocation must be populated');
+  });
+
+  test('69. B-2 Step-1 Fix: pytest timeout yields failureKind TIMEOUT, and runReproduction preserves process.env immutability', async () => {
+    const pyRepo = path.join(testRoot, 'b2_pytest_timeout_repo');
+    fs.mkdirSync(pyRepo, { recursive: true });
+    execFileSync('git', ['init', '-b', 'main'], { cwd: pyRepo });
+    execFileSync('git', ['config', 'user.name', 'Tester'], { cwd: pyRepo });
+    execFileSync('git', ['config', 'user.email', 'test@local'], { cwd: pyRepo });
+
+    fs.writeFileSync(path.join(pyRepo, 'calc.py'), 'def add(a, b): return a + b\n');
+    execFileSync('git', ['add', '.'], { cwd: pyRepo });
+    execFileSync('git', ['commit', '-m', 'Init py repo'], { cwd: pyRepo });
+
+    core.updateProjectSettings(pyRepo, { testCommand: 'python -m pytest' });
+    const inc = await core.collectIncidentBundle(pyRepo, 'pytest 타임아웃 사건', 'Timeout');
+
+    fs.writeFileSync(
+      path.join(pyRepo, 'test_sleep.py'),
+      `import time
+def test_long_running():
+    time.sleep(10)
+`
+    );
+
+    // Snapshot process.env keys and values before runReproduction
+    const envBefore = { ...process.env };
+
+    // Execute reproduction with a short timeout (1500ms)
+    const repro = await core.runReproduction(pyRepo, inc.id, 'test_sleep.py', 1500);
+
+    // 1) Verify timeout result
+    assert.strictEqual(repro.status, 'WRONG_FAILURE');
+    assert.strictEqual(repro.failureKind, 'TIMEOUT');
+    assert.strictEqual(repro.exitCode, 124);
+    assert.ok(repro.output.includes('시간이 초과되었습니다'));
+
+    // 2) Verify process.env was not mutated
+    const envAfter = { ...process.env };
+    assert.deepStrictEqual(Object.keys(envAfter), Object.keys(envBefore), 'process.env keys must be unmodified');
+    for (const key of Object.keys(envBefore)) {
+      assert.strictEqual(envAfter[key], envBefore[key], `process.env[${key}] must be unmodified`);
+    }
+  });
 });

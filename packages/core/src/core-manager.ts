@@ -510,9 +510,10 @@ export class CoreManager {
   public async runReproduction(
     repoPath: string,
     incidentId: string,
-    testFilePath: string
+    testFilePath: string,
+    timeoutMs: number = 30000
   ): Promise<ReproductionResult> {
-    return runReproduction(this.ctx, repoPath, incidentId, testFilePath);
+    return runReproduction(this.ctx, repoPath, incidentId, testFilePath, timeoutMs);
   }
 
 

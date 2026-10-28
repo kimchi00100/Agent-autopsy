@@ -138,6 +138,34 @@ export interface BaselineComparison {
   note?: string;
 }
 
+export type AssertFlipVerdict =
+  | 'FLIP_CONFIRMED'
+  | 'PRE_FLIP_NOT_PASSING'
+  | 'PRE_FLIP_FLAKY'
+  | 'FLIP_CHANGED_NON_ASSERTION'
+  | 'SKIPPED'
+  | 'NOT_PROVIDED';
+
+export interface AssertFlipNonAssertionLine {
+  line: number;
+  content: string;
+}
+
+export interface AssertFlipResult {
+  preFlipTestFilePath?: string;
+  verdict: AssertFlipVerdict;
+  runs?: ReproductionRunRecord[];
+  changedLineCount?: number;
+  nonAssertionChangedLines?: AssertFlipNonAssertionLine[];
+  note?: string;
+}
+
+export interface RunReproductionOptions {
+  baselineCheckpointId?: string;
+  preFlipTestFilePath?: string;
+  timeoutMs?: number;
+}
+
 export interface ReproductionResult {
   status: ReproductionStatus;
   command: string;
@@ -150,6 +178,7 @@ export interface ReproductionResult {
   failureReason?: string;
   testCount?: number;
   baselineComparison?: BaselineComparison;
+  assertFlip?: AssertFlipResult;
 }
 
 export type Severity = 'HIGH' | 'MEDIUM' | 'LOW' | 'UNASSESSED';

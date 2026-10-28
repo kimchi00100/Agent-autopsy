@@ -9,7 +9,7 @@ import { execFileSync, execSync, spawn, ChildProcess } from 'node:child_process'
 import { CoreManager } from '../src/core-manager.js';
 import { detectUnapprovedFiles } from '../src/core/project.js';
 import { buildReproductionCommand } from '../src/core/reproduction.js';
-import { Incident } from '../src/types.js';
+import { Incident, ReproductionResult } from '../src/types.js';
 import { ApiServer } from '../src/server/api-server.js';
 import { WorktreeRunner } from '../src/runner/worktree-runner.js';
 import { analyzeIncident, parseStackFrames, STACK_TRACE_PATTERNS } from '../src/analysis/analyzer.js';
@@ -4365,5 +4365,380 @@ def test_slow():
     assert.strictEqual(scope.baselineRule, 'EXPANDED_TO_OLDER_CHECKPOINT');
     assert.strictEqual(scope.baselineSha, cpA.worktreeCommitSha || cpA.gitHeadSha);
     assert.strictEqual(scope.scopeResult.changedFunctions.some(f => f.name === 'mul'), true);
+  });
+
+  test('87. B-2 Step-3: pytest pre-flip passes (assert add(1,2) == 4), flipped fails (assert add(1,2) == 3) -> FLIP_CONFIRMED, status REPRODUCED', async () => {
+    const pyRepo = path.join(testRoot, 'b2_s3_t87_pytest_flip');
+    fs.mkdirSync(pyRepo, { recursive: true });
+    execFileSync('git', ['init', '-b', 'main'], { cwd: pyRepo });
+    execFileSync('git', ['config', 'user.name', 'Tester'], { cwd: pyRepo });
+    execFileSync('git', ['config', 'user.email', 'test@local'], { cwd: pyRepo });
+
+    fs.writeFileSync(path.join(pyRepo, 'calc.py'), 'def add(a, b):\n    return a + b + 1\n');
+    execFileSync('git', ['add', '.'], { cwd: pyRepo });
+    execFileSync('git', ['commit', '-m', 'Initial buggy add'], { cwd: pyRepo });
+    core.captureCheckpoint(pyRepo, 'Bug state');
+
+    const inc = await core.collectIncidentBundle(pyRepo, 'pytest assertion bug', 'AssertionError');
+    core.updateProjectSettings(pyRepo, { testCommand: 'python -m pytest' });
+
+    fs.writeFileSync(
+      path.join(pyRepo, 'pre_test.py'),
+      'from calc import add\n\ndef test_add():\n    assert add(1, 2) == 4\n'
+    );
+    fs.writeFileSync(
+      path.join(pyRepo, 'test_repro.py'),
+      'from calc import add\n\ndef test_add():\n    assert add(1, 2) == 3\n'
+    );
+
+    const repro = await core.runReproduction(pyRepo, inc.id, 'test_repro.py', {
+      preFlipTestFilePath: 'pre_test.py',
+    });
+
+    assert.strictEqual(repro.status, 'REPRODUCED');
+    assert.ok(repro.assertFlip, 'assertFlip must be defined');
+    assert.strictEqual(repro.assertFlip.verdict, 'FLIP_CONFIRMED');
+    assert.ok(repro.assertFlip.runs && repro.assertFlip.runs.length > 0, 'pre-flip runs must be recorded');
+    assert.ok(repro.assertFlip.runs.every((r) => r.status === 'NOT_REPRODUCED'), 'pre-flip runs must pass');
+    assert.strictEqual(repro.assertFlip.changedLineCount, 2);
+    assert.strictEqual(repro.assertFlip.nonAssertionChangedLines?.length ?? 0, 0);
+
+    const updatedInc = (core as any).ctx.db.getIncident(inc.id);
+    assert.ok(
+      updatedInc?.causeEvidence?.some((e: string) => e.includes('[AssertFlip: FLIP_CONFIRMED]')),
+      'causeEvidence must contain [AssertFlip: FLIP_CONFIRMED]'
+    );
+  });
+
+  test('88. B-2 Step-3: node:test describe/it pre-flip passes, flipped fails -> FLIP_CONFIRMED', async () => {
+    const jsRepo = path.join(testRoot, 'b2_s3_t88_node_flip');
+    fs.mkdirSync(jsRepo, { recursive: true });
+    execFileSync('git', ['init', '-b', 'main'], { cwd: jsRepo });
+    execFileSync('git', ['config', 'user.name', 'Tester'], { cwd: jsRepo });
+    execFileSync('git', ['config', 'user.email', 'test@local'], { cwd: jsRepo });
+
+    fs.writeFileSync(path.join(jsRepo, 'calc.js'), 'function add(a, b) { return a + b + 1; }\nmodule.exports = { add };\n');
+    execFileSync('git', ['add', '.'], { cwd: jsRepo });
+    execFileSync('git', ['commit', '-m', 'Initial buggy add js'], { cwd: jsRepo });
+    core.captureCheckpoint(jsRepo, 'JS Bug state');
+
+    const inc = await core.collectIncidentBundle(jsRepo, 'node test assertion bug', 'ERR_ASSERTION');
+    core.updateProjectSettings(jsRepo, { testCommand: 'node --test' });
+
+    fs.writeFileSync(
+      path.join(jsRepo, 'pre_test.js'),
+      "const test = require('node:test');\nconst assert = require('node:assert');\nconst { add } = require('./calc');\n\ntest.describe('calc', () => {\n  test.it('adds', () => {\n    assert.strictEqual(add(1, 2), 4);\n  });\n});\n"
+    );
+    fs.writeFileSync(
+      path.join(jsRepo, 'test_repro.js'),
+      "const test = require('node:test');\nconst assert = require('node:assert');\nconst { add } = require('./calc');\n\ntest.describe('calc', () => {\n  test.it('adds', () => {\n    assert.strictEqual(add(1, 2), 3);\n  });\n});\n"
+    );
+
+    const repro = await core.runReproduction(jsRepo, inc.id, 'test_repro.js', {
+      preFlipTestFilePath: 'pre_test.js',
+    });
+
+    assert.strictEqual(repro.status, 'REPRODUCED');
+    assert.ok(repro.assertFlip, 'assertFlip must be defined');
+    assert.strictEqual(repro.assertFlip.verdict, 'FLIP_CONFIRMED');
+    assert.ok(repro.assertFlip.runs && repro.assertFlip.runs.length > 0, 'pre-flip runs must be recorded');
+    assert.strictEqual(repro.assertFlip.changedLineCount, 2);
+  });
+
+  test('89. B-2 Step-3: unittest self.assertEqual pre-flip passes, flipped fails -> FLIP_CONFIRMED', async () => {
+    const pyRepo = path.join(testRoot, 'b2_s3_t89_unittest_flip');
+    fs.mkdirSync(pyRepo, { recursive: true });
+    execFileSync('git', ['init', '-b', 'main'], { cwd: pyRepo });
+    execFileSync('git', ['config', 'user.name', 'Tester'], { cwd: pyRepo });
+    execFileSync('git', ['config', 'user.email', 'test@local'], { cwd: pyRepo });
+
+    fs.writeFileSync(path.join(pyRepo, 'calc.py'), 'def add(a, b):\n    return a + b + 1\n');
+    execFileSync('git', ['add', '.'], { cwd: pyRepo });
+    execFileSync('git', ['commit', '-m', 'Initial buggy add unittest'], { cwd: pyRepo });
+    core.captureCheckpoint(pyRepo, 'Unittest Bug state');
+
+    const inc = await core.collectIncidentBundle(pyRepo, 'unittest assertion bug', 'AssertionError');
+    core.updateProjectSettings(pyRepo, { testCommand: 'python -m unittest' });
+
+    fs.writeFileSync(
+      path.join(pyRepo, 'pre_test.py'),
+      'import unittest\nfrom calc import add\n\nclass TestCalc(unittest.TestCase):\n    def test_add(self):\n        self.assertEqual(add(1, 2), 4)\n'
+    );
+    fs.writeFileSync(
+      path.join(pyRepo, 'test_repro.py'),
+      'import unittest\nfrom calc import add\n\nclass TestCalc(unittest.TestCase):\n    def test_add(self):\n        self.assertEqual(add(1, 2), 3)\n'
+    );
+
+    const repro = await core.runReproduction(pyRepo, inc.id, 'test_repro.py', {
+      preFlipTestFilePath: 'pre_test.py',
+    });
+
+    assert.strictEqual(repro.status, 'REPRODUCED');
+    assert.ok(repro.assertFlip, 'assertFlip must be defined');
+    assert.strictEqual(repro.assertFlip.verdict, 'FLIP_CONFIRMED');
+    assert.ok(repro.assertFlip.runs && repro.assertFlip.runs.length > 0);
+    assert.strictEqual(repro.assertFlip.changedLineCount, 2);
+  });
+
+  test('90. B-2 Step-3: pre-flip test asserting correct answer fails on current buggy code -> PRE_FLIP_NOT_PASSING', async () => {
+    const pyRepo = path.join(testRoot, 'b2_s3_t90_pre_fail');
+    fs.mkdirSync(pyRepo, { recursive: true });
+    execFileSync('git', ['init', '-b', 'main'], { cwd: pyRepo });
+    execFileSync('git', ['config', 'user.name', 'Tester'], { cwd: pyRepo });
+    execFileSync('git', ['config', 'user.email', 'test@local'], { cwd: pyRepo });
+
+    fs.writeFileSync(path.join(pyRepo, 'calc.py'), 'def add(a, b):\n    return a + b + 1\n');
+    execFileSync('git', ['add', '.'], { cwd: pyRepo });
+    execFileSync('git', ['commit', '-m', 'Initial buggy add'], { cwd: pyRepo });
+    core.captureCheckpoint(pyRepo, 'Bug state');
+
+    const inc = await core.collectIncidentBundle(pyRepo, 'pytest bug', 'AssertionError');
+    core.updateProjectSettings(pyRepo, { testCommand: 'python -m pytest' });
+
+    // pre-flip asserts correct answer 3, which fails on buggy code returning 4!
+    fs.writeFileSync(
+      path.join(pyRepo, 'pre_test.py'),
+      'from calc import add\n\ndef test_add():\n    assert add(1, 2) == 3\n'
+    );
+    fs.writeFileSync(
+      path.join(pyRepo, 'test_repro.py'),
+      'from calc import add\n\ndef test_add():\n    assert add(1, 2) == 99\n'
+    );
+
+    const repro = await core.runReproduction(pyRepo, inc.id, 'test_repro.py', {
+      preFlipTestFilePath: 'pre_test.py',
+    });
+
+    assert.strictEqual(repro.status, 'REPRODUCED');
+    assert.ok(repro.assertFlip);
+    assert.strictEqual(repro.assertFlip.verdict, 'PRE_FLIP_NOT_PASSING');
+    assert.ok(repro.assertFlip.runs && repro.assertFlip.runs.length > 0);
+    assert.ok(repro.assertFlip.note, 'failure note must be provided');
+  });
+
+  test('91. B-2 Step-3: non-assertion line changed between test files (call args changed) -> FLIP_CHANGED_NON_ASSERTION', async () => {
+    const pyRepo = path.join(testRoot, 'b2_s3_t91_non_assert_change');
+    fs.mkdirSync(pyRepo, { recursive: true });
+    execFileSync('git', ['init', '-b', 'main'], { cwd: pyRepo });
+    execFileSync('git', ['config', 'user.name', 'Tester'], { cwd: pyRepo });
+    execFileSync('git', ['config', 'user.email', 'test@local'], { cwd: pyRepo });
+
+    fs.writeFileSync(path.join(pyRepo, 'calc.py'), 'def add(a, b):\n    return a + b + 1\n');
+    execFileSync('git', ['add', '.'], { cwd: pyRepo });
+    execFileSync('git', ['commit', '-m', 'Initial buggy add'], { cwd: pyRepo });
+    core.captureCheckpoint(pyRepo, 'Bug state');
+
+    const inc = await core.collectIncidentBundle(pyRepo, 'pytest bug', 'AssertionError');
+    core.updateProjectSettings(pyRepo, { testCommand: 'python -m pytest' });
+
+    // Changed non-assertion line: val = add(1, 2) -> val = add(2, 2)
+    fs.writeFileSync(
+      path.join(pyRepo, 'pre_test.py'),
+      'from calc import add\n\ndef test_add():\n    val = add(1, 2)\n    assert val == 4\n'
+    );
+    fs.writeFileSync(
+      path.join(pyRepo, 'test_repro.py'),
+      'from calc import add\n\ndef test_add():\n    val = add(2, 2)\n    assert val == 4\n'
+    );
+
+    const repro = await core.runReproduction(pyRepo, inc.id, 'test_repro.py', {
+      preFlipTestFilePath: 'pre_test.py',
+    });
+
+    assert.ok(repro.assertFlip);
+    assert.strictEqual(repro.assertFlip.verdict, 'FLIP_CHANGED_NON_ASSERTION');
+    assert.ok(repro.assertFlip.nonAssertionChangedLines && repro.assertFlip.nonAssertionChangedLines.length > 0);
+    assert.ok(repro.assertFlip.nonAssertionChangedLines.some((l) => l.content.includes('add(2, 2)') || l.content.includes('add(1, 2)')));
+  });
+
+  test('92. B-2 Step-3: flipped test runtime error (WRONG_FAILURE) skips pre-flip run with empty runs', async () => {
+    const pyRepo = path.join(testRoot, 'b2_s3_t92_runtime_err_skip');
+    fs.mkdirSync(pyRepo, { recursive: true });
+    execFileSync('git', ['init', '-b', 'main'], { cwd: pyRepo });
+    execFileSync('git', ['config', 'user.name', 'Tester'], { cwd: pyRepo });
+    execFileSync('git', ['config', 'user.email', 'test@local'], { cwd: pyRepo });
+
+    fs.writeFileSync(path.join(pyRepo, 'calc.py'), 'def add(a, b):\n    return a + b + 1\n');
+    execFileSync('git', ['add', '.'], { cwd: pyRepo });
+    execFileSync('git', ['commit', '-m', 'Initial buggy add'], { cwd: pyRepo });
+    core.captureCheckpoint(pyRepo, 'Bug state');
+
+    const inc = await core.collectIncidentBundle(pyRepo, 'pytest bug', 'AssertionError');
+    core.updateProjectSettings(pyRepo, { testCommand: 'python -m pytest' });
+
+    fs.writeFileSync(
+      path.join(pyRepo, 'pre_test.py'),
+      'from calc import add\n\ndef test_add():\n    assert add(1, 2) == 4\n'
+    );
+    // test_repro has syntax/runtime error (NameError: non_existent_function) -> WRONG_FAILURE
+    fs.writeFileSync(
+      path.join(pyRepo, 'test_repro.py'),
+      'from calc import add\n\ndef test_add():\n    non_existent_function()\n'
+    );
+
+    const repro = await core.runReproduction(pyRepo, inc.id, 'test_repro.py', {
+      preFlipTestFilePath: 'pre_test.py',
+    });
+
+    assert.strictEqual(repro.status, 'WRONG_FAILURE');
+    assert.ok(repro.assertFlip);
+    assert.strictEqual(repro.assertFlip.verdict, 'SKIPPED');
+    assert.deepStrictEqual(repro.assertFlip.runs, []);
+    assert.ok(repro.assertFlip.note?.includes('REPRODUCED가 아니므로'));
+  });
+
+  test('93. B-2 Step-3: pre_flip_test_file_path omitted records NOT_PROVIDED and preserves baselineComparison', async () => {
+    const pyRepo = path.join(testRoot, 'b2_s3_t93_not_provided');
+    fs.mkdirSync(pyRepo, { recursive: true });
+    execFileSync('git', ['init', '-b', 'main'], { cwd: pyRepo });
+    execFileSync('git', ['config', 'user.name', 'Tester'], { cwd: pyRepo });
+    execFileSync('git', ['config', 'user.email', 'test@local'], { cwd: pyRepo });
+
+    // Clean commit A
+    fs.writeFileSync(path.join(pyRepo, 'calc.py'), 'def add(a, b):\n    return a + b\n');
+    execFileSync('git', ['add', '.'], { cwd: pyRepo });
+    execFileSync('git', ['commit', '-m', 'Clean A'], { cwd: pyRepo });
+    core.captureCheckpoint(pyRepo, 'CP A');
+
+    // Bug commit B
+    fs.writeFileSync(path.join(pyRepo, 'calc.py'), 'def add(a, b):\n    return a + b + 1\n');
+    execFileSync('git', ['add', '.'], { cwd: pyRepo });
+    execFileSync('git', ['commit', '-m', 'Bug B'], { cwd: pyRepo });
+    core.captureCheckpoint(pyRepo, 'CP B');
+
+    const inc = await core.collectIncidentBundle(pyRepo, 'pytest bug', 'AssertionError');
+    core.updateProjectSettings(pyRepo, { testCommand: 'python -m pytest' });
+
+    fs.writeFileSync(
+      path.join(pyRepo, 'test_repro.py'),
+      'from calc import add\n\ndef test_add():\n    assert add(1, 2) == 3\n'
+    );
+
+    // Call without preFlipTestFilePath
+    const repro = await core.runReproduction(pyRepo, inc.id, 'test_repro.py');
+
+    assert.strictEqual(repro.status, 'REPRODUCED');
+    assert.ok(repro.assertFlip);
+    assert.strictEqual(repro.assertFlip.verdict, 'NOT_PROVIDED');
+    assert.strictEqual(repro.baselineComparison?.verdict, 'REGRESSION_CONFIRMED');
+    assert.strictEqual(repro.baselineComparison?.baselineRule, 'EXPANDED_TO_OLDER_CHECKPOINT');
+  });
+
+  test('94. B-2 Step-3: non-standard pre-flip test file name (pre_repro.py) does not block get_change_scope expansion', async () => {
+    const pyRepo = path.join(testRoot, 'b2_s3_t94_custom_pre_flip');
+    fs.mkdirSync(pyRepo, { recursive: true });
+    execFileSync('git', ['init', '-b', 'main'], { cwd: pyRepo });
+    execFileSync('git', ['config', 'user.name', 'Tester'], { cwd: pyRepo });
+    execFileSync('git', ['config', 'user.email', 'test@local'], { cwd: pyRepo });
+
+    // Commit A: clean mul
+    fs.writeFileSync(path.join(pyRepo, 'calc.py'), 'def mul(a, b):\n    return a * b\n');
+    execFileSync('git', ['add', '.'], { cwd: pyRepo });
+    execFileSync('git', ['commit', '-m', 'Commit A: clean mul'], { cwd: pyRepo });
+    const cpA = core.captureCheckpoint(pyRepo, 'CP A clean');
+
+    // Commit B: bug in mul
+    fs.writeFileSync(path.join(pyRepo, 'calc.py'), 'def mul(a, b):\n    return a * b + 10\n');
+    execFileSync('git', ['add', '.'], { cwd: pyRepo });
+    execFileSync('git', ['commit', '-m', 'Commit B: bug in mul'], { cwd: pyRepo });
+    core.captureCheckpoint(pyRepo, 'CP B after bug');
+
+    const inc = await core.collectIncidentBundle(pyRepo, '사건: mul 계산 오류', 'AssertionError');
+    core.updateProjectSettings(pyRepo, { testCommand: 'python -m pytest' });
+
+    // Non-standard named files: pre_repro.py and repro_test.py
+    fs.writeFileSync(
+      path.join(pyRepo, 'pre_repro.py'),
+      'from calc import mul\ndef test_m():\n    assert mul(2, 3) == 16\n'
+    );
+    fs.writeFileSync(
+      path.join(pyRepo, 'repro_test.py'),
+      'from calc import mul\ndef test_m():\n    assert mul(2, 3) == 6\n'
+    );
+
+    const repro = await core.runReproduction(pyRepo, inc.id, 'repro_test.py', {
+      preFlipTestFilePath: 'pre_repro.py',
+    });
+    assert.strictEqual(repro.status, 'REPRODUCED');
+    assert.strictEqual(repro.assertFlip?.verdict, 'FLIP_CONFIRMED');
+
+    // getChangeScope auto-expansion to CP A must not be blocked by untracked pre_repro.py
+    const scope = await core.getChangeScope(inc.id);
+    assert.strictEqual(scope.baselineRule, 'EXPANDED_TO_OLDER_CHECKPOINT');
+    assert.strictEqual(scope.baselineSha, cpA.worktreeCommitSha || cpA.gitHeadSha);
+    assert.strictEqual(scope.scopeResult.changedFunctions.some((f) => f.name === 'mul'), true);
+  });
+
+  test('95. B-2 Step-3: legacy command-only record does not exclude newly created non-test source file calc.py', async () => {
+    const pyRepo = path.join(testRoot, 'b2_s3_t95_legacy_command');
+    fs.mkdirSync(pyRepo, { recursive: true });
+    execFileSync('git', ['init', '-b', 'main'], { cwd: pyRepo });
+    execFileSync('git', ['config', 'user.name', 'Tester'], { cwd: pyRepo });
+    execFileSync('git', ['config', 'user.email', 'test@local'], { cwd: pyRepo });
+
+    // Commit A: clean helper
+    fs.writeFileSync(path.join(pyRepo, 'helper.py'), 'def help_me():\n    return 1\n');
+    execFileSync('git', ['add', '.'], { cwd: pyRepo });
+    execFileSync('git', ['commit', '-m', 'Commit A'], { cwd: pyRepo });
+    core.captureCheckpoint(pyRepo, 'CP A');
+
+    // Commit B: update helper
+    fs.writeFileSync(path.join(pyRepo, 'helper.py'), 'def help_me():\n    return 2\n');
+    execFileSync('git', ['add', '.'], { cwd: pyRepo });
+    execFileSync('git', ['commit', '-m', 'Commit B'], { cwd: pyRepo });
+    const cpB = core.captureCheckpoint(pyRepo, 'CP B');
+
+    const inc = await core.collectIncidentBundle(pyRepo, '사건: legacy', 'AssertionError');
+
+    // Manually record legacy reproduction result with command only (no testFilePath)
+    // The command contains 'test_calc.py' which substring-matches 'calc.py'!
+    const dummyResult: ReproductionResult = {
+      status: 'REPRODUCED',
+      command: 'python -m pytest test_calc.py',
+      exitCode: 1,
+      output: 'FAIL',
+      executedAt: new Date().toISOString(),
+    };
+    (core as any).ctx.db.updateIncidentReproduction(inc.id, dummyResult, 'CONFIRMED', []);
+
+    // Create untracked source file calc.py (NOT a test file)
+    fs.writeFileSync(path.join(pyRepo, 'calc.py'), 'def calc_val():\n    return 42\n');
+
+    // Because calc.py is not a test file name, it must NOT be ignored in expansion check.
+    // Since calc.py is untracked and in scope, working tree changes exist, so it does not falsely expand to CP A.
+    const scope = await core.getChangeScope(inc.id);
+    assert.strictEqual(scope.baselineRule, 'INCIDENT_BASE_CHECKPOINT');
+    assert.strictEqual(scope.baselineSha, cpB.worktreeCommitSha || cpB.gitHeadSha);
+    assert.strictEqual(scope.scopeResult.changedFunctions.some((f) => f.name === 'calc_val'), true);
+  });
+
+  test('96. B-2 Step-3: repro-snap ref and reproduction worktree directories are cleaned up completely', async () => {
+    const pyRepo = path.join(testRoot, 'b2_s3_t96_cleanup');
+    fs.mkdirSync(pyRepo, { recursive: true });
+    execFileSync('git', ['init', '-b', 'main'], { cwd: pyRepo });
+    execFileSync('git', ['config', 'user.name', 'Tester'], { cwd: pyRepo });
+    execFileSync('git', ['config', 'user.email', 'test@local'], { cwd: pyRepo });
+
+    fs.writeFileSync(path.join(pyRepo, 'calc.py'), 'def add(a, b):\n    return a + b + 1\n');
+    execFileSync('git', ['add', '.'], { cwd: pyRepo });
+    execFileSync('git', ['commit', '-m', 'Initial'], { cwd: pyRepo });
+    core.captureCheckpoint(pyRepo, 'CP 1');
+
+    const inc = await core.collectIncidentBundle(pyRepo, 'clean test', 'AssertionError');
+    core.updateProjectSettings(pyRepo, { testCommand: 'python -m pytest' });
+
+    fs.writeFileSync(path.join(pyRepo, 'pre.py'), 'from calc import add\ndef test_add():\n    assert add(1, 2) == 4\n');
+    fs.writeFileSync(path.join(pyRepo, 'repro.py'), 'from calc import add\ndef test_add():\n    assert add(1, 2) == 3\n');
+
+    await core.runReproduction(pyRepo, inc.id, 'repro.py', { preFlipTestFilePath: 'pre.py' });
+
+    // Verify git refs: no repro-snap refs exist
+    const refsOutput = (core as any).ctx.gitEngine.runGit(pyRepo, ['for-each-ref', '--format=%(refname)', 'refs/heads/repro-snap*']);
+    assert.strictEqual(refsOutput.trim(), '', 'No repro-snap refs should remain in repository');
+
+    // Verify worktrees: only the main repository worktree exists
+    const wtOutput = (core as any).ctx.gitEngine.runGit(pyRepo, ['worktree', 'list', '--porcelain']);
+    const worktreeLines = wtOutput.split('\n').filter((l: string) => l.startsWith('worktree '));
+    assert.strictEqual(worktreeLines.length, 1, 'Only main worktree should remain');
   });
 });

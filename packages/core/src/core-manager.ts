@@ -111,6 +111,7 @@ import {
   BaselineComparisonVerdict,
   ReproductionRunRecord,
   BaselineComparison,
+  RunReproductionOptions,
   IntentSource,
   IntentProvenance,
   StructuredIntents,
@@ -514,14 +515,23 @@ export class CoreManager {
     repoPath: string,
     incidentId: string,
     testFilePath: string,
-    baselineCheckpointIdOrTimeout?: string | number,
+    baselineCheckpointIdOrOptionsOrTimeout?: string | number | RunReproductionOptions,
     timeoutMs: number = 30000
   ): Promise<ReproductionResult> {
-    const baselineCheckpointId =
-      typeof baselineCheckpointIdOrTimeout === 'string' ? baselineCheckpointIdOrTimeout : undefined;
-    const effectiveTimeout =
-      typeof baselineCheckpointIdOrTimeout === 'number' ? baselineCheckpointIdOrTimeout : timeoutMs;
-    return runReproduction(this.ctx, repoPath, incidentId, testFilePath, baselineCheckpointId, effectiveTimeout);
+    let options: RunReproductionOptions | undefined;
+    let effectiveTimeout = timeoutMs;
+    if (typeof baselineCheckpointIdOrOptionsOrTimeout === 'string') {
+      options = { baselineCheckpointId: baselineCheckpointIdOrOptionsOrTimeout };
+    } else if (typeof baselineCheckpointIdOrOptionsOrTimeout === 'number') {
+      effectiveTimeout = baselineCheckpointIdOrOptionsOrTimeout;
+    } else if (
+      typeof baselineCheckpointIdOrOptionsOrTimeout === 'object' &&
+      baselineCheckpointIdOrOptionsOrTimeout !== null
+    ) {
+      options = baselineCheckpointIdOrOptionsOrTimeout;
+      effectiveTimeout = options.timeoutMs ?? timeoutMs;
+    }
+    return runReproduction(this.ctx, repoPath, incidentId, testFilePath, options, effectiveTimeout);
   }
 
 

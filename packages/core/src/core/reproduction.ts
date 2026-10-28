@@ -10,17 +10,123 @@ import {
   ReproductionRunRecord,
   BaselineComparison,
   Incident,
+  AssertFlipVerdict,
+  AssertFlipResult,
+  AssertFlipNonAssertionLine,
+  RunReproductionOptions,
 } from '../types.js';
 import { parseStackFrames, analyzeIncident } from '../analysis/analyzer.js';
 import { verifyTestCommandSignature } from '../utils/security.js';
 import { locateChangeScope } from '../localization/change-localizer.js';
 import { SnapshotResult } from '../git/git-engine.js';
 
+type SupportedRunnerType = 'pytest' | 'unittest' | 'node:test' | 'unsupported';
+
 interface ExecutionRunsResult {
   runs: ReproductionRunRecord[];
   lastEval: EvaluationOutput;
   lastTestResult: { exitCode: number; output: string };
   durationNote?: string;
+}
+
+// 간단한 줄 패턴 검사
+function isAssertionLine(rawLine: string, runnerType: SupportedRunnerType): boolean {
+  const line = rawLine.trim();
+  if (!line) return false;
+
+  if (runnerType === 'pytest' || runnerType === 'unittest') {
+    // pytest/unittest: assert 문, self.assert*( 호출, pytest.approx를 포함한 assert
+    if (line.startsWith('assert ') || line.startsWith('assert(') || line === 'assert') {
+      return true;
+    }
+    if (/^self\.assert\w*\s*\(/.test(line)) {
+      return true;
+    }
+    return false;
+  }
+
+  if (runnerType === 'node:test') {
+    // node:test: assert.*( 호출, assert( 호출, expect( 호출
+    const unwrapped = line.startsWith('await ') ? line.slice(6).trim() : line;
+    if (/^assert\.\w+\s*\(/.test(unwrapped)) {
+      return true;
+    }
+    if (/^assert\s*\(/.test(unwrapped)) {
+      return true;
+    }
+    if (/^expect\s*\(/.test(unwrapped)) {
+      return true;
+    }
+    return false;
+  }
+
+  return false;
+}
+
+// 간단한 줄 패턴 검사
+function diffAssertionLines(
+  preFlipContent: string,
+  flippedContent: string,
+  runnerType: SupportedRunnerType
+): {
+  changedLineCount: number;
+  nonAssertionChangedLines: AssertFlipNonAssertionLine[];
+} {
+  const lines1 = preFlipContent.replace(/\r\n/g, '\n').split('\n').map((l) => l.trimEnd());
+  const lines2 = flippedContent.replace(/\r\n/g, '\n').split('\n').map((l) => l.trimEnd());
+  if (lines1.length > 0 && lines1[lines1.length - 1] === '') lines1.pop();
+  if (lines2.length > 0 && lines2[lines2.length - 1] === '') lines2.pop();
+
+  const n = lines1.length;
+  const m = lines2.length;
+  const dp: number[][] = Array.from({ length: n + 1 }, () => new Array(m + 1).fill(0));
+
+  for (let i = 0; i < n; i++) {
+    for (let j = 0; j < m; j++) {
+      if (lines1[i] === lines2[j]) {
+        dp[i + 1][j + 1] = dp[i][j] + 1;
+      } else {
+        dp[i + 1][j + 1] = Math.max(dp[i + 1][j], dp[i][j + 1]);
+      }
+    }
+  }
+
+  const preChanged: AssertFlipNonAssertionLine[] = [];
+  const flippedChanged: AssertFlipNonAssertionLine[] = [];
+
+  let i = n;
+  let j = m;
+  while (i > 0 || j > 0) {
+    if (i > 0 && j > 0 && lines1[i - 1] === lines2[j - 1]) {
+      i--;
+      j--;
+    } else if (j > 0 && (i === 0 || dp[i][j - 1] >= dp[i - 1][j])) {
+      flippedChanged.unshift({ line: j, content: lines2[j - 1] });
+      j--;
+    } else if (i > 0 && (j === 0 || dp[i][j - 1] < dp[i - 1][j])) {
+      preChanged.unshift({ line: i, content: lines1[i - 1] });
+      i--;
+    }
+  }
+
+  const totalChangedCount = preChanged.length + flippedChanged.length;
+  const nonAssertionChangedLines: AssertFlipNonAssertionLine[] = [];
+
+  for (const item of preChanged) {
+    if (!isAssertionLine(item.content, runnerType)) {
+      nonAssertionChangedLines.push(item);
+    }
+  }
+  for (const item of flippedChanged) {
+    if (!isAssertionLine(item.content, runnerType)) {
+      nonAssertionChangedLines.push(item);
+    }
+  }
+
+  return {
+    changedLineCount: totalChangedCount,
+    nonAssertionChangedLines,
+  };
 }
 
 async function executeTestRuns(
@@ -103,9 +209,17 @@ export async function runReproduction(
   repoPath: string,
   incidentId: string,
   testFilePath: string,
-  baselineCheckpointId?: string,
+  baselineCheckpointIdOrOptions?: string | RunReproductionOptions,
   timeoutMs: number = 30000
 ): Promise<ReproductionResult> {
+  const options: RunReproductionOptions =
+    typeof baselineCheckpointIdOrOptions === 'string'
+      ? { baselineCheckpointId: baselineCheckpointIdOrOptions }
+      : (baselineCheckpointIdOrOptions || {});
+  const baselineCheckpointId = options.baselineCheckpointId;
+  const preFlipTestFilePath = options.preFlipTestFilePath;
+  const effectiveTimeout = options.timeoutMs ?? timeoutMs;
+
   const targetPath = path.resolve(repoPath);
   const incident = ctx.db.getIncident(incidentId);
   if (!incident) {
@@ -128,6 +242,41 @@ export async function runReproduction(
     const causeEvidence = [...(incident.causeEvidence || []), `[실행 증거] 재현 테스트 실행 불가 - 파일 경로 유효성 검증 실패`];
     ctx.db.updateIncidentReproduction(incidentId, reproductionResult, incident.causeVerdict, causeEvidence);
     return reproductionResult;
+  }
+
+  // 1b. Validate preFlipTestFilePath if provided
+  let relPreFlipPath: string | undefined;
+  let hostPreFlipFile: string | undefined;
+  if (preFlipTestFilePath) {
+    const rawPreFlip = String(preFlipTestFilePath || '').trim().replace(/^["']|["']$/g, '');
+    if (!rawPreFlip || /[\r\n;&|`$><]/.test(rawPreFlip)) {
+      const reproductionResult: ReproductionResult = {
+        status: 'CANNOT_RUN',
+        command: '',
+        testFilePath: rawPath,
+        exitCode: 1,
+        output: '유효하지 않은 뒤집기 전 테스트 파일 경로입니다. 셸 메타문자가 포함될 수 없습니다.',
+        executedAt: new Date().toISOString(),
+      };
+      const causeEvidence = [...(incident.causeEvidence || []), `[실행 증거] 재현 테스트 실행 불가 - 뒤집기 전 파일 경로 유효성 검증 실패`];
+      ctx.db.updateIncidentReproduction(incidentId, reproductionResult, incident.causeVerdict, causeEvidence);
+      return reproductionResult;
+    }
+    hostPreFlipFile = path.resolve(targetPath, rawPreFlip);
+    if (!fs.existsSync(hostPreFlipFile) || !fs.statSync(hostPreFlipFile).isFile()) {
+      const reproductionResult: ReproductionResult = {
+        status: 'CANNOT_RUN',
+        command: '',
+        testFilePath: rawPath,
+        exitCode: 1,
+        output: `뒤집기 전 테스트 파일이 존재하지 않습니다: ${rawPreFlip}`,
+        executedAt: new Date().toISOString(),
+      };
+      const causeEvidence = [...(incident.causeEvidence || []), `[실행 증거] 재현 테스트 실행 불가 - 뒤집기 전 파일 없음: ${rawPreFlip}`];
+      ctx.db.updateIncidentReproduction(incidentId, reproductionResult, incident.causeVerdict, causeEvidence);
+      return reproductionResult;
+    }
+    relPreFlipPath = path.relative(targetPath, hostPreFlipFile).replace(/\\/g, '/');
   }
 
   // 2. Check if host test file exists
@@ -179,11 +328,16 @@ export async function runReproduction(
 
   try {
     // 6. Resolve baseline checkpoint and rule using the unified locateChangeScope
+    const ignoreList = [relTestPath];
+    if (relPreFlipPath) {
+      ignoreList.push(relPreFlipPath);
+    }
     const scopeResult = await locateChangeScope(ctx, {
       repoPath: targetPath,
       incidentId,
       baselineCheckpointId,
       ignoreFilePath: relTestPath,
+      ignoreFilePaths: ignoreList,
     });
 
     // 7. Capture "현재" snapshot (live working directory including untracked & uncommitted changes)
@@ -223,7 +377,7 @@ export async function runReproduction(
           const changedExcludingTest = diffFiles
             .split(/\r?\n/)
             .map((f) => f.trim().replace(/\\/g, '/'))
-            .filter((f) => f && f.toLowerCase() !== relTestPath.toLowerCase());
+            .filter((f) => f && f.toLowerCase() !== relTestPath.toLowerCase() && (!relPreFlipPath || f.toLowerCase() !== relPreFlipPath.toLowerCase()));
           if (changedExcludingTest.length === 0) {
             treeIdentical = true;
           }
@@ -246,6 +400,12 @@ export async function runReproduction(
     fs.mkdirSync(path.dirname(curDestFile), { recursive: true });
     fs.copyFileSync(hostFile, curDestFile);
 
+    if (relPreFlipPath && hostPreFlipFile) {
+      const curPreFlipDest = path.resolve(currentSandboxDir, relPreFlipPath);
+      fs.mkdirSync(path.dirname(curPreFlipDest), { recursive: true });
+      fs.copyFileSync(hostPreFlipFile, curPreFlipDest);
+    }
+
     const currentExec = await executeTestRuns(
       ctx,
       currentSandboxDir,
@@ -253,7 +413,7 @@ export async function runReproduction(
       relTestPath,
       effectiveCommand,
       runnerType,
-      timeoutMs,
+      effectiveTimeout,
       childEnv
     );
 
@@ -327,7 +487,7 @@ export async function runReproduction(
         relTestPath,
         effectiveCommand,
         runnerType,
-        timeoutMs,
+        effectiveTimeout,
         childEnv
       );
 
@@ -365,6 +525,84 @@ export async function runReproduction(
       note,
     };
 
+    // 11. AssertFlip check (Run pre-flip test in current sandbox & check line diff)
+    let assertFlip: AssertFlipResult;
+    if (!relPreFlipPath || !hostPreFlipFile) {
+      assertFlip = {
+        verdict: 'NOT_PROVIDED',
+      };
+    } else if (currentStatus !== 'REPRODUCED' || runnerType === 'unsupported') {
+      assertFlip = {
+        preFlipTestFilePath: relPreFlipPath,
+        verdict: 'SKIPPED',
+        runs: [],
+        note: currentStatus !== 'REPRODUCED'
+          ? '뒤집은 테스트가 REPRODUCED가 아니므로 뒤집기 전 테스트 실행 생략'
+          : '지원하지 않는 실행기이므로 뒤집기 전 테스트 실행 생략',
+      };
+    } else {
+      // Execute pre-flip test in currentSandboxDir
+      const preFlipCommand = buildReproductionCommand(project.testCommand!, relPreFlipPath);
+      const preFlipExec = await executeTestRuns(
+        ctx,
+        currentSandboxDir,
+        hostPreFlipFile,
+        relPreFlipPath,
+        preFlipCommand,
+        runnerType,
+        effectiveTimeout,
+        childEnv
+      );
+
+      // Line diff check between pre-flip and flipped test files ("간단한 줄 패턴 검사")
+      const preFlipContent = fs.readFileSync(hostPreFlipFile, 'utf8');
+      const flippedContent = fs.readFileSync(hostFile, 'utf8');
+      const diffResult = diffAssertionLines(preFlipContent, flippedContent, runnerType);
+
+      const preFlipRuns = preFlipExec.runs;
+      const allPreFlipPassed = preFlipRuns.length > 0 && preFlipRuns.every((r) => r.status === 'NOT_REPRODUCED');
+      const allSameStatus = preFlipRuns.length > 0 && preFlipRuns.every(
+        (r) => r.status === preFlipRuns[0].status && r.failureKind === preFlipRuns[0].failureKind
+      );
+
+      if (diffResult.changedLineCount > 10 || diffResult.nonAssertionChangedLines.length > 0) {
+        assertFlip = {
+          preFlipTestFilePath: relPreFlipPath,
+          verdict: 'FLIP_CHANGED_NON_ASSERTION',
+          runs: preFlipRuns,
+          changedLineCount: diffResult.changedLineCount,
+          nonAssertionChangedLines: diffResult.nonAssertionChangedLines.slice(0, 5),
+          note: diffResult.changedLineCount > 10
+            ? `바뀐 줄 수(${diffResult.changedLineCount}줄)가 상한(10줄)을 초과함`
+            : '단언 줄이 아닌 줄이 변경됨',
+        };
+      } else if (!allSameStatus) {
+        assertFlip = {
+          preFlipTestFilePath: relPreFlipPath,
+          verdict: 'PRE_FLIP_FLAKY',
+          runs: preFlipRuns,
+          changedLineCount: diffResult.changedLineCount,
+          note: '뒤집기 전 테스트 결과가 실행마다 다름',
+        };
+      } else if (!allPreFlipPassed) {
+        assertFlip = {
+          preFlipTestFilePath: relPreFlipPath,
+          verdict: 'PRE_FLIP_NOT_PASSING',
+          runs: preFlipRuns,
+          changedLineCount: diffResult.changedLineCount,
+          note: preFlipExec.lastEval.failureReason || '뒤집기 전 테스트가 통과하지 않음',
+        };
+      } else {
+        assertFlip = {
+          preFlipTestFilePath: relPreFlipPath,
+          verdict: 'FLIP_CONFIRMED',
+          runs: preFlipRuns,
+          changedLineCount: diffResult.changedLineCount,
+          note: '뒤집기 전 테스트 통과, 단언 줄만 변경되어 뒤집은 테스트 단언 실패 확인',
+        };
+      }
+    }
+
     const reproductionResult: ReproductionResult = {
       status: currentStatus,
       command: effectiveCommand,
@@ -377,9 +615,10 @@ export async function runReproduction(
       failureReason: currentFailureReason,
       testCount: currentExec.lastEval.testCount,
       baselineComparison,
+      assertFlip,
     };
 
-    // 9. Update incident in DB with execution evidence & re-evaluate causeVerdict
+    // 12. Update incident in DB with execution evidence & re-evaluate causeVerdict
     const updatedIncident: Incident = {
       ...incident,
       reproductionResult,
@@ -396,18 +635,19 @@ export async function runReproduction(
 
     const causeEvidence = [...(incident.causeEvidence || [])];
     const verdictSuffix = ` [비교: ${verdict}]`;
+    const flipSuffix = assertFlip ? ` [AssertFlip: ${assertFlip.verdict}]` : '';
     if (currentStatus === 'REPRODUCED') {
       const locNote = reproductionResult.failedLocation ? ` (${reproductionResult.failedLocation.filePath}:${reproductionResult.failedLocation.line})` : '';
-      causeEvidence.push(`[실행 증거] 재현 테스트 실행으로 실패 재현 확인${locNote}${verdictSuffix} - ${effectiveCommand}`);
+      causeEvidence.push(`[실행 증거] 재현 테스트 실행으로 실패 재현 확인${locNote}${verdictSuffix}${flipSuffix} - ${effectiveCommand}`);
     } else if (currentStatus === 'NOT_REPRODUCED') {
-      causeEvidence.push(`[실행 증거] 재현 테스트에서 실패가 재현되지 않음${verdictSuffix} - ${effectiveCommand}`);
+      causeEvidence.push(`[실행 증거] 재현 테스트에서 실패가 재현되지 않음${verdictSuffix}${flipSuffix} - ${effectiveCommand}`);
     } else if (currentStatus === 'WRONG_FAILURE') {
       const reason = currentFailureReason ? `: ${currentFailureReason}` : '';
-      causeEvidence.push(`[실행 증거] 재현 테스트가 단언 실패가 아닌 다른 이유로 실패함${reason}${verdictSuffix} - ${effectiveCommand}`);
+      causeEvidence.push(`[실행 증거] 재현 테스트가 단언 실패가 아닌 다른 이유로 실패함${reason}${verdictSuffix}${flipSuffix} - ${effectiveCommand}`);
     } else if (currentStatus === 'UNVERIFIED_FAILURE') {
-      causeEvidence.push(`[실행 증거] 지원하지 않는 실행기로 실패 이유를 검증하지 못함${verdictSuffix} - ${effectiveCommand}`);
+      causeEvidence.push(`[실행 증거] 지원하지 않는 실행기로 실패 이유를 검증하지 못함${verdictSuffix}${flipSuffix} - ${effectiveCommand}`);
     } else {
-      causeEvidence.push(`[실행 증거] 재현 테스트 실행 불가${verdictSuffix} - ${effectiveCommand}`);
+      causeEvidence.push(`[실행 증거] 재현 테스트 실행 불가${verdictSuffix}${flipSuffix} - ${effectiveCommand}`);
     }
 
     ctx.db.updateIncidentReproduction(
@@ -478,8 +718,6 @@ export async function runReproduction(
     }
     return `${trimmed} "${relTestPath}"`;
   }
-
-  type SupportedRunnerType = 'pytest' | 'unittest' | 'node:test' | 'unsupported';
 
   function detectRunnerType(command: string): SupportedRunnerType {
     const trimmed = command.trim();

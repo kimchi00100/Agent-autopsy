@@ -101,6 +101,7 @@ export interface LocateChangeScopeOptions {
   baselineSha?: string;
   baselineCheckpointId?: string;
   ignoreFilePath?: string;
+  ignoreFilePaths?: string[];
 }
 
 // Aliases for backwards compatibility
@@ -324,8 +325,16 @@ export async function locateChangeScope(
   }
 
   const gitEngine = ctx.gitEngine;
-  const normIgnore = options.ignoreFilePath ? options.ignoreFilePath.replace(/\\/g, '/').toLowerCase() : '';
-  const isIgnored = (p: string) => (normIgnore ? p.replace(/\\/g, '/').toLowerCase() === normIgnore : false);
+  const normIgnores = new Set<string>();
+  if (options.ignoreFilePath) {
+    normIgnores.add(options.ignoreFilePath.replace(/\\/g, '/').toLowerCase());
+  }
+  if (options.ignoreFilePaths) {
+    for (const p of options.ignoreFilePaths) {
+      if (p) normIgnores.add(p.replace(/\\/g, '/').toLowerCase());
+    }
+  }
+  const isIgnored = (p: string) => normIgnores.has(p.replace(/\\/g, '/').toLowerCase());
 
   // 2. Scan all tracked & untracked supported files in repository
   const untrackedFiles = new Set<string>();
@@ -355,9 +364,16 @@ export async function locateChangeScope(
     if (untrackedFiles.has(recordedPath)) {
       ignoredForExpansionFiles.add(recordedPath);
     }
-  } else if (incident?.reproductionResult?.command) {
+  }
+  if (incident?.reproductionResult?.assertFlip?.preFlipTestFilePath) {
+    const recordedPreFlip = incident.reproductionResult.assertFlip.preFlipTestFilePath.replace(/\\/g, '/').replace(/^\.\//, '').toLowerCase();
+    if (untrackedFiles.has(recordedPreFlip)) {
+      ignoredForExpansionFiles.add(recordedPreFlip);
+    }
+  }
+  if (!incident?.reproductionResult?.testFilePath && incident?.reproductionResult?.command) {
     for (const u of untrackedFiles) {
-      if (incident.reproductionResult.command.toLowerCase().includes(u) && untrackedFiles.has(u)) {
+      if (incident.reproductionResult.command.toLowerCase().includes(u) && isTestFileName(u)) {
         ignoredForExpansionFiles.add(u);
       }
     }
@@ -370,9 +386,14 @@ export async function locateChangeScope(
     }
   }
 
-  // Also include options.ignoreFilePath if explicitly provided
+  // Also include options.ignoreFilePath/ignoreFilePaths if explicitly provided
   if (options.ignoreFilePath) {
     ignoredForExpansionFiles.add(options.ignoreFilePath.replace(/\\/g, '/').replace(/^\.\//, '').toLowerCase());
+  }
+  if (options.ignoreFilePaths) {
+    for (const p of options.ignoreFilePaths) {
+      if (p) ignoredForExpansionFiles.add(p.replace(/\\/g, '/').replace(/^\.\//, '').toLowerCase());
+    }
   }
 
   let totalRepoFunctions = 0;

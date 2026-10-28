@@ -140,19 +140,24 @@ server.tool(
   {
     incidentId: z.string().describe('ID of the incident to run reproduction for'),
     testFilePath: z.string().describe('Relative path to the reproduction test file in the repository (e.g. "tests/test_repro.py" or "test/repro.test.js"). Only file paths are allowed; tests are executed using the user-confirmed test runner.'),
+    pre_flip_test_file_path: z.string().optional().describe('뒤집기 전 테스트 파일의 저장소 기준 상대 경로'),
     testCommandOrFile: z.string().optional().describe('Deprecated fallback: please provide testFilePath instead'),
     repoPath: z.string().optional().describe('Root path of the git repository (defaults to current directory)'),
     baseline_checkpoint_id: z.string().optional().describe('Optional baseline checkpoint ID to compare against'),
   },
-  async ({ incidentId, testFilePath, testCommandOrFile, repoPath, baseline_checkpoint_id }) => {
+  async ({ incidentId, testFilePath, pre_flip_test_file_path, testCommandOrFile, repoPath, baseline_checkpoint_id }) => {
     try {
       const targetPath = resolvePath(repoPath);
       const filePath = testFilePath || testCommandOrFile || '';
-      const result = await coreManager.runReproduction(targetPath, incidentId, filePath, baseline_checkpoint_id);
+      const result = await coreManager.runReproduction(targetPath, incidentId, filePath, {
+        baselineCheckpointId: baseline_checkpoint_id,
+        preFlipTestFilePath: pre_flip_test_file_path,
+      });
       let message = `Reproduction test completed with status: ${result.status}`;
       let next_action: NextAction;
 
       const verdict = result.baselineComparison?.verdict;
+      const flipVerdict = result.assertFlip?.verdict;
 
       if (result.failureKind === 'FLAKY') {
         message = `Reproduction test completed with status: WRONG_FAILURE (FLAKY)`;
@@ -176,6 +181,30 @@ server.tool(
           actor: 'AGENT',
           action: 'PROPOSE_REPAIR',
           agent_should: '이 실행기는 아직 실패 이유를 판정하지 못한다. 재현으로 인정되지 않는다',
+          forbidden: ['원본 파일 직접 수정', 'DB 직접 수정'],
+        };
+      } else if (flipVerdict === 'PRE_FLIP_NOT_PASSING') {
+        message = `Reproduction test completed with status: ${result.status} (PRE_FLIP_NOT_PASSING)`;
+        next_action = {
+          actor: 'AGENT',
+          action: 'RUN_REPRODUCTION',
+          agent_should: '뒤집기 전 테스트는 지금의 잘못된 값을 단언해서 현재 코드에서 통과해야 한다. 지금 실제로 나오는 값을 단언하도록 고쳐라',
+          forbidden: ['원본 파일 직접 수정', 'DB 직접 수정'],
+        };
+      } else if (flipVerdict === 'PRE_FLIP_FLAKY') {
+        message = `Reproduction test completed with status: ${result.status} (PRE_FLIP_FLAKY)`;
+        next_action = {
+          actor: 'AGENT',
+          action: 'RUN_REPRODUCTION',
+          agent_should: '뒤집기 전 테스트 결과가 실행마다 달라졌다. 시간, 난수, 실행 순서에 의존하지 않게 고쳐라',
+          forbidden: ['원본 파일 직접 수정', 'DB 직접 수정'],
+        };
+      } else if (flipVerdict === 'FLIP_CHANGED_NON_ASSERTION') {
+        message = `Reproduction test completed with status: ${result.status} (FLIP_CHANGED_NON_ASSERTION)`;
+        next_action = {
+          actor: 'AGENT',
+          action: 'RUN_REPRODUCTION',
+          agent_should: '두 테스트는 단언 줄만 달라야 한다. 준비 코드와 호출은 그대로 두고 기대값만 바꿔라',
           forbidden: ['원본 파일 직접 수정', 'DB 직접 수정'],
         };
       } else if (verdict === 'PRE_EXISTING') {
@@ -209,6 +238,10 @@ server.tool(
           agent_should: '재현 테스트 결과가 기록되었습니다. 원인을 분석하고 propose_and_verify_repair로 수정안을 제출하세요.',
           forbidden: ['원본 파일 직접 수정', 'DB 직접 수정'],
         };
+      }
+
+      if (flipVerdict === 'NOT_PROVIDED') {
+        next_action.agent_should += '\npre_flip_test_file_path를 주면 재현 근거가 강해진다';
       }
       return {
         content: [

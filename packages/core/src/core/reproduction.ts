@@ -120,6 +120,7 @@ export async function runReproduction(
     const reproductionResult: ReproductionResult = {
       status: 'CANNOT_RUN',
       command: '',
+      testFilePath: rawPath,
       exitCode: 1,
       output: '유효하지 않은 테스트 파일 경로입니다. 재현 테스트에는 임의의 셸 명령이나 제어 문자를 전달할 수 없으며 오직 단일 파일 경로만 허용됩니다.',
       executedAt: new Date().toISOString(),
@@ -135,6 +136,7 @@ export async function runReproduction(
     const reproductionResult: ReproductionResult = {
       status: 'CANNOT_RUN',
       command: '',
+      testFilePath: rawPath,
       exitCode: 1,
       output: `재현 테스트 파일이 존재하지 않습니다: ${rawPath}`,
       executedAt: new Date().toISOString(),
@@ -155,6 +157,7 @@ export async function runReproduction(
     const reproductionResult: ReproductionResult = {
       status: 'CANNOT_RUN',
       command: '',
+      testFilePath: rawPath,
       exitCode: 1,
       output: '확정된 테스트 러너가 없습니다. 앱 프로젝트 설정에서 테스트 명령을 먼저 확정한 후 재현 테스트를 실행할 수 있습니다.',
       executedAt: new Date().toISOString(),
@@ -192,6 +195,7 @@ export async function runReproduction(
       const reproductionResult: ReproductionResult = {
         status: 'CANNOT_RUN',
         command: effectiveCommand,
+        testFilePath: relTestPath,
         exitCode: 1,
         output: `현재 작업 폴더 스냅샷을 만들지 못해 재현하지 않음: ${errMsg}`,
         executedAt: new Date().toISOString(),
@@ -364,6 +368,7 @@ export async function runReproduction(
     const reproductionResult: ReproductionResult = {
       status: currentStatus,
       command: effectiveCommand,
+      testFilePath: relTestPath,
       exitCode: currentExec.lastTestResult.exitCode,
       output: currentExec.lastTestResult.output,
       failedLocation: currentExec.lastEval.failedLocation,

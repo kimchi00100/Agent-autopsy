@@ -136,6 +136,22 @@ function isSupportedFile(filePath: string): boolean {
   return SUPPORTED_EXTENSIONS.has(ext) && !isExcludedFile(filePath);
 }
 
+export function isTestFileName(filePath: string): boolean {
+  const base = path.basename(filePath).toLowerCase();
+  // Python: test_*.py or *_test.py
+  if (base.endsWith('.py')) {
+    const stem = base.slice(0, -3);
+    if (stem.startsWith('test_') || stem.endsWith('_test')) {
+      return true;
+    }
+  }
+  // JS/TS: *.test.js, *.test.mjs, *.test.cjs, *.test.ts, *.test.tsx, *.spec.js, *.spec.ts, *.spec.mjs, *.spec.cjs, *.spec.tsx
+  if (/\.(test|spec)\.(js|mjs|cjs|ts|tsx)$/i.test(base)) {
+    return true;
+  }
+  return false;
+}
+
 interface ParsedDiffFile {
   filePath: string;
   addedLines: number[];
@@ -312,6 +328,7 @@ export async function locateChangeScope(
   const isIgnored = (p: string) => (normIgnore ? p.replace(/\\/g, '/').toLowerCase() === normIgnore : false);
 
   // 2. Scan all tracked & untracked supported files in repository
+  const untrackedFiles = new Set<string>();
   const allRepoFiles = new Set<string>();
   try {
     const trackedRaw = gitEngine.runGit(repoPath, ['ls-files']);
@@ -322,9 +339,47 @@ export async function locateChangeScope(
     const untrackedRaw = gitEngine.runGit(repoPath, ['ls-files', '--others', '--exclude-standard']);
     for (const line of untrackedRaw.split(/\r?\n/)) {
       const p = line.trim();
-      if (p && isSupportedFile(p) && !isIgnored(p)) allRepoFiles.add(p);
+      if (p) {
+        untrackedFiles.add(p.replace(/\\/g, '/').toLowerCase());
+        if (isSupportedFile(p) && !isIgnored(p)) allRepoFiles.add(p);
+      }
     }
   } catch {}
+
+  // Determine files to ignore specifically for baseline auto-expansion checks
+  const ignoredForExpansionFiles = new Set<string>();
+
+  // (a) Recorded reproduction test file in incident (if untracked)
+  let hasRecordedTest = false;
+  if (incident?.reproductionResult?.testFilePath) {
+    const recordedPath = incident.reproductionResult.testFilePath.replace(/\\/g, '/').replace(/^\.\//, '').toLowerCase();
+    if (untrackedFiles.has(recordedPath)) {
+      ignoredForExpansionFiles.add(recordedPath);
+      hasRecordedTest = true;
+    }
+  } else if (incident?.reproductionResult?.command) {
+    for (const u of untrackedFiles) {
+      if (incident.reproductionResult.command.toLowerCase().includes(u) && isTestFileName(u)) {
+        ignoredForExpansionFiles.add(u);
+        hasRecordedTest = true;
+      }
+    }
+  }
+
+  // (b) Before reproduction has run (no record in incident):
+  // untracked newly created files matching test file naming conventions
+  if (!hasRecordedTest) {
+    for (const u of untrackedFiles) {
+      if (isTestFileName(u)) {
+        ignoredForExpansionFiles.add(u);
+      }
+    }
+  }
+
+  // Also include options.ignoreFilePath if explicitly provided
+  if (options.ignoreFilePath) {
+    ignoredForExpansionFiles.add(options.ignoreFilePath.replace(/\\/g, '/').replace(/^\.\//, '').toLowerCase());
+  }
 
   let totalRepoFunctions = 0;
   const functionRegistry = new Map<string, Array<{ func: ExtractedFunction; filePath: string }>>();
@@ -675,10 +730,27 @@ export async function locateChangeScope(
   let usedCheckpoint: any = null;
   let expansionInfo: ScopeExpansionInfo | undefined;
 
-  const isScopeEmpty =
-    initialScope.changedFunctions.length === 0 &&
-    initialScope.topLevelChanges.length === 0 &&
-    initialScope.hunks.length === 0;
+  const isPathIgnoredForExpansion = (filePath: string): boolean => {
+    const norm = filePath.replace(/\\/g, '/').replace(/^\.\//, '').toLowerCase();
+    return ignoredForExpansionFiles.has(norm);
+  };
+
+  const isScopeEmptyForExpansion = (scope: {
+    changedFunctions: ChangedFunction[];
+    topLevelChanges: TopLevelChange[];
+    hunks: HunkCandidate[];
+  }): boolean => {
+    const effectiveChangedFuncs = scope.changedFunctions.filter((f) => !isPathIgnoredForExpansion(f.filePath));
+    const effectiveTopLevels = scope.topLevelChanges.filter((t) => !isPathIgnoredForExpansion(t.filePath));
+    const effectiveHunks = scope.hunks.filter((h) => !isPathIgnoredForExpansion(h.filePath));
+    return (
+      effectiveChangedFuncs.length === 0 &&
+      effectiveTopLevels.length === 0 &&
+      effectiveHunks.length === 0
+    );
+  };
+
+  const isScopeEmpty = isScopeEmptyForExpansion(initialScope);
 
   // 5. Auto-expansion if scope is completely empty
   if (isScopeEmpty && !disableAutoExpand && originalCheckpoint && ctx.db && projectId) {
@@ -708,10 +780,7 @@ export async function locateChangeScope(
       lastTestedSha = candSha;
 
       const candidateScope = computeScopeDiff(candSha);
-      const candidateEmpty =
-        candidateScope.changedFunctions.length === 0 &&
-        candidateScope.topLevelChanges.length === 0 &&
-        candidateScope.hunks.length === 0;
+      const candidateEmpty = isScopeEmptyForExpansion(candidateScope);
 
       if (!candidateEmpty) {
         finalScope = candidateScope;

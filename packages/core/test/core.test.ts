@@ -4154,4 +4154,122 @@ def test_slow():
     assert.strictEqual(repro3.baselineComparison?.baselineRule, 'INCIDENT_BASE_CHECKPOINT');
     assert.strictEqual(scope3.baselineSha, repro3.baselineComparison?.baselineSha);
   });
+
+  test('82. B-2 Step-2: Agent creates repro test first, get_change_scope and run_reproduction both expand to Checkpoint A with bug function in scope', async () => {
+    const pyRepo = path.join(testRoot, 'b2_s2_t82_repro_first');
+    fs.mkdirSync(pyRepo, { recursive: true });
+    execFileSync('git', ['init', '-b', 'main'], { cwd: pyRepo });
+    execFileSync('git', ['config', 'user.name', 'Tester'], { cwd: pyRepo });
+    execFileSync('git', ['config', 'user.email', 'test@local'], { cwd: pyRepo });
+
+    // 1) 정상 코드 커밋 -> 체크포인트 A
+    fs.writeFileSync(path.join(pyRepo, 'calc.py'), 'def mul(a, b):\n    return a * b\n');
+    execFileSync('git', ['add', '.'], { cwd: pyRepo });
+    execFileSync('git', ['commit', '-m', 'Commit A: clean mul'], { cwd: pyRepo });
+    const cpA = core.captureCheckpoint(pyRepo, 'CP A clean');
+
+    // 2) 버그 커밋 -> 체크포인트 B
+    fs.writeFileSync(path.join(pyRepo, 'calc.py'), 'def mul(a, b):\n    return a * b + 10\n');
+    execFileSync('git', ['add', '.'], { cwd: pyRepo });
+    execFileSync('git', ['commit', '-m', 'Commit B: bug in mul'], { cwd: pyRepo });
+    const cpB = core.captureCheckpoint(pyRepo, 'CP B after bug');
+
+    // 3) 사건 등록 (기준 체크포인트 = B)
+    const inc = await core.collectIncidentBundle(pyRepo, '사건: mul 계산 오류', 'AssertionError');
+    core.updateProjectSettings(pyRepo, { testCommand: 'python -m pytest' });
+
+    // 4) 재현 테스트 파일(test_mul.py, 추적 안 되는 새 파일) 작성
+    fs.writeFileSync(path.join(pyRepo, 'test_mul.py'), 'from calc import mul\ndef test_mul():\n    assert mul(2, 3) == 6\n');
+
+    // 5) get_change_scope 호출
+    const scope = await core.getChangeScope(inc.id);
+
+    // 6) run_reproduction 호출
+    const repro = await core.runReproduction(pyRepo, inc.id, 'test_mul.py');
+
+    assert.strictEqual(scope.baselineRule, 'EXPANDED_TO_OLDER_CHECKPOINT');
+    assert.strictEqual(repro.baselineComparison?.baselineRule, 'EXPANDED_TO_OLDER_CHECKPOINT');
+    assert.strictEqual(scope.baselineSha, cpA.worktreeCommitSha || cpA.gitHeadSha);
+    assert.strictEqual(repro.baselineComparison?.baselineSha, cpA.worktreeCommitSha || cpA.gitHeadSha);
+
+    const hasMul = scope.scopeResult.changedFunctions.some((f) => f.name === 'mul');
+    assert.strictEqual(hasMul, true, 'get_change_scope should include the bug function mul in scope');
+  });
+
+  test('83. B-2 Step-2: Calling run_reproduction first and get_change_scope second yields identical expanded baseline and scope', async () => {
+    const pyRepo = path.join(testRoot, 'b2_s2_t83_repro_order');
+    fs.mkdirSync(pyRepo, { recursive: true });
+    execFileSync('git', ['init', '-b', 'main'], { cwd: pyRepo });
+    execFileSync('git', ['config', 'user.name', 'Tester'], { cwd: pyRepo });
+    execFileSync('git', ['config', 'user.email', 'test@local'], { cwd: pyRepo });
+
+    // 1) 정상 코드 커밋 -> 체크포인트 A
+    fs.writeFileSync(path.join(pyRepo, 'calc.py'), 'def mul(a, b):\n    return a * b\n');
+    execFileSync('git', ['add', '.'], { cwd: pyRepo });
+    execFileSync('git', ['commit', '-m', 'Commit A: clean mul'], { cwd: pyRepo });
+    const cpA = core.captureCheckpoint(pyRepo, 'CP A clean');
+
+    // 2) 버그 커밋 -> 체크포인트 B
+    fs.writeFileSync(path.join(pyRepo, 'calc.py'), 'def mul(a, b):\n    return a * b + 10\n');
+    execFileSync('git', ['add', '.'], { cwd: pyRepo });
+    execFileSync('git', ['commit', '-m', 'Commit B: bug in mul'], { cwd: pyRepo });
+    const cpB = core.captureCheckpoint(pyRepo, 'CP B after bug');
+
+    // 3) 사건 등록 (기준 체크포인트 = B)
+    const inc = await core.collectIncidentBundle(pyRepo, '사건: mul 계산 오류', 'AssertionError');
+    core.updateProjectSettings(pyRepo, { testCommand: 'python -m pytest' });
+
+    // 4) 재현 테스트 파일(test_mul.py, 추적 안 되는 새 파일) 작성
+    fs.writeFileSync(path.join(pyRepo, 'test_mul.py'), 'from calc import mul\ndef test_mul():\n    assert mul(2, 3) == 6\n');
+
+    // 5) run_reproduction 먼저 호출
+    const repro = await core.runReproduction(pyRepo, inc.id, 'test_mul.py');
+
+    // 6) get_change_scope 그 다음 호출
+    const scope = await core.getChangeScope(inc.id);
+
+    assert.strictEqual(repro.baselineComparison?.baselineRule, 'EXPANDED_TO_OLDER_CHECKPOINT');
+    assert.strictEqual(scope.baselineRule, 'EXPANDED_TO_OLDER_CHECKPOINT');
+    assert.strictEqual(repro.baselineComparison?.baselineSha, cpA.worktreeCommitSha || cpA.gitHeadSha);
+    assert.strictEqual(scope.baselineSha, cpA.worktreeCommitSha || cpA.gitHeadSha);
+
+    const hasMul = scope.scopeResult.changedFunctions.some((f) => f.name === 'mul');
+    assert.strictEqual(hasMul, true, 'get_change_scope should include the bug function mul in scope');
+  });
+
+  test('84. B-2 Step-2: Modifying an existing committed test file does not auto-expand to older checkpoints', async () => {
+    const pyRepo = path.join(testRoot, 'b2_s2_t84_committed_test');
+    fs.mkdirSync(pyRepo, { recursive: true });
+    execFileSync('git', ['init', '-b', 'main'], { cwd: pyRepo });
+    execFileSync('git', ['config', 'user.name', 'Tester'], { cwd: pyRepo });
+    execFileSync('git', ['config', 'user.email', 'test@local'], { cwd: pyRepo });
+
+    // 1) 정상 코드 및 테스트 파일 커밋 -> 체크포인트 A
+    fs.writeFileSync(path.join(pyRepo, 'calc.py'), 'def mul(a, b):\n    return a * b\n');
+    fs.writeFileSync(path.join(pyRepo, 'test_calc.py'), 'from calc import mul\ndef test_mul():\n    assert mul(2, 3) == 6\n');
+    execFileSync('git', ['add', '.'], { cwd: pyRepo });
+    execFileSync('git', ['commit', '-m', 'Commit A: clean mul and test'], { cwd: pyRepo });
+    const cpA = core.captureCheckpoint(pyRepo, 'CP A clean');
+
+    // 2) 버그 커밋 -> 체크포인트 B
+    fs.writeFileSync(path.join(pyRepo, 'calc.py'), 'def mul(a, b):\n    return a * b + 10\n');
+    execFileSync('git', ['add', '.'], { cwd: pyRepo });
+    execFileSync('git', ['commit', '-m', 'Commit B: bug in mul'], { cwd: pyRepo });
+    const cpB = core.captureCheckpoint(pyRepo, 'CP B after bug');
+
+    // 3) 사건 등록 (기준 체크포인트 = B)
+    const inc = await core.collectIncidentBundle(pyRepo, '사건: mul 계산 오류', 'AssertionError');
+    core.updateProjectSettings(pyRepo, { testCommand: 'python -m pytest' });
+
+    // 4) 커밋된 기존 테스트 파일(test_calc.py)을 수정 (추적되는 기존 파일)
+    fs.writeFileSync(path.join(pyRepo, 'test_calc.py'), 'from calc import mul\ndef test_mul():\n    assert mul(2, 3) == 999\n');
+
+    // 5) get_change_scope 호출 -> 기존 테스트 파일의 변경은 변경으로 세어지므로 확장되지 않고 B 유지
+    const scope = await core.getChangeScope(inc.id);
+
+    assert.strictEqual(scope.baselineRule, 'INCIDENT_BASE_CHECKPOINT');
+    assert.strictEqual(scope.baselineSha, cpB.worktreeCommitSha || cpB.gitHeadSha);
+    const hasTestMul = scope.scopeResult.changedFunctions.some((f) => f.name === 'test_mul');
+    assert.strictEqual(hasTestMul, true, 'Committed test file modification must be detected in scope');
+  });
 });

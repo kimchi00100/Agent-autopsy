@@ -141,6 +141,7 @@ export interface BaselineComparison {
 export interface ReproductionResult {
   status: ReproductionStatus;
   command: string;
+  testFilePath?: string;
   exitCode: number;
   output: string;
   failedLocation?: { filePath: string; line: number };

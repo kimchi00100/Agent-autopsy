@@ -13,7 +13,7 @@ import {
 } from '../types.js';
 import { parseStackFrames, analyzeIncident } from '../analysis/analyzer.js';
 import { verifyTestCommandSignature } from '../utils/security.js';
-import { resolveBaselineCheckpoint } from '../localization/change-localizer.js';
+import { locateChangeScope } from '../localization/change-localizer.js';
 import { SnapshotResult } from '../git/git-engine.js';
 
 interface ExecutionRunsResult {
@@ -169,54 +169,70 @@ export async function runReproduction(
   const effectiveCommand = buildReproductionCommand(project.testCommand!, relTestPath);
   const runnerType = detectRunnerType(effectiveCommand);
 
-  // 5. Capture "현재" snapshot (live working directory including untracked & uncommitted changes)
+  // 5. Variables declared before try/finally so cleanup always occurs
   let currentSnapshot: SnapshotResult | undefined;
-  const reproSnapshotId = `repro-snap-${incidentId.slice(0, 8)}-${Date.now()}`;
-  try {
-    currentSnapshot = ctx.gitEngine.createSnapshot(targetPath, reproSnapshotId, 'Reproduction transient snapshot');
-  } catch {}
-  const currentCommit = currentSnapshot?.worktreeCommitSha || 'HEAD';
-
-  // 6. Resolve baseline checkpoint and rule
-  const resolvedBaseline = resolveBaselineCheckpoint(ctx, {
-    repoPath: targetPath,
-    projectId: project.id,
-    incidentId,
-    baselineCheckpointId,
-    ignoreFilePath: relTestPath,
-  });
-
-  // Check if baseline tree is byte-for-byte identical to current snapshot tree
-  let treeIdentical = false;
-  if (resolvedBaseline.baselineSha && resolvedBaseline.baselineSha !== 'HEAD' && currentCommit) {
-    try {
-      const currentTree = ctx.gitEngine.runGit(targetPath, ['rev-parse', `${currentCommit}^{tree}`]).trim();
-      const baselineTree = ctx.gitEngine.runGit(targetPath, ['rev-parse', `${resolvedBaseline.baselineSha}^{tree}`]).trim();
-      if (currentTree && baselineTree && currentTree === baselineTree) {
-        treeIdentical = true;
-      } else {
-        const diffFiles = ctx.gitEngine.runGit(targetPath, ['diff', '--name-only', resolvedBaseline.baselineSha, currentCommit]);
-        const changedExcludingTest = diffFiles
-          .split(/\r?\n/)
-          .map((f) => f.trim().replace(/\\/g, '/'))
-          .filter((f) => f && f.toLowerCase() !== relTestPath.toLowerCase());
-        if (changedExcludingTest.length === 0) {
-          treeIdentical = true;
-        }
-      }
-    } catch {}
-  }
-
-  // Child environment without NODE_TEST_CONTEXT or NODE_TEST_WORKER_ID
-  const childEnv: NodeJS.ProcessEnv = { ...process.env };
-  delete childEnv.NODE_TEST_CONTEXT;
-  delete childEnv.NODE_TEST_WORKER_ID;
-
   let currentSandboxDir: string | undefined;
   let baselineSandboxDir: string | undefined;
 
   try {
-    // 7. Run on "현재" (Current)
+    // 6. Resolve baseline checkpoint and rule using the unified locateChangeScope
+    const scopeResult = await locateChangeScope(ctx, {
+      repoPath: targetPath,
+      incidentId,
+      baselineCheckpointId,
+      ignoreFilePath: relTestPath,
+    });
+
+    // 7. Capture "현재" snapshot (live working directory including untracked & uncommitted changes)
+    const reproSnapshotId = `repro-snap-${incidentId.slice(0, 8)}-${Date.now()}`;
+    try {
+      currentSnapshot = ctx.gitEngine.createSnapshot(targetPath, reproSnapshotId, 'Reproduction transient snapshot');
+    } catch (snapErr: any) {
+      const errMsg = snapErr?.message || String(snapErr);
+      const reproductionResult: ReproductionResult = {
+        status: 'CANNOT_RUN',
+        command: effectiveCommand,
+        exitCode: 1,
+        output: `현재 작업 폴더 스냅샷을 만들지 못해 재현하지 않음: ${errMsg}`,
+        executedAt: new Date().toISOString(),
+        failureReason: `현재 작업 폴더 스냅샷을 만들지 못해 재현하지 않음: ${errMsg}`,
+      };
+      const causeEvidence = [
+        ...(incident.causeEvidence || []),
+        `[실행 증거] 현재 작업 폴더 스냅샷을 만들지 못해 재현하지 않음: ${errMsg} - ${effectiveCommand}`,
+      ];
+      ctx.db.updateIncidentReproduction(incidentId, reproductionResult, incident.causeVerdict, causeEvidence);
+      return reproductionResult;
+    }
+    const currentCommit = currentSnapshot.worktreeCommitSha;
+
+    // 8. Check if baseline tree is byte-for-byte identical to current snapshot tree
+    let treeIdentical = false;
+    if (scopeResult.baselineSha && scopeResult.baselineSha !== 'HEAD' && currentCommit) {
+      try {
+        const currentTree = ctx.gitEngine.runGit(targetPath, ['rev-parse', `${currentCommit}^{tree}`]).trim();
+        const baselineTree = ctx.gitEngine.runGit(targetPath, ['rev-parse', `${scopeResult.baselineSha}^{tree}`]).trim();
+        if (currentTree && baselineTree && currentTree === baselineTree) {
+          treeIdentical = true;
+        } else {
+          const diffFiles = ctx.gitEngine.runGit(targetPath, ['diff', '--name-only', scopeResult.baselineSha, currentCommit]);
+          const changedExcludingTest = diffFiles
+            .split(/\r?\n/)
+            .map((f) => f.trim().replace(/\\/g, '/'))
+            .filter((f) => f && f.toLowerCase() !== relTestPath.toLowerCase());
+          if (changedExcludingTest.length === 0) {
+            treeIdentical = true;
+          }
+        }
+      } catch {}
+    }
+
+    // Child environment without NODE_TEST_CONTEXT or NODE_TEST_WORKER_ID
+    const childEnv: NodeJS.ProcessEnv = { ...process.env };
+    delete childEnv.NODE_TEST_CONTEXT;
+    delete childEnv.NODE_TEST_WORKER_ID;
+
+    // 9. Run on "현재" (Current)
     const currentSandboxId = `repro-cur-${incidentId.slice(0, 8)}-${Date.now()}`;
     const curWorktree = ctx.worktreeRunner.createWorktree(targetPath, currentSandboxId, currentCommit, [], effectiveCommand);
     currentSandboxDir = curWorktree.sandboxDir;
@@ -264,15 +280,15 @@ export async function runReproduction(
       }
     }
 
-    // 8. Baseline Comparison
+    // 10. Baseline Comparison
     let verdict: BaselineComparisonVerdict;
     let baselineRuns: ReproductionRunRecord[] = [];
     let note: string | undefined = currentExec.durationNote;
 
     const canCompareBaseline =
       !treeIdentical &&
-      Boolean(resolvedBaseline.baselineSha) &&
-      resolvedBaseline.baselineRule !== 'NO_CHECKPOINT_HEAD';
+      Boolean(scopeResult.baselineSha) &&
+      scopeResult.baselineRule !== 'NO_CHECKPOINT_HEAD';
 
     if (currentStatus !== 'REPRODUCED') {
       verdict = 'SKIPPED';
@@ -290,7 +306,7 @@ export async function runReproduction(
       const baseWorktree = ctx.worktreeRunner.createWorktree(
         targetPath,
         baselineSandboxId,
-        resolvedBaseline.baselineSha,
+        scopeResult.baselineSha,
         [],
         effectiveCommand
       );
@@ -334,9 +350,9 @@ export async function runReproduction(
     }
 
     const baselineComparison: BaselineComparison = {
-      baselineCheckpointId: resolvedBaseline.baselineCheckpointId,
-      baselineSha: resolvedBaseline.baselineSha,
-      baselineRule: resolvedBaseline.baselineRule,
+      baselineCheckpointId: scopeResult.baselineCheckpointId,
+      baselineSha: scopeResult.baselineSha,
+      baselineRule: scopeResult.baselineRule,
       verdict,
       runs: {
         current: currentRuns,

@@ -3977,4 +3977,181 @@ def test_slow():
     assert.strictEqual(repro.baselineComparison.verdict, 'NO_BASELINE');
     assert.ok(repro.baselineComparison.note?.includes('트리') || repro.baselineComparison.note?.includes('비교 대상 없음'));
   });
+
+  test('79. B-2 Step-2: Foreign baseline_checkpoint_id is rejected without leaving transient ref or worktrees', async () => {
+    const repoA = path.join(testRoot, 'b2_s2_t79_repoA');
+    const repoB = path.join(testRoot, 'b2_s2_t79_repoB');
+    fs.mkdirSync(repoA, { recursive: true });
+    fs.mkdirSync(repoB, { recursive: true });
+
+    execFileSync('git', ['init', '-b', 'main'], { cwd: repoA });
+    execFileSync('git', ['config', 'user.name', 'Tester'], { cwd: repoA });
+    execFileSync('git', ['config', 'user.email', 'test@local'], { cwd: repoA });
+    fs.writeFileSync(path.join(repoA, 'calc.py'), 'def add(a, b): return a + b\n');
+    execFileSync('git', ['add', '.'], { cwd: repoA });
+    execFileSync('git', ['commit', '-m', 'Init A'], { cwd: repoA });
+
+    execFileSync('git', ['init', '-b', 'main'], { cwd: repoB });
+    execFileSync('git', ['config', 'user.name', 'Tester'], { cwd: repoB });
+    execFileSync('git', ['config', 'user.email', 'test@local'], { cwd: repoB });
+    fs.writeFileSync(path.join(repoB, 'calc.py'), 'def add(a, b): return a + b\n');
+    execFileSync('git', ['add', '.'], { cwd: repoB });
+    execFileSync('git', ['commit', '-m', 'Init B'], { cwd: repoB });
+
+    const cpA = core.captureCheckpoint(repoA, 'Checkpoint A');
+    const cpB = core.captureCheckpoint(repoB, 'Checkpoint B');
+    const incA = await core.collectIncidentBundle(repoA, 'Inc A', 'Error output');
+
+    core.updateProjectSettings(repoA, { testCommand: 'python -m pytest' });
+    fs.writeFileSync(path.join(repoA, 'test_repro.py'), 'def test_a(): assert 1 == 2\n');
+
+    // Attempt reproduction with repoB's checkpoint -> must throw
+    await assert.rejects(
+      async () => {
+        await core.runReproduction(repoA, incA.id, 'test_repro.py', cpB.id);
+      },
+      /체크포인트 .*는 이 사건\/프로젝트.*의 체크포인트가 아닙니다/
+    );
+
+    // Verify git for-each-ref has no repro-snap
+    const gitRefs = execFileSync('git', ['for-each-ref', 'refs/autopsy/checkpoints/'], { cwd: repoA, encoding: 'utf8' });
+    assert.ok(!gitRefs.includes('repro-snap-'), 'No repro-snap ref should remain');
+    assert.ok(gitRefs.includes(cpA.id), 'Legitimate checkpoint ref must remain');
+
+    // Verify git worktree list has no reproduction worktree
+    const worktreeList = execFileSync('git', ['worktree', 'list'], { cwd: repoA, encoding: 'utf8' });
+    assert.ok(!worktreeList.includes('repro-cur-'), 'No repro-cur worktree should remain');
+    assert.ok(!worktreeList.includes('repro-base-'), 'No repro-base worktree should remain');
+  });
+
+  test('80. B-2 Step-2: Snapshot creation failure returns CANNOT_RUN without executing on HEAD', async () => {
+    const pyRepo = path.join(testRoot, 'b2_s2_t80_snap_fail');
+    fs.mkdirSync(pyRepo, { recursive: true });
+    execFileSync('git', ['init', '-b', 'main'], { cwd: pyRepo });
+    execFileSync('git', ['config', 'user.name', 'Tester'], { cwd: pyRepo });
+    execFileSync('git', ['config', 'user.email', 'test@local'], { cwd: pyRepo });
+
+    fs.writeFileSync(path.join(pyRepo, 'calc.py'), 'def add(a, b): return a + b\n');
+    execFileSync('git', ['add', '.'], { cwd: pyRepo });
+    execFileSync('git', ['commit', '-m', 'Init calc'], { cwd: pyRepo });
+
+    core.captureCheckpoint(pyRepo, 'Baseline');
+    const inc = await core.collectIncidentBundle(pyRepo, '스냅샷 실패 테스트 사건', 'Error');
+
+    // Working directory has uncommitted bug
+    fs.writeFileSync(path.join(pyRepo, 'calc.py'), 'def add(a, b): return a + b + 999\n');
+    fs.writeFileSync(path.join(pyRepo, 'test_repro.py'), 'from calc import add\ndef test_add(): assert add(1, 1) == 2\n');
+    core.updateProjectSettings(pyRepo, { testCommand: 'python -m pytest' });
+
+    // Temporarily stub gitEngine.createSnapshot to throw an error
+    const gitEngine = (core as any).ctx.gitEngine;
+    const origCreateSnapshot = gitEngine.createSnapshot.bind(gitEngine);
+    gitEngine.createSnapshot = () => {
+      throw new Error('Simulated index lock error');
+    };
+
+    try {
+      const repro = await core.runReproduction(pyRepo, inc.id, 'test_repro.py');
+
+      assert.strictEqual(repro.status, 'CANNOT_RUN');
+      assert.strictEqual(repro.exitCode, 1);
+      assert.ok(repro.output.includes('현재 작업 폴더 스냅샷을 만들지 못해 재현하지 않음'));
+      assert.ok(repro.output.includes('Simulated index lock error'));
+
+      const updatedInc = core.getDatabase().getIncident(inc.id)!;
+      assert.ok(
+        updatedInc.causeEvidence?.some((e: string) =>
+          e.includes('현재 작업 폴더 스냅샷을 만들지 못해 재현하지 않음: Simulated index lock error')
+        )
+      );
+
+      // Verify it did NOT run on HEAD (which would have returned NOT_REPRODUCED since HEAD had clean add(a,b))
+      assert.strictEqual(repro.status, 'CANNOT_RUN');
+      assert.ok(!repro.baselineComparison?.runs?.current || repro.baselineComparison.runs.current.length === 0);
+    } finally {
+      gitEngine.createSnapshot = origCreateSnapshot;
+    }
+  });
+
+  test('81. B-2 Step-2: get_change_scope and run_reproduction pick identical baselineSha and baselineRule across 3 cases', async () => {
+    const pyRepo = path.join(testRoot, 'b2_s2_t81_rule_parity');
+    fs.mkdirSync(pyRepo, { recursive: true });
+    execFileSync('git', ['init', '-b', 'main'], { cwd: pyRepo });
+    execFileSync('git', ['config', 'user.name', 'Tester'], { cwd: pyRepo });
+    execFileSync('git', ['config', 'user.email', 'test@local'], { cwd: pyRepo });
+
+    // --- Case 1: 사건 기준 체크포인트를 쓰는 경우 (INCIDENT_BASE_CHECKPOINT) ---
+    fs.writeFileSync(path.join(pyRepo, 'calc.py'), 'def add(a, b):\n    return a + b\n');
+    execFileSync('git', ['add', '.'], { cwd: pyRepo });
+    execFileSync('git', ['commit', '-m', 'Commit 1: clean add'], { cwd: pyRepo });
+    const cp1 = core.captureCheckpoint(pyRepo, 'CP1 clean');
+
+    fs.writeFileSync(path.join(pyRepo, 'calc.py'), 'def add(a, b):\n    return a + b + 1\n');
+    execFileSync('git', ['add', '.'], { cwd: pyRepo });
+    execFileSync('git', ['commit', '-m', 'Commit 2: bug in add'], { cwd: pyRepo });
+
+    const inc1 = await core.collectIncidentBundle(pyRepo, 'Case 1 회귀 사건', 'AssertionError');
+    core.updateProjectSettings(pyRepo, { testCommand: 'python -m pytest' });
+    fs.writeFileSync(path.join(pyRepo, 'test_c1.py'), 'from calc import add\ndef test_add(): assert add(1, 1) == 2\n');
+
+    const scope1 = await core.getChangeScope(inc1.id);
+    const repro1 = await core.runReproduction(pyRepo, inc1.id, 'test_c1.py');
+
+    assert.strictEqual(scope1.baselineRule, 'INCIDENT_BASE_CHECKPOINT');
+    assert.strictEqual(repro1.baselineComparison?.baselineRule, 'INCIDENT_BASE_CHECKPOINT');
+    assert.strictEqual(scope1.baselineSha, repro1.baselineComparison?.baselineSha);
+
+    // --- Case 2: 더 이전 체크포인트로 넓히는 경우 (EXPANDED_TO_OLDER_CHECKPOINT) ---
+    const repoC2 = path.join(testRoot, 'b2_s2_t81_c2');
+    fs.mkdirSync(repoC2, { recursive: true });
+    execFileSync('git', ['init', '-b', 'main'], { cwd: repoC2 });
+    execFileSync('git', ['config', 'user.name', 'Tester'], { cwd: repoC2 });
+    execFileSync('git', ['config', 'user.email', 'test@local'], { cwd: repoC2 });
+
+    fs.writeFileSync(path.join(repoC2, 'calc.py'), 'def mul(a, b):\n    return a * b\n');
+    execFileSync('git', ['add', '.'], { cwd: repoC2 });
+    execFileSync('git', ['commit', '-m', 'Commit A: clean mul'], { cwd: repoC2 });
+    const cpA = core.captureCheckpoint(repoC2, 'CP A clean');
+
+    fs.writeFileSync(path.join(repoC2, 'calc.py'), 'def mul(a, b):\n    return a * b + 10\n');
+    execFileSync('git', ['add', '.'], { cwd: repoC2 });
+    execFileSync('git', ['commit', '-m', 'Commit B: bug in mul'], { cwd: repoC2 });
+    core.captureCheckpoint(repoC2, 'CP B after bug');
+
+    // Incident registered at CP B: base checkpoint is CP B
+    const inc2 = await core.collectIncidentBundle(repoC2, 'Case 2 자동 확장 사건', 'AssertionError');
+    core.updateProjectSettings(repoC2, { testCommand: 'python -m pytest' });
+
+    const scope2 = await core.getChangeScope(inc2.id);
+    fs.writeFileSync(path.join(repoC2, 'test_c2.py'), 'from calc import mul\ndef test_mul(): assert mul(2, 3) == 6\n');
+    const repro2 = await core.runReproduction(repoC2, inc2.id, 'test_c2.py');
+
+    assert.strictEqual(scope2.baselineRule, 'EXPANDED_TO_OLDER_CHECKPOINT');
+    assert.strictEqual(repro2.baselineComparison?.baselineRule, 'EXPANDED_TO_OLDER_CHECKPOINT');
+    assert.strictEqual(scope2.baselineSha, repro2.baselineComparison?.baselineSha);
+    assert.strictEqual(scope2.baselineSha, cpA.worktreeCommitSha || cpA.gitHeadSha);
+
+    // --- Case 3: 넓혀도 찾지 못하는 경우 (INCIDENT_BASE_CHECKPOINT 유지) ---
+    const repoC3 = path.join(testRoot, 'b2_s2_t81_c3');
+    fs.mkdirSync(repoC3, { recursive: true });
+    execFileSync('git', ['init', '-b', 'main'], { cwd: repoC3 });
+    execFileSync('git', ['config', 'user.name', 'Tester'], { cwd: repoC3 });
+    execFileSync('git', ['config', 'user.email', 'test@local'], { cwd: repoC3 });
+
+    fs.writeFileSync(path.join(repoC3, 'calc.py'), 'def sub(a, b):\n    return a - b\n');
+    execFileSync('git', ['add', '.'], { cwd: repoC3 });
+    execFileSync('git', ['commit', '-m', 'Initial only commit'], { cwd: repoC3 });
+    core.captureCheckpoint(repoC3, 'Only initial checkpoint');
+
+    const inc3 = await core.collectIncidentBundle(repoC3, 'Case 3 넓혀도 없는 사건', 'AssertionError');
+    core.updateProjectSettings(repoC3, { testCommand: 'python -m pytest' });
+    fs.writeFileSync(path.join(repoC3, 'test_c3.py'), 'def test_a(): assert 1 == 2\n');
+
+    const scope3 = await core.getChangeScope(inc3.id);
+    const repro3 = await core.runReproduction(repoC3, inc3.id, 'test_c3.py');
+
+    assert.strictEqual(scope3.baselineRule, 'INCIDENT_BASE_CHECKPOINT');
+    assert.strictEqual(repro3.baselineComparison?.baselineRule, 'INCIDENT_BASE_CHECKPOINT');
+    assert.strictEqual(scope3.baselineSha, repro3.baselineComparison?.baselineSha);
+  });
 });

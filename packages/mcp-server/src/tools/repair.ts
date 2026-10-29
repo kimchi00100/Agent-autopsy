@@ -112,6 +112,7 @@ server.tool(
         'LOCKED_TEST_MODIFIED',
         'LOCK_SIGNATURE_INVALID',
         'LOCK_REMOVED',
+        'INVALID_FILE_PATH',
       ];
       const matchedCode = knownRejectionCodes.find(
         (c) => error.code === c || (error.message && error.message.includes(c))

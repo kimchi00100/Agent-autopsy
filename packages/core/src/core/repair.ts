@@ -3,7 +3,7 @@ import * as fs from 'node:fs';
 import * as crypto from 'node:crypto';
 import { CoreContext } from './context.js';
 import { sendWindowsToast } from '../notifications/toast.js';
-import { isSamePathUnderRepo } from '../utils/paths.js';
+import { isSamePathUnderRepo, validateRepoRelativeFilePath } from '../utils/paths.js';
 import {
   signApprovalPayload,
   verifyApprovalSignature,
@@ -37,6 +37,11 @@ import {
     const incident = ctx.db.getIncident(incidentId);
     if (!incident) {
       throw new Error(`Incident with ID "${incidentId}" not found.`);
+    }
+
+    // Validate all proposal file paths against project root before any disk operation or lock check
+    for (const change of fileChanges) {
+      validateRepoRelativeFilePath(project.rootPath, change.filePath);
     }
 
     // Check reproduction test lock before preparing patch:
@@ -637,6 +642,26 @@ import {
           `[STALE_APPROVAL_ERROR]: 대상 파일 "${relPath}" 이(가) 사용자 승인 이후 외부에서 수정되었습니다. 코드 충돌을 방지하기 위해 적용이 차단되었습니다. 수정안을 다시 검토해 주세요.`
         );
       }
+    }
+
+    // Re-verify that all fileChanges paths are strictly inside repo before applying or creating checkpoint
+    try {
+      for (const change of fileChanges) {
+        validateRepoRelativeFilePath(project.rootPath, change.filePath);
+      }
+    } catch (pathErr: any) {
+      ctx.db.appendAuditLog({
+        kind: 'APPLY_REJECTED',
+        entityType: 'PROPOSAL',
+        entityId: proposalId,
+        payloadHash: hashAuditPayload({
+          error: 'INVALID_FILE_PATH',
+          proposalId,
+          incidentId: proposal.incidentId,
+          message: pathErr.message,
+        }),
+      });
+      throw pathErr;
     }
 
     // 1. Take safety checkpoint before applying

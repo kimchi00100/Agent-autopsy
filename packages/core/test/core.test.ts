@@ -18,12 +18,14 @@ import {
   getInstallationSecretKey,
   verifyReproductionLockSignature,
   computeNormalizedContentHash,
+  computeProposalRowSignature,
 } from '../src/utils/security.js';
 import {
   resolveDataDir,
   resolveCacheDir,
   generateDeterministicProjectId,
   normalizeRepoPath,
+  validateRepoRelativeFilePath,
 } from '../src/utils/paths.js';
 
 describe('Agent Autopsy Core Engine Integration Tests', () => {
@@ -5854,7 +5856,6 @@ def test_slow():
       './test_repro.js',
       '.\\test_repro.js',
       'sub/../test_repro.js',
-      path.resolve(jsRepo, 'test_repro.js'),
     ];
 
     for (const variant of bypassVariants) {
@@ -5871,6 +5872,20 @@ def test_slow():
         }
       );
     }
+
+    // Absolute path variant rejected by path confinement before reaching lock check
+    const absVariant = path.resolve(jsRepo, 'test_repro.js');
+    await assert.rejects(
+      async () => {
+        await core.proposeAndVerifyRepair(jsRepo, inc.id, `우회 시도 (${absVariant})`, [
+          { filePath: absVariant, replacements: [{ search: 'add(1, 2), 3', replace: 'add(1, 2), 4' }] },
+        ]);
+      },
+      (err: any) => {
+        assert.strictEqual(err.code, 'INVALID_FILE_PATH');
+        return true;
+      }
+    );
   });
 
   test('122. B-2 Step 4-2: Case-insensitive path comparison prevents bypass on Windows', async () => {
@@ -6131,5 +6146,298 @@ def test_slow():
     ]);
     assert.strictEqual(proposal.verificationStatus, 'VERIFIED_PASS');
     assert.strictEqual(executionResult.success, true);
+  });
+
+  test('127. B-2 Step 4-2b: proposeAndVerifyRepair rejects paths outside repo with INVALID_FILE_PATH without writing files or creating DB rows', async () => {
+    const jsRepo = path.join(testRoot, 'b2_s42b_t127_rejection');
+    fs.mkdirSync(jsRepo, { recursive: true });
+    execFileSync('git', ['init', '-b', 'main'], { cwd: jsRepo });
+    execFileSync('git', ['config', 'user.name', 'Tester'], { cwd: jsRepo });
+    execFileSync('git', ['config', 'user.email', 'test@local'], { cwd: jsRepo });
+
+    fs.writeFileSync(path.join(jsRepo, 'package.json'), JSON.stringify({ type: 'module' }));
+    fs.writeFileSync(path.join(jsRepo, 'calc.js'), 'export function add(a, b) { return a + b + 1; }\n');
+    execFileSync('git', ['add', '.'], { cwd: jsRepo });
+    execFileSync('git', ['commit', '-m', 'initial'], { cwd: jsRepo });
+    core.captureCheckpoint(jsRepo, 'Initial checkpoint');
+
+    core.updateProjectSettings(jsRepo, { testCommand: 'node --test' });
+    const inc = await core.collectIncidentBundle(jsRepo, 'Rejection Incident', 'AssertionError');
+
+    const parentDir = path.dirname(jsRepo);
+    const outsideTxt = path.join(parentDir, 'outside.txt');
+    if (fs.existsSync(outsideTxt)) fs.unlinkSync(outsideTxt);
+
+    const initialParentFiles = new Set(fs.readdirSync(parentDir));
+    const gitHooksDir = path.join(jsRepo, '.git', 'hooks');
+    const initialGitHooksFiles = fs.existsSync(gitHooksDir) ? new Set(fs.readdirSync(gitHooksDir)) : new Set();
+
+    const rejectedPaths = [
+      '../outside.txt',
+      'a/../../outside.txt',
+      '..\\outside.txt',
+      path.join(parentDir, 'outside.txt'),
+      'C:/x.txt',
+      'C:x.txt',
+      '\\\\server\\share\\x.txt',
+      'calc.js:stream',
+      '.git/hooks/pre-commit',
+      '.GIT/config',
+      '',
+      'sub/',
+    ];
+
+    for (const targetPath of rejectedPaths) {
+      await assert.rejects(
+        async () => {
+          await core.proposeAndVerifyRepair(jsRepo, inc.id, '테스트 거부 시도', [
+            { filePath: targetPath, newContent: 'hacked content' },
+          ]);
+        },
+        (err: any) => {
+          assert.strictEqual(err.code, 'INVALID_FILE_PATH', `Expected INVALID_FILE_PATH for path "${targetPath}"`);
+          return true;
+        }
+      );
+    }
+
+    // Verify parent directory has no new files and outside.txt was not written
+    const currentParentFiles = new Set(fs.readdirSync(parentDir));
+    assert.deepStrictEqual(currentParentFiles, initialParentFiles, 'Parent directory must have no new files');
+    assert.strictEqual(fs.existsSync(outsideTxt), false, 'outside.txt must not exist');
+
+    // Verify .git/hooks has no new files
+    if (fs.existsSync(gitHooksDir)) {
+      const currentGitHooksFiles = new Set(fs.readdirSync(gitHooksDir));
+      assert.deepStrictEqual(currentGitHooksFiles, initialGitHooksFiles, '.git/hooks must have no new files');
+    }
+
+    // Verify cache sandboxes has no outside.txt
+    const cacheDir = resolveCacheDir();
+    const sandboxesDir = path.join(cacheDir, 'sandboxes');
+    if (fs.existsSync(sandboxesDir)) {
+      assert.strictEqual(fs.existsSync(path.join(sandboxesDir, 'outside.txt')), false, 'sandboxes must not contain outside.txt');
+    }
+
+    // Verify no repair proposal rows were created in DB
+    const proposals = core.getDatabase().listProposalsForIncident(inc.id);
+    assert.strictEqual(proposals.length, 0, 'No proposals should be created in DB on path rejection');
+  });
+
+  test('128. B-2 Step 4-2b: proposeAndVerifyRepair rejects folder link escape (symlink/junction) with INVALID_FILE_PATH', async () => {
+    const jsRepo = path.join(testRoot, 'b2_s42b_t128_link_escape');
+    fs.mkdirSync(jsRepo, { recursive: true });
+    execFileSync('git', ['init', '-b', 'main'], { cwd: jsRepo });
+    execFileSync('git', ['config', 'user.name', 'Tester'], { cwd: jsRepo });
+    execFileSync('git', ['config', 'user.email', 'test@local'], { cwd: jsRepo });
+
+    fs.writeFileSync(path.join(jsRepo, 'package.json'), JSON.stringify({ type: 'module' }));
+    fs.writeFileSync(path.join(jsRepo, 'calc.js'), 'export function add(a, b) { return a + b + 1; }\n');
+    execFileSync('git', ['add', '.'], { cwd: jsRepo });
+    execFileSync('git', ['commit', '-m', 'initial'], { cwd: jsRepo });
+    core.captureCheckpoint(jsRepo, 'Initial checkpoint');
+
+    core.updateProjectSettings(jsRepo, { testCommand: 'node --test' });
+    const inc = await core.collectIncidentBundle(jsRepo, 'Link Escape Incident', 'AssertionError');
+
+    const outsideTarget = path.join(testRoot, 'b2_s42b_outside_target');
+    fs.mkdirSync(outsideTarget, { recursive: true });
+    fs.writeFileSync(path.join(outsideTarget, 'secret.txt'), 'secret\n');
+
+    const linkPath = path.join(jsRepo, 'escapelink');
+    try {
+      const symlinkType = process.platform === 'win32' ? 'junction' : 'dir';
+      fs.symlinkSync(outsideTarget, linkPath, symlinkType);
+    } catch (e: any) {
+      console.log('SKIPPED(symlink permission):', e.message);
+      return;
+    }
+
+    await assert.rejects(
+      async () => {
+        await core.proposeAndVerifyRepair(jsRepo, inc.id, '정션 탈출 시도', [
+          { filePath: 'escapelink/pwned.txt', newContent: 'pwned' },
+        ]);
+      },
+      (err: any) => {
+        assert.strictEqual(err.code, 'INVALID_FILE_PATH');
+        return true;
+      }
+    );
+
+    assert.strictEqual(fs.existsSync(path.join(outsideTarget, 'pwned.txt')), false, 'Outside target folder must not be written');
+  });
+
+  test('129. B-2 Step 4-2b: Normal paths (./, sub/../, new subfolder/file) pass verification with VERIFIED_PASS', async () => {
+    const jsRepo = path.join(testRoot, 'b2_s42b_t129_normal_paths');
+    fs.mkdirSync(jsRepo, { recursive: true });
+    execFileSync('git', ['init', '-b', 'main'], { cwd: jsRepo });
+    execFileSync('git', ['config', 'user.name', 'Tester'], { cwd: jsRepo });
+    execFileSync('git', ['config', 'user.email', 'test@local'], { cwd: jsRepo });
+
+    fs.writeFileSync(path.join(jsRepo, 'package.json'), JSON.stringify({ type: 'module' }));
+    fs.writeFileSync(path.join(jsRepo, 'calc.js'), 'export function add(a, b) { return a + b + 1; }\n');
+    execFileSync('git', ['add', '.'], { cwd: jsRepo });
+    execFileSync('git', ['commit', '-m', 'initial'], { cwd: jsRepo });
+    core.captureCheckpoint(jsRepo, 'Initial checkpoint');
+
+    core.updateProjectSettings(jsRepo, { testCommand: 'node --test' });
+    const inc = await core.collectIncidentBundle(jsRepo, 'Normal Paths Incident', 'AssertionError');
+
+    // 1. calc.js
+    const res1 = await core.proposeAndVerifyRepair(jsRepo, inc.id, '정상 경로 1', [
+      { filePath: 'calc.js', replacements: [{ search: 'a + b + 1', replace: 'a + b' }] },
+    ]);
+    assert.strictEqual(res1.proposal.verificationStatus, 'VERIFIED_PASS');
+
+    // 2. ./calc.js
+    const res2 = await core.proposeAndVerifyRepair(jsRepo, inc.id, '정상 경로 2', [
+      { filePath: './calc.js', replacements: [{ search: 'a + b + 1', replace: 'a + b' }] },
+    ]);
+    assert.strictEqual(res2.proposal.verificationStatus, 'VERIFIED_PASS');
+
+    // 3. sub/../calc.js
+    const res3 = await core.proposeAndVerifyRepair(jsRepo, inc.id, '정상 경로 3', [
+      { filePath: 'sub/../calc.js', replacements: [{ search: 'a + b + 1', replace: 'a + b' }] },
+    ]);
+    assert.strictEqual(res3.proposal.verificationStatus, 'VERIFIED_PASS');
+
+    // 4. src/new_file.js (new file, new subfolder)
+    const res4 = await core.proposeAndVerifyRepair(jsRepo, inc.id, '정상 경로 4 새 파일', [
+      { filePath: 'calc.js', replacements: [{ search: 'a + b + 1', replace: 'a + b' }] },
+      { filePath: 'src/new_file.js', newContent: 'export const helper = 42;\n' },
+    ]);
+    assert.strictEqual(res4.proposal.verificationStatus, 'VERIFIED_PASS');
+  });
+
+  test('130. B-2 Step 4-2b: applyApprovedRepair rejects proposal with invalid path, leaves repo untouched, and records APPLY_REJECTED in audit log', async () => {
+    const jsRepo = path.join(testRoot, 'b2_s42b_t130_apply_recheck');
+    fs.mkdirSync(jsRepo, { recursive: true });
+    execFileSync('git', ['init', '-b', 'main'], { cwd: jsRepo });
+    execFileSync('git', ['config', 'user.name', 'Tester'], { cwd: jsRepo });
+    execFileSync('git', ['config', 'user.email', 'test@local'], { cwd: jsRepo });
+
+    fs.writeFileSync(path.join(jsRepo, 'package.json'), JSON.stringify({ type: 'module' }));
+    fs.writeFileSync(path.join(jsRepo, 'calc.js'), 'export function add(a, b) { return a + b + 1; }\n');
+    execFileSync('git', ['add', '.'], { cwd: jsRepo });
+    execFileSync('git', ['commit', '-m', 'initial'], { cwd: jsRepo });
+    core.captureCheckpoint(jsRepo, 'Initial checkpoint');
+
+    core.updateProjectSettings(jsRepo, { testCommand: 'node --test' });
+    const project = core.ensureProject(jsRepo);
+    const inc = await core.collectIncidentBundle(jsRepo, 'Apply Recheck Incident', 'AssertionError');
+
+    const parentDir = path.dirname(jsRepo);
+    const outsideTxt = path.join(parentDir, 'outside_apply.txt');
+    if (fs.existsSync(outsideTxt)) fs.unlinkSync(outsideTxt);
+
+    // Simulate legacy proposal containing ../outside_apply.txt in DB with valid row signature
+    const proposalId = 'prp_legacy_escape_' + Date.now();
+    const fileChangesJson = JSON.stringify([
+      { filePath: '../outside_apply.txt', newContent: 'injected by legacy proposal' },
+    ]);
+    const createdAt = new Date().toISOString();
+    const secret = getInstallationSecretKey();
+    const rowSig = computeProposalRowSignature(secret, {
+      id: proposalId,
+      incident_id: inc.id,
+      project_id: project.id,
+      file_changes_json: fileChangesJson,
+      verification_status: 'VERIFIED_PASS',
+      created_at: createdAt,
+    });
+
+    core.getDatabase().insertRepairProposal({
+      id: proposalId,
+      incidentId: inc.id,
+      rootCauseAnalysis: 'Legacy proposal with outside path',
+      fileChangesJson,
+      patchDiff: 'diff --git a/../outside_apply.txt b/../outside_apply.txt\n',
+      touchedFiles: ['../outside_apply.txt'],
+      verificationStatus: 'VERIFIED_PASS',
+      verificationLog: 'tests pass',
+      riskLevel: 'LOW',
+      approvalStatus: 'AWAITING_USER',
+      approvalReadiness: 'READY_FOR_APPROVAL',
+      stages: [],
+      threeLevelHealth: { code: 'PASS', functional: 'PASS', requirement: 'PASS' },
+      verifiedWithCommand: 'node --test',
+      approvalFingerprintJson: null,
+      approvedAt: null,
+      appliedAt: null,
+      rowSignature: rowSig,
+      createdAt,
+    });
+
+    // Approve proposal via standard approveProposal
+    core.approveProposal(proposalId);
+
+    // Now applyApprovedRepair must reject with INVALID_FILE_PATH
+    assert.throws(
+      () => {
+        core.applyApprovedRepair(jsRepo, proposalId);
+      },
+      (err: any) => {
+        assert.strictEqual(err.code, 'INVALID_FILE_PATH');
+        return true;
+      }
+    );
+
+    // Verify outside file was NOT created
+    assert.strictEqual(fs.existsSync(outsideTxt), false, 'Outside file must not be created');
+
+    // Verify original repository files are untouched
+    const calcContent = fs.readFileSync(path.join(jsRepo, 'calc.js'), 'utf8');
+    assert.strictEqual(calcContent, 'export function add(a, b) { return a + b + 1; }\n');
+
+    // Verify audit log recorded APPLY_REJECTED
+    const auditLogs = core.getDatabase().getAuditLogs();
+    const rejectAudit = auditLogs.find((l: any) => l.kind === 'APPLY_REJECTED' && l.entityId === proposalId);
+    assert.ok(rejectAudit, 'Audit log must record APPLY_REJECTED for proposal');
+  });
+
+  test('131. B-2 Step 4-2b: validateRepoRelativeFilePath unit test table of rejection and passing cases', () => {
+    const testCases: Array<{ path: any; expectPass: boolean; reason: string }> = [
+      { path: '../outside.txt', expectPass: false, reason: 'Parent directory traversal' },
+      { path: 'a/../../outside.txt', expectPass: false, reason: 'Double parent directory traversal' },
+      { path: '..\\outside.txt', expectPass: false, reason: 'Windows backslash traversal' },
+      { path: '/outside.txt', expectPass: false, reason: 'Leading forward slash absolute' },
+      { path: '\\outside.txt', expectPass: false, reason: 'Leading backslash absolute' },
+      { path: '\\\\server\\share\\x.txt', expectPass: false, reason: 'UNC network path' },
+      { path: 'C:/x.txt', expectPass: false, reason: 'Drive letter slash' },
+      { path: 'C:x.txt', expectPass: false, reason: 'Drive relative colon' },
+      { path: 'calc.js:stream', expectPass: false, reason: 'NTFS alternate data stream colon' },
+      { path: '.git/hooks/pre-commit', expectPass: false, reason: '.git directory access' },
+      { path: '.GIT/config', expectPass: false, reason: '.GIT uppercase directory access' },
+      { path: './.git/x', expectPass: false, reason: 'Normalized .git directory access' },
+      { path: '', expectPass: false, reason: 'Empty string' },
+      { path: '   ', expectPass: false, reason: 'Whitespace only string' },
+      { path: 'calc\0.js', expectPass: false, reason: 'NUL byte in path' },
+      { path: 'sub/', expectPass: false, reason: 'Directory ending with slash' },
+      { path: 'sub\\', expectPass: false, reason: 'Directory ending with backslash' },
+      { path: '.', expectPass: false, reason: 'Current directory root' },
+      { path: 'calc.js', expectPass: true, reason: 'Standard relative file' },
+      { path: './calc.js', expectPass: true, reason: 'Standard relative file with ./' },
+      { path: '.\\calc.js', expectPass: true, reason: 'Standard relative file with .\\' },
+      { path: 'sub/../calc.js', expectPass: true, reason: 'Normalized inner relative path' },
+      { path: 'src/new_file.js', expectPass: true, reason: 'Subdirectory file' },
+    ];
+
+    for (const tc of testCases) {
+      if (tc.expectPass) {
+        const norm = validateRepoRelativeFilePath(testRoot, tc.path);
+        assert.ok(typeof norm === 'string' && norm.length > 0, `Expected pass for ${tc.reason}: ${tc.path}`);
+      } else {
+        assert.throws(
+          () => {
+            validateRepoRelativeFilePath(testRoot, tc.path);
+          },
+          (err: any) => {
+            assert.strictEqual(err.code, 'INVALID_FILE_PATH', `Expected INVALID_FILE_PATH for ${tc.reason}: ${tc.path}`);
+            return true;
+          }
+        );
+      }
+    }
   });
 });

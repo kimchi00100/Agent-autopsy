@@ -2,6 +2,7 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as diff from 'diff';
 import { FileChange, Replacement } from '../types.js';
+import { validateRepoRelativeFilePath } from '../utils/paths.js';
 
 export interface PreparedPatch {
   appliedFiles: Map<string, string>; // relativePath -> new full content
@@ -60,7 +61,7 @@ export class PatchEngine {
     let fullUnifiedDiff = '';
 
     for (const change of fileChanges) {
-      const relPath = change.filePath.replace(/\\/g, '/').replace(/^\/+/, '');
+      const relPath = validateRepoRelativeFilePath(baseDirectory, change.filePath);
       const fullPath = path.join(baseDirectory, relPath);
       touchedFiles.push(relPath);
 
@@ -110,7 +111,8 @@ export class PatchEngine {
    */
   public writePatchToDisk(targetDirectory: string, appliedFiles: Map<string, string>): void {
     for (const [relPath, newContent] of appliedFiles.entries()) {
-      const fullPath = path.join(targetDirectory, relPath);
+      const validatedRelPath = validateRepoRelativeFilePath(targetDirectory, relPath);
+      const fullPath = path.join(targetDirectory, validatedRelPath);
       const dir = path.dirname(fullPath);
       if (!fs.existsSync(dir)) {
         fs.mkdirSync(dir, { recursive: true });

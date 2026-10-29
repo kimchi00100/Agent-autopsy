@@ -14,9 +14,20 @@ import {
   AssertFlipResult,
   AssertFlipNonAssertionLine,
   RunReproductionOptions,
+  ReproductionLock,
+  ReproductionLockHistoryEntry,
+  ReproductionLockStatus,
+  NextAction,
 } from '../types.js';
 import { parseStackFrames, analyzeIncident } from '../analysis/analyzer.js';
-import { verifyTestCommandSignature } from '../utils/security.js';
+import {
+  verifyTestCommandSignature,
+  getInstallationSecretKey,
+  computeNormalizedContentHash,
+  computeReproductionLockSignature,
+  verifyReproductionLockSignature,
+  hashAuditPayload,
+} from '../utils/security.js';
 import { locateChangeScope } from '../localization/change-localizer.js';
 import { SnapshotResult } from '../git/git-engine.js';
 import type Parser from 'web-tree-sitter';
@@ -535,6 +546,36 @@ export async function runReproduction(
 
   const project = ctx.ensureProject(targetPath);
 
+  // Check reproduction test lock at start
+  let initialLockStatus: ReproductionLockStatus | undefined;
+  let initialLockWarning: string | undefined;
+  let initialLockNextAction: NextAction | undefined;
+
+  const existingLock = incident.reproductionLock;
+  if (existingLock) {
+    const secret = getInstallationSecretKey();
+    if (!verifyReproductionLockSignature(secret, existingLock)) {
+      initialLockStatus = 'LOCK_SIGNATURE_INVALID';
+      initialLockWarning = '재현 테스트 잠금의 서명이 올바르지 않습니다 (잠금 변조 의심).';
+    } else {
+      const hostLockedFile = path.resolve(targetPath, existingLock.testFilePath);
+      let currentLockedHash = '';
+      if (fs.existsSync(hostLockedFile)) {
+        currentLockedHash = computeNormalizedContentHash(fs.readFileSync(hostLockedFile, 'utf8'));
+      }
+      if (currentLockedHash !== existingLock.contentHash) {
+        initialLockStatus = 'LOCKED_TEST_MODIFIED';
+        initialLockWarning = '잠금된 재현 테스트 파일이 디스크에서 변경되었습니다.';
+        initialLockNextAction = {
+          actor: 'AGENT',
+          action: 'RESTORE_OR_REPLACE_LOCK',
+          agent_should: `잠금된 테스트 파일(${existingLock.testFilePath})이 변경되었습니다. 원래 내용으로 복원하거나 replace_lock: true와 replace_reason을 지정하여 잠금을 갱신하세요.`,
+          forbidden: ['원본 파일 직접 수정', 'DB 직접 수정'],
+        };
+      }
+    }
+  }
+
   // 1. Validate that input is strictly a file path and contains no shell metacharacters
   const rawPath = String(testFilePath || '').trim().replace(/^["']|["']$/g, '');
   if (!rawPath || /[\r\n;&|`$><]/.test(rawPath)) {
@@ -937,6 +978,104 @@ export async function runReproduction(
       }
     }
 
+    let lockStatus: ReproductionLockStatus | undefined = initialLockStatus;
+    let reproductionLock: ReproductionLock | undefined = existingLock || undefined;
+    let lockWarning: string | undefined = initialLockWarning;
+    let lockNextAction: NextAction | undefined = initialLockNextAction;
+
+    const secret = getInstallationSecretKey();
+    const curContent = fs.readFileSync(hostFile, 'utf8');
+    const curContentHash = computeNormalizedContentHash(curContent);
+    let curPreFlipContentHash: string | undefined;
+    if (hostPreFlipFile && fs.existsSync(hostPreFlipFile)) {
+      curPreFlipContentHash = computeNormalizedContentHash(fs.readFileSync(hostPreFlipFile, 'utf8'));
+    }
+
+    if (currentStatus === 'REPRODUCED' && currentFailureKind !== 'FLAKY') {
+      if (!existingLock) {
+        // 1. First time locking
+        const lockData = {
+          testFilePath: relTestPath,
+          contentHash: curContentHash,
+          lockedAt: new Date().toISOString(),
+          baselineVerdict: verdict,
+          assertFlipVerdict: assertFlip?.verdict,
+          preFlipFilePath: relPreFlipPath,
+          preFlipContentHash: curPreFlipContentHash,
+        };
+        const signature = computeReproductionLockSignature(secret, lockData);
+        const newLock: ReproductionLock = { ...lockData, signature };
+        ctx.db.updateIncidentReproductionLock(incidentId, newLock);
+        ctx.db.appendAuditLog({
+          kind: 'REPRODUCTION_LOCKED',
+          entityType: 'INCIDENT',
+          entityId: incidentId,
+          payloadHash: hashAuditPayload(newLock),
+        });
+        lockStatus = 'LOCKED';
+        reproductionLock = newLock;
+        lockWarning = undefined;
+        lockNextAction = undefined;
+      } else {
+        // 2. Existing lock present
+        const isSameFile = existingLock.testFilePath.replace(/\\/g, '/').toLowerCase() === relTestPath.toLowerCase();
+        const isSameHash = existingLock.contentHash === curContentHash;
+
+        if (isSameFile && isSameHash) {
+          lockStatus = 'LOCKED';
+          reproductionLock = existingLock;
+          lockWarning = undefined;
+          lockNextAction = undefined;
+        } else {
+          if (!options.replace_lock) {
+            lockStatus = 'LOCK_KEPT';
+            lockWarning = `잠금된 테스트와 다름: 이미 잠금된 재현 테스트(${existingLock.testFilePath})와 다릅니다. 기존 잠금이 유지됩니다.`;
+            reproductionLock = existingLock;
+            lockNextAction = {
+              actor: 'AGENT',
+              action: 'REUSE_OR_REPLACE_LOCK',
+              agent_should: `기존 잠금 테스트(${existingLock.testFilePath})로 다시 실행하거나, 테스트를 변경해야 한다면 replace_lock: true와 변경 사유(replace_reason)를 함께 전달하세요.`,
+              forbidden: ['원본 파일 직접 수정', 'DB 직접 수정'],
+            };
+          } else {
+            const historyEntry: ReproductionLockHistoryEntry = {
+              testFilePath: existingLock.testFilePath,
+              contentHash: existingLock.contentHash,
+              lockedAt: existingLock.lockedAt,
+              baselineVerdict: existingLock.baselineVerdict,
+              assertFlipVerdict: existingLock.assertFlipVerdict,
+              preFlipFilePath: existingLock.preFlipFilePath,
+              preFlipContentHash: existingLock.preFlipContentHash,
+              replaceReason: options.replace_reason || '사유 미지정',
+            };
+            const history = [...(existingLock.history || []), historyEntry];
+            const lockData = {
+              testFilePath: relTestPath,
+              contentHash: curContentHash,
+              lockedAt: new Date().toISOString(),
+              baselineVerdict: verdict,
+              assertFlipVerdict: assertFlip?.verdict,
+              preFlipFilePath: relPreFlipPath,
+              preFlipContentHash: curPreFlipContentHash,
+            };
+            const signature = computeReproductionLockSignature(secret, lockData);
+            const newLock: ReproductionLock = { ...lockData, history, signature };
+            ctx.db.updateIncidentReproductionLock(incidentId, newLock);
+            ctx.db.appendAuditLog({
+              kind: 'REPRODUCTION_LOCK_REPLACED',
+              entityType: 'INCIDENT',
+              entityId: incidentId,
+              payloadHash: hashAuditPayload(newLock),
+            });
+            lockStatus = 'LOCK_REPLACED';
+            reproductionLock = newLock;
+            lockWarning = undefined;
+            lockNextAction = undefined;
+          }
+        }
+      }
+    }
+
     const reproductionResult: ReproductionResult = {
       status: currentStatus,
       command: effectiveCommand,
@@ -950,6 +1089,10 @@ export async function runReproduction(
       testCount: currentExec.lastEval.testCount,
       baselineComparison,
       assertFlip,
+      lockStatus,
+      reproductionLock,
+      lockWarning,
+      next_action: lockNextAction,
     };
 
     // 12. Update incident in DB with execution evidence & re-evaluate causeVerdict

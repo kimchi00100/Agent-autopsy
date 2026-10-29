@@ -144,14 +144,27 @@ server.tool(
     testCommandOrFile: z.string().optional().describe('Deprecated fallback: please provide testFilePath instead'),
     repoPath: z.string().optional().describe('Root path of the git repository (defaults to current directory)'),
     baseline_checkpoint_id: z.string().optional().describe('Optional baseline checkpoint ID to compare against'),
+    replace_lock: z.boolean().optional().describe('기존 잠금이 있을 때 새 잠금으로 교체할지 여부 (기본값: false)'),
+    replace_reason: z.string().optional().describe('잠금을 교체하는 구체적인 사유 (replace_lock이 true일 때 필요)'),
   },
-  async ({ incidentId, testFilePath, pre_flip_test_file_path, testCommandOrFile, repoPath, baseline_checkpoint_id }) => {
+  async ({
+    incidentId,
+    testFilePath,
+    pre_flip_test_file_path,
+    testCommandOrFile,
+    repoPath,
+    baseline_checkpoint_id,
+    replace_lock,
+    replace_reason,
+  }) => {
     try {
       const targetPath = resolvePath(repoPath);
       const filePath = testFilePath || testCommandOrFile || '';
       const result = await coreManager.runReproduction(targetPath, incidentId, filePath, {
         baselineCheckpointId: baseline_checkpoint_id,
         preFlipTestFilePath: pre_flip_test_file_path,
+        replace_lock,
+        replace_reason,
       });
       let message = `Reproduction test completed with status: ${result.status}`;
       let next_action: NextAction;
@@ -242,6 +255,12 @@ server.tool(
 
       if (flipVerdict === 'NOT_PROVIDED') {
         next_action.agent_should += '\npre_flip_test_file_path를 주면 재현 근거가 강해진다';
+      }
+      if (result.next_action) {
+        next_action = result.next_action;
+      }
+      if (result.lockWarning) {
+        message += ` (경고: ${result.lockWarning})`;
       }
       return {
         content: [

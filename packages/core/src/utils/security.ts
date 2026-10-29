@@ -2,7 +2,7 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as crypto from 'node:crypto';
 import { resolveDataDir } from './paths.js';
-import { FileChange } from '../types.js';
+import { FileChange, ReproductionLock } from '../types.js';
 
 let cachedSecretKey: string | null = null;
 
@@ -263,4 +263,60 @@ export function verifyIncidentRowSignature(
     return false;
   }
 }
+
+/**
+ * Computes deterministic SHA-256 hash of file content after normalizing CRLF line endings to LF.
+ */
+export function computeNormalizedContentHash(content: string): string {
+  const normalized = content.replace(/\r\n/g, '\n');
+  return crypto.createHash('sha256').update(normalized, 'utf8').digest('hex');
+}
+
+/**
+ * Computes deterministic HMAC-SHA256 signature for a reproduction test lock.
+ * Payload: testFilePath::contentHash::lockedAt::baselineVerdict::assertFlipVerdict::preFlipFilePath::preFlipContentHash
+ */
+export function computeReproductionLockSignature(
+  secretKey: string,
+  lock: {
+    testFilePath: string;
+    contentHash: string;
+    lockedAt: string;
+    baselineVerdict?: string;
+    assertFlipVerdict?: string;
+    preFlipFilePath?: string;
+    preFlipContentHash?: string;
+  }
+): string {
+  const payload = [
+    lock.testFilePath.replace(/\\/g, '/'),
+    lock.contentHash,
+    lock.lockedAt,
+    lock.baselineVerdict || '',
+    lock.assertFlipVerdict || '',
+    lock.preFlipFilePath ? lock.preFlipFilePath.replace(/\\/g, '/') : '',
+    lock.preFlipContentHash || '',
+  ].join('::');
+  return crypto.createHmac('sha256', secretKey).update(payload).digest('hex');
+}
+
+/**
+ * Verifies the cryptographic HMAC signature of a reproduction lock.
+ */
+export function verifyReproductionLockSignature(
+  secretKey: string,
+  lock: ReproductionLock
+): boolean {
+  if (!lock || !lock.signature || typeof lock.signature !== 'string') return false;
+  const expected = computeReproductionLockSignature(secretKey, lock);
+  try {
+    const a = Buffer.from(lock.signature, 'hex');
+    const b = Buffer.from(expected, 'hex');
+    if (a.length !== b.length) return false;
+    return crypto.timingSafeEqual(a, b);
+  } catch {
+    return false;
+  }
+}
+
 

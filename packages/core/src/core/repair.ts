@@ -12,6 +12,8 @@ import {
   computeProposalRowSignature,
   verifyProposalRowSignature,
   hashAuditPayload,
+  computeNormalizedContentHash,
+  verifyReproductionLockSignature,
 } from '../utils/security.js';
 import {
   ApprovalReadiness,
@@ -38,6 +40,82 @@ import {
 
     // 1. Prepare patch in memory
     const prepared = ctx.patchEngine.preparePatch(project.rootPath, fileChanges);
+
+    // Check reproduction test lock: (c) signature validity, (a) proposal modification, (b) disk modification
+    if (incident.reproductionLock) {
+      const lock = incident.reproductionLock;
+      const secret = getInstallationSecretKey();
+
+      // (c) Lock signature verification
+      if (!verifyReproductionLockSignature(secret, lock)) {
+        ctx.db.appendAuditLog({
+          kind: 'REPAIR_REJECTED',
+          entityType: 'INCIDENT',
+          entityId: incidentId,
+          payloadHash: hashAuditPayload({ error: 'LOCK_SIGNATURE_INVALID', lock }),
+        });
+        const err: any = new Error('[LOCK_SIGNATURE_INVALID]: 재현 테스트 잠금의 서명이 올바르지 않습니다 (잠금 변조 의심).');
+        err.code = 'LOCK_SIGNATURE_INVALID';
+        err.next_action = {
+          actor: 'USER',
+          action: 'INVESTIGATE_TAMPER',
+          agent_should: '재현 테스트 잠금 서명 불일치가 감지되었습니다. 잠금 데이터를 확인하거나 재현 테스트를 다시 실행하세요.',
+          forbidden: ['원본 파일 직접 수정', 'DB 직접 수정'],
+        };
+        throw err;
+      }
+
+      // (a) Check if proposal modifies locked test file (or preFlip file)
+      const lockedTestRel = lock.testFilePath.replace(/\\/g, '/').toLowerCase();
+      const lockedPreFlipRel = lock.preFlipFilePath ? lock.preFlipFilePath.replace(/\\/g, '/').toLowerCase() : null;
+      const modifiesLocked = prepared.touchedFiles.some((f) => {
+        const norm = f.replace(/\\/g, '/').toLowerCase();
+        return norm === lockedTestRel || (lockedPreFlipRel !== null && norm === lockedPreFlipRel);
+      });
+
+      if (modifiesLocked) {
+        ctx.db.appendAuditLog({
+          kind: 'REPAIR_REJECTED',
+          entityType: 'INCIDENT',
+          entityId: incidentId,
+          payloadHash: hashAuditPayload({ error: 'REPAIR_MODIFIES_LOCKED_TEST', lock, touched: prepared.touchedFiles }),
+        });
+        const err: any = new Error('[REPAIR_MODIFIES_LOCKED_TEST]: 수정안에 잠금된 재현 테스트 파일이 포함되어 있습니다. 수정안은 실제 소스 코드만 변경해야 합니다.');
+        err.code = 'REPAIR_MODIFIES_LOCKED_TEST';
+        err.next_action = {
+          actor: 'AGENT',
+          action: 'REMOVE_TEST_CHANGES_FROM_REPAIR',
+          agent_should: '수정안에서 재현 테스트 파일 수정을 제거하고, 실제 대상 소스 코드만 수정하도록 패치를 변경하세요.',
+          forbidden: ['원본 파일 직접 수정', 'DB 직접 수정'],
+        };
+        throw err;
+      }
+
+      // (b) Check if locked test file was modified on disk
+      const hostLockedTestFile = path.resolve(project.rootPath, lock.testFilePath);
+      let diskContentHash = '';
+      if (fs.existsSync(hostLockedTestFile)) {
+        diskContentHash = computeNormalizedContentHash(fs.readFileSync(hostLockedTestFile, 'utf8'));
+      }
+      if (diskContentHash !== lock.contentHash) {
+        ctx.db.appendAuditLog({
+          kind: 'REPAIR_REJECTED',
+          entityType: 'INCIDENT',
+          entityId: incidentId,
+          payloadHash: hashAuditPayload({ error: 'LOCKED_TEST_MODIFIED', lock, diskContentHash }),
+        });
+        const err: any = new Error('[LOCKED_TEST_MODIFIED]: 잠금된 재현 테스트 파일이 디스크에서 변경되었습니다. 잠금 당시 내용으로 복원하거나 잠금을 갱신하세요.');
+        err.code = 'LOCKED_TEST_MODIFIED';
+        err.next_action = {
+          actor: 'AGENT',
+          action: 'RESTORE_OR_REPLACE_LOCK',
+          agent_should: '잠금된 테스트 파일을 원래대로 복원하거나, 의도된 변경인 경우 run_reproduction(replace_lock=true)으로 잠금을 갱신하세요.',
+          forbidden: ['원본 파일 직접 수정', 'DB 직접 수정'],
+        };
+        throw err;
+      }
+    }
+
     const proposalId = `prop_${Date.now().toString(36)}_${Math.random().toString(36).substring(2, 6)}`;
 
     // 2. Base commit to checkout in sandbox (use checkpoint worktree commit if available)

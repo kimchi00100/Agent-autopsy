@@ -22,6 +22,7 @@ import {
   DirectiveDeliveryStatus,
   ConfirmedIntentData,
   ReproductionResult,
+  ReproductionLock,
   CauseVerdict,
   AuditLogEntry,
   AuditLogKind,
@@ -163,6 +164,7 @@ export class AutopsyDatabase {
         cause_evidence_json TEXT DEFAULT '[]',
         reproduction_result_json TEXT,
         coverage_lines_json TEXT,
+        reproduction_lock_json TEXT,
         change_scope_summary_json TEXT,
         agent_name TEXT DEFAULT 'agent',
         session_id TEXT,
@@ -344,6 +346,7 @@ export class AutopsyDatabase {
       `ALTER TABLE incidents ADD COLUMN intents_json TEXT;`,
       `ALTER TABLE incidents ADD COLUMN missing_intents_json TEXT DEFAULT '[]';`,
       `ALTER TABLE incidents ADD COLUMN change_scope_summary_json TEXT;`,
+      `ALTER TABLE incidents ADD COLUMN reproduction_lock_json TEXT;`,
       `ALTER TABLE repair_proposals ADD COLUMN rejection_reason TEXT;`,
       `ALTER TABLE repair_proposals ADD COLUMN row_signature TEXT;`,
       `ALTER TABLE incidents ADD COLUMN row_signature TEXT;`,
@@ -1038,6 +1041,15 @@ export class AutopsyDatabase {
             }
           })()
         : undefined,
+      reproductionLock: row.reproduction_lock_json
+        ? (() => {
+            try {
+              return JSON.parse(row.reproduction_lock_json);
+            } catch {
+              return undefined;
+            }
+          })()
+        : undefined,
       rowSignature: row.row_signature || null,
       integrityStatus,
       integrityCode,
@@ -1125,6 +1137,13 @@ export class AutopsyDatabase {
       values.push(id);
       const updateStmt = this.db.prepare(`UPDATE incidents SET ${updates.join(', ')} WHERE id = ?`);
       updateStmt.run(...values);
+    });
+  }
+
+  public updateIncidentReproductionLock(id: string, lock: ReproductionLock | null): void {
+    this.runInImmediateTransaction(() => {
+      const stmt = this.db.prepare(`UPDATE incidents SET reproduction_lock_json = ? WHERE id = ?`);
+      stmt.run(lock ? JSON.stringify(lock) : null, id);
     });
   }
 

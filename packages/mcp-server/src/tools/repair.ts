@@ -106,7 +106,16 @@ server.tool(
         ],
       };
     } catch (error: any) {
-      if (error.code === 'BLOCKED_TEST_COMMAND_UNCONFIRMED' || error.message?.includes('BLOCKED_TEST_COMMAND_UNCONFIRMED')) {
+      const knownRejectionCodes = [
+        'BLOCKED_TEST_COMMAND_UNCONFIRMED',
+        'REPAIR_MODIFIES_LOCKED_TEST',
+        'LOCKED_TEST_MODIFIED',
+        'LOCK_SIGNATURE_INVALID',
+      ];
+      const matchedCode = knownRejectionCodes.find(
+        (c) => error.code === c || (error.message && error.message.includes(c))
+      );
+      if (matchedCode) {
         return {
           content: [
             {
@@ -114,13 +123,14 @@ server.tool(
               text: JSON.stringify(
                 {
                   success: false,
-                  status: 'BLOCKED_TEST_COMMAND_UNCONFIRMED',
+                  status: matchedCode,
+                  code: matchedCode,
                   message: error.message,
                   next_action: error.next_action || {
-                    actor: 'USER',
-                    action: 'CONFIRM_TEST_COMMAND_IN_APP',
-                    agent_should: '사용자에게 앱 대시보드에서 테스트 명령을 확인(확정)해 달라고 요청하거나 propose_test_command 도구로 명령을 제안하세요.',
-                    forbidden: ['원본 파일 직접 수정', 'DB 직접 수정', '검증 생략'],
+                    actor: 'AGENT',
+                    action: 'FIX_REPAIR',
+                    agent_should: `수정안 제출 거부 (${matchedCode}): ${error.message}`,
+                    forbidden: ['원본 파일 직접 수정', 'DB 직접 수정'],
                   },
                 },
                 null,

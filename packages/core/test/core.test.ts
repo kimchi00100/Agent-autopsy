@@ -13,7 +13,12 @@ import { Incident, ReproductionResult } from '../src/types.js';
 import { ApiServer } from '../src/server/api-server.js';
 import { WorktreeRunner } from '../src/runner/worktree-runner.js';
 import { analyzeIncident, parseStackFrames, STACK_TRACE_PATTERNS } from '../src/analysis/analyzer.js';
-import { verifyApprovalSignature } from '../src/utils/security.js';
+import {
+  verifyApprovalSignature,
+  getInstallationSecretKey,
+  verifyReproductionLockSignature,
+  computeNormalizedContentHash,
+} from '../src/utils/security.js';
 import {
   resolveDataDir,
   resolveCacheDir,
@@ -5456,5 +5461,367 @@ def test_slow():
     const reproParen = await core.runReproduction(pyRepo, inc.id, 'repro_paren.py', { preFlipTestFilePath: 'pre_paren.py' });
     assert.strictEqual(reproParen.status, 'REPRODUCED');
     assert.strictEqual(reproParen.assertFlip?.verdict, 'FLIP_CONFIRMED');
+  });
+
+  test('113. B-2 Step 4-2: REPRODUCED creates HMAC-signed reproduction lock and records REPRODUCTION_LOCKED in audit log', async () => {
+    const jsRepo = path.join(testRoot, 'b2_s42_t113_lock_creation');
+    fs.mkdirSync(jsRepo, { recursive: true });
+    execFileSync('git', ['init', '-b', 'main'], { cwd: jsRepo });
+    execFileSync('git', ['config', 'user.name', 'Tester'], { cwd: jsRepo });
+    execFileSync('git', ['config', 'user.email', 'test@local'], { cwd: jsRepo });
+
+    fs.writeFileSync(path.join(jsRepo, 'package.json'), JSON.stringify({ type: 'module' }));
+    fs.writeFileSync(path.join(jsRepo, 'calc.js'), 'export function add(a, b) { return a + b + 1; }\n');
+    execFileSync('git', ['add', '.'], { cwd: jsRepo });
+    execFileSync('git', ['commit', '-m', 'buggy calc'], { cwd: jsRepo });
+    core.captureCheckpoint(jsRepo, 'Initial checkpoint');
+
+    core.updateProjectSettings(jsRepo, { testCommand: 'node --test' });
+    const inc = await core.collectIncidentBundle(jsRepo, 'Lock Creation Incident', 'AssertionError');
+
+    fs.writeFileSync(
+      path.join(jsRepo, 'test_repro.js'),
+      'import test from "node:test";\nimport assert from "node:assert";\nimport { add } from "./calc.js";\n\ntest("repro", () => {\n  assert.strictEqual(add(1, 2), 3);\n});\n'
+    );
+
+    const reproRes = await core.runReproduction(jsRepo, inc.id, 'test_repro.js');
+    assert.strictEqual(reproRes.status, 'REPRODUCED');
+    assert.strictEqual(reproRes.lockStatus, 'LOCKED');
+    assert.ok(reproRes.reproductionLock, 'reproductionLock must be present');
+    assert.strictEqual(reproRes.reproductionLock.testFilePath, 'test_repro.js');
+
+    // Verify HMAC signature
+    const secret = getInstallationSecretKey();
+    const isValid = verifyReproductionLockSignature(secret, reproRes.reproductionLock);
+    assert.strictEqual(isValid, true, 'Reproduction lock signature must be valid');
+
+    // Verify stored in DB
+    const dbInc = core.getDatabase().getIncident(inc.id);
+    assert.ok(dbInc?.reproductionLock, 'Incident in DB must contain reproductionLock');
+    assert.strictEqual(dbInc?.reproductionLock?.testFilePath, 'test_repro.js');
+    assert.strictEqual(dbInc?.reproductionLock?.signature, reproRes.reproductionLock.signature);
+
+    // Verify audit log
+    const auditLogs = core.getAuditLogs();
+    const lockLog = auditLogs.find((l) => l.kind === 'REPRODUCTION_LOCKED' && l.entityId === inc.id);
+    assert.ok(lockLog, 'Audit log must record REPRODUCTION_LOCKED');
+  });
+
+  test('114. B-2 Step 4-2: FLAKY reproduction does NOT create reproduction lock', async () => {
+    const jsRepo = path.join(testRoot, 'b2_s42_t114_flaky_no_lock');
+    fs.mkdirSync(jsRepo, { recursive: true });
+    execFileSync('git', ['init', '-b', 'main'], { cwd: jsRepo });
+    execFileSync('git', ['config', 'user.name', 'Tester'], { cwd: jsRepo });
+    execFileSync('git', ['config', 'user.email', 'test@local'], { cwd: jsRepo });
+
+    fs.writeFileSync(path.join(jsRepo, 'package.json'), JSON.stringify({ type: 'module' }));
+    fs.writeFileSync(
+      path.join(jsRepo, 'state.json'),
+      JSON.stringify({ counter: 0 })
+    );
+    fs.writeFileSync(
+      path.join(jsRepo, 'calc.js'),
+      'import fs from "node:fs";\nexport function getVal() {\n  const data = JSON.parse(fs.readFileSync("./state.json", "utf8"));\n  data.counter++;\n  fs.writeFileSync("./state.json", JSON.stringify(data));\n  return data.counter % 2 === 1 ? 1 : 2;\n}\n'
+    );
+    execFileSync('git', ['add', '.'], { cwd: jsRepo });
+    execFileSync('git', ['commit', '-m', 'flaky code'], { cwd: jsRepo });
+    core.captureCheckpoint(jsRepo, 'Initial checkpoint');
+
+    core.updateProjectSettings(jsRepo, { testCommand: 'node --test' });
+    const inc = await core.collectIncidentBundle(jsRepo, 'Flaky Incident', 'AssertionError');
+
+    fs.writeFileSync(
+      path.join(jsRepo, 'test_repro.js'),
+      'import test from "node:test";\nimport assert from "node:assert";\nimport { getVal } from "./calc.js";\n\ntest("flaky", () => {\n  assert.strictEqual(getVal(), 2);\n});\n'
+    );
+
+    const reproRes = await core.runReproduction(jsRepo, inc.id, 'test_repro.js');
+    assert.strictEqual(reproRes.failureKind, 'FLAKY');
+    assert.notStrictEqual(reproRes.lockStatus, 'LOCKED');
+
+    const dbInc = core.getDatabase().getIncident(inc.id);
+    assert.ok(!dbInc?.reproductionLock, 'FLAKY incident must not have reproductionLock');
+
+    const auditLogs = core.getAuditLogs();
+    const lockLog = auditLogs.find((l) => l.kind === 'REPRODUCTION_LOCKED' && l.entityId === inc.id);
+    assert.ok(!lockLog, 'FLAKY incident must not have REPRODUCTION_LOCKED in audit log');
+  });
+
+  test('115. B-2 Step 4-2: Modifying locked test file on disk causes runReproduction to flag LOCKED_TEST_MODIFIED', async () => {
+    const jsRepo = path.join(testRoot, 'b2_s42_t115_repro_disk_modified');
+    fs.mkdirSync(jsRepo, { recursive: true });
+    execFileSync('git', ['init', '-b', 'main'], { cwd: jsRepo });
+    execFileSync('git', ['config', 'user.name', 'Tester'], { cwd: jsRepo });
+    execFileSync('git', ['config', 'user.email', 'test@local'], { cwd: jsRepo });
+
+    fs.writeFileSync(path.join(jsRepo, 'package.json'), JSON.stringify({ type: 'module' }));
+    fs.writeFileSync(path.join(jsRepo, 'calc.js'), 'export function add(a, b) { return a + b + 1; }\n');
+    execFileSync('git', ['add', '.'], { cwd: jsRepo });
+    execFileSync('git', ['commit', '-m', 'buggy calc'], { cwd: jsRepo });
+    core.captureCheckpoint(jsRepo, 'Initial checkpoint');
+
+    core.updateProjectSettings(jsRepo, { testCommand: 'node --test' });
+    const inc = await core.collectIncidentBundle(jsRepo, 'Repro Disk Mod Incident', 'AssertionError');
+
+    fs.writeFileSync(
+      path.join(jsRepo, 'test_repro.js'),
+      'import test from "node:test";\nimport assert from "node:assert";\nimport { add } from "./calc.js";\n\ntest("repro", () => {\n  assert.strictEqual(add(1, 2), 3);\n});\n'
+    );
+    const res1 = await core.runReproduction(jsRepo, inc.id, 'test_repro.js');
+    assert.strictEqual(res1.status, 'REPRODUCED');
+    assert.strictEqual(res1.lockStatus, 'LOCKED');
+
+    // Alter test_repro.js on disk
+    fs.writeFileSync(
+      path.join(jsRepo, 'test_repro.js'),
+      'import test from "node:test";\nimport assert from "node:assert";\nimport { add } from "./calc.js";\n\ntest("repro", () => {\n  assert.strictEqual(add(1, 2), 4);\n});\n'
+    );
+
+    const res2 = await core.runReproduction(jsRepo, inc.id, 'test_repro.js');
+    assert.strictEqual(res2.lockStatus, 'LOCKED_TEST_MODIFIED');
+    assert.ok(res2.lockWarning?.includes('디스크에서 변경'));
+    assert.strictEqual(res2.next_action?.action, 'RESTORE_OR_REPLACE_LOCK');
+  });
+
+  test('116. B-2 Step 4-2: Different test file without replace_lock keeps existing lock; replace_lock=true replaces with history', async () => {
+    const jsRepo = path.join(testRoot, 'b2_s42_t116_replace_lock');
+    fs.mkdirSync(jsRepo, { recursive: true });
+    execFileSync('git', ['init', '-b', 'main'], { cwd: jsRepo });
+    execFileSync('git', ['config', 'user.name', 'Tester'], { cwd: jsRepo });
+    execFileSync('git', ['config', 'user.email', 'test@local'], { cwd: jsRepo });
+
+    fs.writeFileSync(path.join(jsRepo, 'package.json'), JSON.stringify({ type: 'module' }));
+    fs.writeFileSync(path.join(jsRepo, 'calc.js'), 'export function add(a, b) { return a + b + 1; }\n');
+    execFileSync('git', ['add', '.'], { cwd: jsRepo });
+    execFileSync('git', ['commit', '-m', 'buggy calc'], { cwd: jsRepo });
+    core.captureCheckpoint(jsRepo, 'Initial checkpoint');
+
+    core.updateProjectSettings(jsRepo, { testCommand: 'node --test' });
+    const inc = await core.collectIncidentBundle(jsRepo, 'Lock Replace Incident', 'AssertionError');
+
+    fs.writeFileSync(
+      path.join(jsRepo, 'test_repro1.js'),
+      'import test from "node:test";\nimport assert from "node:assert";\nimport { add } from "./calc.js";\n\ntest("r1", () => {\n  assert.strictEqual(add(1, 2), 3);\n});\n'
+    );
+    const res1 = await core.runReproduction(jsRepo, inc.id, 'test_repro1.js');
+    assert.strictEqual(res1.status, 'REPRODUCED');
+    assert.strictEqual(res1.lockStatus, 'LOCKED');
+    assert.strictEqual(res1.reproductionLock?.testFilePath, 'test_repro1.js');
+
+    // Create a second test file
+    fs.writeFileSync(
+      path.join(jsRepo, 'test_repro2.js'),
+      'import test from "node:test";\nimport assert from "node:assert";\nimport { add } from "./calc.js";\n\ntest("r2", () => {\n  assert.strictEqual(add(2, 2), 4);\n});\n'
+    );
+
+    // Run reproduction with test_repro2.js without replace_lock -> keeps existing lock
+    const res2 = await core.runReproduction(jsRepo, inc.id, 'test_repro2.js');
+    assert.strictEqual(res2.status, 'REPRODUCED');
+    assert.strictEqual(res2.lockStatus, 'LOCK_KEPT');
+    assert.strictEqual(res2.reproductionLock?.testFilePath, 'test_repro1.js');
+    assert.ok(res2.lockWarning?.includes('잠금된 테스트와 다름'));
+    assert.strictEqual(res2.next_action?.action, 'REUSE_OR_REPLACE_LOCK');
+
+    // Run reproduction with replace_lock: true and replace_reason
+    const res3 = await core.runReproduction(jsRepo, inc.id, 'test_repro2.js', {
+      replace_lock: true,
+      replace_reason: '더 포괄적인 경계값 검증 테스트로 교체',
+    });
+    assert.strictEqual(res3.status, 'REPRODUCED');
+    assert.strictEqual(res3.lockStatus, 'LOCK_REPLACED');
+    assert.strictEqual(res3.reproductionLock?.testFilePath, 'test_repro2.js');
+    assert.strictEqual(res3.reproductionLock?.history?.length, 1);
+    assert.strictEqual(res3.reproductionLock?.history?.[0].testFilePath, 'test_repro1.js');
+    assert.strictEqual(res3.reproductionLock?.history?.[0].replaceReason, '더 포괄적인 경계값 검증 테스트로 교체');
+
+    const auditLogs = core.getAuditLogs();
+    const replaceLog = auditLogs.find((l) => l.kind === 'REPRODUCTION_LOCK_REPLACED' && l.entityId === inc.id);
+    assert.ok(replaceLog, 'Audit log must record REPRODUCTION_LOCK_REPLACED');
+  });
+
+  test('117. B-2 Step 4-2: proposeAndVerifyRepair modifying locked test file is rejected with REPAIR_MODIFIES_LOCKED_TEST', async () => {
+    const jsRepo = path.join(testRoot, 'b2_s42_t117_repair_modifies_locked');
+    fs.mkdirSync(jsRepo, { recursive: true });
+    execFileSync('git', ['init', '-b', 'main'], { cwd: jsRepo });
+    execFileSync('git', ['config', 'user.name', 'Tester'], { cwd: jsRepo });
+    execFileSync('git', ['config', 'user.email', 'test@local'], { cwd: jsRepo });
+
+    fs.writeFileSync(path.join(jsRepo, 'package.json'), JSON.stringify({ type: 'module' }));
+    fs.writeFileSync(path.join(jsRepo, 'calc.js'), 'export function add(a, b) { return a + b + 1; }\n');
+    execFileSync('git', ['add', '.'], { cwd: jsRepo });
+    execFileSync('git', ['commit', '-m', 'buggy calc'], { cwd: jsRepo });
+    core.captureCheckpoint(jsRepo, 'Initial checkpoint');
+
+    core.updateProjectSettings(jsRepo, { testCommand: 'node --test' });
+    const inc = await core.collectIncidentBundle(jsRepo, 'Locked Test Repair Tamper', 'AssertionError');
+
+    const reproCode = 'import test from "node:test";\nimport assert from "node:assert";\nimport { add } from "./calc.js";\n\ntest("repro", () => {\n  assert.strictEqual(add(1, 2), 3);\n});\n';
+    fs.writeFileSync(path.join(jsRepo, 'test_repro.js'), reproCode);
+
+    const reproRes = await core.runReproduction(jsRepo, inc.id, 'test_repro.js');
+    assert.strictEqual(reproRes.status, 'REPRODUCED');
+    assert.strictEqual(reproRes.lockStatus, 'LOCKED');
+
+    // Proposal attempts to modify test_repro.js
+    await assert.rejects(
+      async () => {
+        await core.proposeAndVerifyRepair(jsRepo, inc.id, '재현 테스트 수정 시도', [
+          { filePath: 'test_repro.js', replacements: [{ search: '3', replace: '4' }] },
+        ]);
+      },
+      (err: any) => {
+        assert.strictEqual(err.code, 'REPAIR_MODIFIES_LOCKED_TEST');
+        assert.strictEqual(err.next_action?.action, 'REMOVE_TEST_CHANGES_FROM_REPAIR');
+        return true;
+      }
+    );
+
+    // Verify original test file is untouched
+    const currentContent = fs.readFileSync(path.join(jsRepo, 'test_repro.js'), 'utf8');
+    assert.strictEqual(currentContent, reproCode);
+  });
+
+  test('118. B-2 Step 4-2: proposeAndVerifyRepair when locked test is modified on disk is rejected with LOCKED_TEST_MODIFIED', async () => {
+    const jsRepo = path.join(testRoot, 'b2_s42_t118_disk_modified_repair');
+    fs.mkdirSync(jsRepo, { recursive: true });
+    execFileSync('git', ['init', '-b', 'main'], { cwd: jsRepo });
+    execFileSync('git', ['config', 'user.name', 'Tester'], { cwd: jsRepo });
+    execFileSync('git', ['config', 'user.email', 'test@local'], { cwd: jsRepo });
+
+    fs.writeFileSync(path.join(jsRepo, 'package.json'), JSON.stringify({ type: 'module' }));
+    fs.writeFileSync(path.join(jsRepo, 'calc.js'), 'export function add(a, b) { return a + b + 1; }\n');
+    execFileSync('git', ['add', '.'], { cwd: jsRepo });
+    execFileSync('git', ['commit', '-m', 'buggy calc'], { cwd: jsRepo });
+    core.captureCheckpoint(jsRepo, 'Initial checkpoint');
+
+    core.updateProjectSettings(jsRepo, { testCommand: 'node --test' });
+    const inc = await core.collectIncidentBundle(jsRepo, 'Disk Modified Repair Tamper', 'AssertionError');
+
+    fs.writeFileSync(
+      path.join(jsRepo, 'test_repro.js'),
+      'import test from "node:test";\nimport assert from "node:assert";\nimport { add } from "./calc.js";\n\ntest("repro", () => {\n  assert.strictEqual(add(1, 2), 3);\n});\n'
+    );
+
+    const reproRes = await core.runReproduction(jsRepo, inc.id, 'test_repro.js');
+    assert.strictEqual(reproRes.status, 'REPRODUCED');
+    assert.strictEqual(reproRes.lockStatus, 'LOCKED');
+
+    // Modify test_repro.js on disk
+    fs.writeFileSync(
+      path.join(jsRepo, 'test_repro.js'),
+      'import test from "node:test";\nimport assert from "node:assert";\nimport { add } from "./calc.js";\n\ntest("repro", () => {\n  assert.strictEqual(add(1, 2), 4);\n});\n'
+    );
+
+    // Proposal modifying calc.js should be rejected
+    await assert.rejects(
+      async () => {
+        await core.proposeAndVerifyRepair(jsRepo, inc.id, '정상 수정안 제출', [
+          { filePath: 'calc.js', replacements: [{ search: 'a + b + 1', replace: 'a + b' }] },
+        ]);
+      },
+      (err: any) => {
+        assert.strictEqual(err.code, 'LOCKED_TEST_MODIFIED');
+        assert.strictEqual(err.next_action?.action, 'RESTORE_OR_REPLACE_LOCK');
+        return true;
+      }
+    );
+  });
+
+  test('119. B-2 Step 4-2: External process tampering with lock JSON hash is rejected with LOCK_SIGNATURE_INVALID', async () => {
+    const jsRepo = path.join(testRoot, 'b2_s42_t119_tamper_signature');
+    fs.mkdirSync(jsRepo, { recursive: true });
+    execFileSync('git', ['init', '-b', 'main'], { cwd: jsRepo });
+    execFileSync('git', ['config', 'user.name', 'Tester'], { cwd: jsRepo });
+    execFileSync('git', ['config', 'user.email', 'test@local'], { cwd: jsRepo });
+
+    fs.writeFileSync(path.join(jsRepo, 'package.json'), JSON.stringify({ type: 'module' }));
+    fs.writeFileSync(path.join(jsRepo, 'calc.js'), 'export function add(a, b) { return a + b + 1; }\n');
+    execFileSync('git', ['add', '.'], { cwd: jsRepo });
+    execFileSync('git', ['commit', '-m', 'buggy calc'], { cwd: jsRepo });
+    core.captureCheckpoint(jsRepo, 'Initial checkpoint');
+
+    core.updateProjectSettings(jsRepo, { testCommand: 'node --test' });
+    const inc = await core.collectIncidentBundle(jsRepo, 'Lock Tamper Incident', 'AssertionError');
+
+    fs.writeFileSync(
+      path.join(jsRepo, 'test_repro.js'),
+      'import test from "node:test";\nimport assert from "node:assert";\nimport { add } from "./calc.js";\n\ntest("repro", () => {\n  assert.strictEqual(add(1, 2), 3);\n});\n'
+    );
+    const reproRes = await core.runReproduction(jsRepo, inc.id, 'test_repro.js');
+    assert.strictEqual(reproRes.status, 'REPRODUCED');
+    assert.strictEqual(reproRes.lockStatus, 'LOCKED');
+
+    // Separate external process directly opens the DB and tampers with reproduction_lock_json
+    const tamperScript = `
+      const { DatabaseSync } = require('node:sqlite');
+      const db = new DatabaseSync(${JSON.stringify(dbPath)});
+      const row = db.prepare('SELECT reproduction_lock_json FROM incidents WHERE id = ?').get(${JSON.stringify(inc.id)});
+      const lock = JSON.parse(row.reproduction_lock_json);
+      lock.contentHash = '0000000000000000000000000000000000000000000000000000000000000000';
+      db.prepare('UPDATE incidents SET reproduction_lock_json = ? WHERE id = ?').run(JSON.stringify(lock), ${JSON.stringify(inc.id)});
+      db.close();
+    `;
+    execFileSync(process.execPath, ['-e', tamperScript], {
+      env: {
+        ...process.env,
+        AUTOPSY_DATA_DIR: process.env.AUTOPSY_DATA_DIR,
+        AUTOPSY_CACHE_DIR: process.env.AUTOPSY_CACHE_DIR,
+      },
+    });
+
+    // Attempting to propose repair must be rejected with LOCK_SIGNATURE_INVALID
+    await assert.rejects(
+      async () => {
+        await core.proposeAndVerifyRepair(jsRepo, inc.id, '수정안 제출', [
+          { filePath: 'calc.js', replacements: [{ search: 'a + b + 1', replace: 'a + b' }] },
+        ]);
+      },
+      (err: any) => {
+        assert.strictEqual(err.code, 'LOCK_SIGNATURE_INVALID');
+        assert.strictEqual(err.next_action?.action, 'INVESTIGATE_TAMPER');
+        return true;
+      }
+    );
+  });
+
+  test('120. B-2 Step 4-2: CRLF vs LF only differences produce same content hash without false positive tamper', async () => {
+    const jsRepo = path.join(testRoot, 'b2_s42_t120_crlf_lf_equiv');
+    fs.mkdirSync(jsRepo, { recursive: true });
+    execFileSync('git', ['init', '-b', 'main'], { cwd: jsRepo });
+    execFileSync('git', ['config', 'user.name', 'Tester'], { cwd: jsRepo });
+    execFileSync('git', ['config', 'user.email', 'test@local'], { cwd: jsRepo });
+
+    fs.writeFileSync(path.join(jsRepo, 'package.json'), JSON.stringify({ type: 'module' }));
+    fs.writeFileSync(path.join(jsRepo, 'calc.js'), 'export function add(a, b) { return a + b + 1; }\n');
+    execFileSync('git', ['add', '.'], { cwd: jsRepo });
+    execFileSync('git', ['commit', '-m', 'buggy calc'], { cwd: jsRepo });
+    core.captureCheckpoint(jsRepo, 'Initial checkpoint');
+
+    core.updateProjectSettings(jsRepo, { testCommand: 'node --test' });
+    const inc = await core.collectIncidentBundle(jsRepo, 'CRLF test incident', 'AssertionError');
+
+    // Create test with LF
+    const testCodeLF = 'import test from "node:test";\nimport assert from "node:assert";\nimport { add } from "./calc.js";\n\ntest("repro", () => {\n  assert.strictEqual(add(1, 2), 3);\n});\n';
+    fs.writeFileSync(path.join(jsRepo, 'test_repro.js'), testCodeLF);
+
+    const reproRes = await core.runReproduction(jsRepo, inc.id, 'test_repro.js');
+    assert.strictEqual(reproRes.status, 'REPRODUCED');
+    assert.strictEqual(reproRes.lockStatus, 'LOCKED');
+
+    // Overwrite test file on disk with CRLF
+    const testCodeCRLF = testCodeLF.replace(/\n/g, '\r\n');
+    fs.writeFileSync(path.join(jsRepo, 'test_repro.js'), testCodeCRLF);
+
+    // Verify that content hashes are identical
+    assert.strictEqual(
+      computeNormalizedContentHash(testCodeLF),
+      computeNormalizedContentHash(testCodeCRLF)
+    );
+
+    // Propose repair: should NOT reject with LOCKED_TEST_MODIFIED
+    const { proposal } = await core.proposeAndVerifyRepair(jsRepo, inc.id, '수정안 제출', [
+      { filePath: 'calc.js', replacements: [{ search: 'a + b + 1', replace: 'a + b' }] },
+    ]);
+    assert.strictEqual(proposal.verificationStatus, 'VERIFIED_PASS');
   });
 });

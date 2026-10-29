@@ -160,10 +160,43 @@ export interface AssertFlipResult {
   note?: string;
 }
 
+export interface ReproductionLockHistoryEntry {
+  testFilePath: string;
+  contentHash: string;
+  lockedAt: string;
+  baselineVerdict?: BaselineComparisonVerdict;
+  assertFlipVerdict?: AssertFlipVerdict;
+  preFlipFilePath?: string;
+  preFlipContentHash?: string;
+  replaceReason?: string;
+}
+
+export interface ReproductionLock {
+  testFilePath: string;
+  contentHash: string;
+  lockedAt: string;
+  baselineVerdict?: BaselineComparisonVerdict;
+  assertFlipVerdict?: AssertFlipVerdict;
+  preFlipFilePath?: string;
+  preFlipContentHash?: string;
+  history?: ReproductionLockHistoryEntry[];
+  signature?: string;
+}
+
+export type ReproductionLockStatus =
+  | 'LOCKED'
+  | 'LOCK_KEPT'
+  | 'LOCK_REPLACED'
+  | 'LOCKED_TEST_MODIFIED'
+  | 'LOCK_SIGNATURE_INVALID'
+  | 'UNLOCKED';
+
 export interface RunReproductionOptions {
   baselineCheckpointId?: string;
   preFlipTestFilePath?: string;
   timeoutMs?: number;
+  replace_lock?: boolean;
+  replace_reason?: string;
 }
 
 export interface ReproductionResult {
@@ -179,6 +212,10 @@ export interface ReproductionResult {
   testCount?: number;
   baselineComparison?: BaselineComparison;
   assertFlip?: AssertFlipResult;
+  lockStatus?: ReproductionLockStatus;
+  reproductionLock?: ReproductionLock;
+  lockWarning?: string;
+  next_action?: NextAction;
 }
 
 export type Severity = 'HIGH' | 'MEDIUM' | 'LOW' | 'UNASSESSED';
@@ -306,6 +343,7 @@ export interface Incident {
   rowSignature?: string | null;
   integrityStatus?: IncidentIntegrityStatus;
   integrityCode?: IncidentIntegrityCode;
+  reproductionLock?: ReproductionLock | null;
   createdAt: string;
 }
 
@@ -713,7 +751,10 @@ export type AuditLogKind =
   | 'PROPOSAL_REJECTED'
   | 'REPAIR_APPLIED'
   | 'TAMPERED_DETECTED'
-  | 'ROLLBACK_EXECUTED';
+  | 'ROLLBACK_EXECUTED'
+  | 'REPRODUCTION_LOCKED'
+  | 'REPRODUCTION_LOCK_REPLACED'
+  | 'REPAIR_REJECTED';
 
 export type AuditEntityType = 'INCIDENT' | 'PROPOSAL' | 'PROJECT' | 'CHECKPOINT';
 

@@ -5012,4 +5012,196 @@ def test_slow():
     const diffFiles = filesAfter.filter((f) => !filesBefore.includes(f));
     assert.deepStrictEqual(diffFiles, [], 'No files should be created outside the repository');
   });
+
+  test('103. B-2 Step 4-1: multiline function call input argument change in pytest -> FLIP_CHANGED_NON_ASSERTION and nonAssertionChangedLines recorded', async () => {
+    const pyRepo = path.join(testRoot, 'b2_s41_t103_pytest_multiline_input');
+    fs.mkdirSync(pyRepo, { recursive: true });
+    execFileSync('git', ['init', '-b', 'main'], { cwd: pyRepo });
+    execFileSync('git', ['config', 'user.name', 'Tester'], { cwd: pyRepo });
+    execFileSync('git', ['config', 'user.email', 'test@local'], { cwd: pyRepo });
+
+    // Returns 3 when a=1, b=2 (wrong value), else a+b
+    fs.writeFileSync(
+      path.join(pyRepo, 'calc.py'),
+      'def add(a, b):\n    if a == 1 and b == 2:\n        return 3\n    return a + b\n'
+    );
+    execFileSync('git', ['add', '.'], { cwd: pyRepo });
+    execFileSync('git', ['commit', '-m', 'buggy calc'], { cwd: pyRepo });
+    core.captureCheckpoint(pyRepo, 'Bug state');
+
+    const inc = await core.collectIncidentBundle(pyRepo, 'pytest multiline input bug', 'AssertionError');
+    core.updateProjectSettings(pyRepo, { testCommand: 'python -m pytest' });
+
+    // pre_test.py passes on buggy code: x = add(1, 2) -> 3 == 3
+    fs.writeFileSync(
+      path.join(pyRepo, 'pre_test.py'),
+      'from calc import add\n\ndef test_add():\n    x = add(\n        1,\n        2)\n    assert x == 3\n'
+    );
+    // test_repro.py fails on buggy code: x = add(1, 1) -> 2 != 3
+    fs.writeFileSync(
+      path.join(pyRepo, 'test_repro.py'),
+      'from calc import add\n\ndef test_add():\n    x = add(\n        1,\n        1)\n    assert x == 3\n'
+    );
+
+    const repro = await core.runReproduction(pyRepo, inc.id, 'test_repro.py', {
+      preFlipTestFilePath: 'pre_test.py',
+    });
+
+    assert.strictEqual(repro.status, 'REPRODUCED');
+    assert.ok(repro.assertFlip, 'assertFlip must be defined');
+    assert.strictEqual(repro.assertFlip.verdict, 'FLIP_CHANGED_NON_ASSERTION');
+    assert.ok(
+      repro.assertFlip.nonAssertionChangedLines && repro.assertFlip.nonAssertionChangedLines.length > 0,
+      'nonAssertionChangedLines must not be empty'
+    );
+    assert.ok(
+      repro.assertFlip.nonAssertionChangedLines.some((l) => l.content.includes('2)') || l.content.includes('1)')),
+      'nonAssertionChangedLines must contain changed input line'
+    );
+  });
+
+  test('104. B-2 Step 4-1: multiline function call input argument change in node:test -> FLIP_CHANGED_NON_ASSERTION and nonAssertionChangedLines recorded', async () => {
+    const jsRepo = path.join(testRoot, 'b2_s41_t104_node_multiline_input');
+    fs.mkdirSync(jsRepo, { recursive: true });
+    execFileSync('git', ['init', '-b', 'main'], { cwd: jsRepo });
+    execFileSync('git', ['config', 'user.name', 'Tester'], { cwd: jsRepo });
+    execFileSync('git', ['config', 'user.email', 'test@local'], { cwd: jsRepo });
+
+    fs.writeFileSync(path.join(jsRepo, 'package.json'), JSON.stringify({ type: 'module' }));
+    fs.writeFileSync(
+      path.join(jsRepo, 'calc.js'),
+      'export function add(a, b) {\n  if (a === 1 && b === 2) return 3;\n  return a + b;\n}\n'
+    );
+    execFileSync('git', ['add', '.'], { cwd: jsRepo });
+    execFileSync('git', ['commit', '-m', 'buggy calc'], { cwd: jsRepo });
+    core.captureCheckpoint(jsRepo, 'Bug state');
+
+    const inc = await core.collectIncidentBundle(jsRepo, 'node multiline input bug', 'AssertionError');
+    core.updateProjectSettings(jsRepo, { testCommand: 'node --test' });
+
+    fs.writeFileSync(
+      path.join(jsRepo, 'pre_test.js'),
+      'import test from "node:test";\nimport assert from "node:assert";\nimport { add } from "./calc.js";\n\ntest("test add", () => {\n  const x = add(\n    1,\n    2\n  );\n  assert.strictEqual(x, 3);\n});\n'
+    );
+    fs.writeFileSync(
+      path.join(jsRepo, 'test_repro.js'),
+      'import test from "node:test";\nimport assert from "node:assert";\nimport { add } from "./calc.js";\n\ntest("test add", () => {\n  const x = add(\n    1,\n    1\n  );\n  assert.strictEqual(x, 3);\n});\n'
+    );
+
+    const repro = await core.runReproduction(jsRepo, inc.id, 'test_repro.js', {
+      preFlipTestFilePath: 'pre_test.js',
+    });
+
+    assert.strictEqual(repro.status, 'REPRODUCED');
+    assert.ok(repro.assertFlip, 'assertFlip must be defined');
+    assert.strictEqual(repro.assertFlip.verdict, 'FLIP_CHANGED_NON_ASSERTION');
+    assert.ok(
+      repro.assertFlip.nonAssertionChangedLines && repro.assertFlip.nonAssertionChangedLines.length > 0,
+      'nonAssertionChangedLines must not be empty'
+    );
+    assert.ok(
+      repro.assertFlip.nonAssertionChangedLines.some((l) => l.content.includes('2') || l.content.includes('1')),
+      'nonAssertionChangedLines must contain changed input line'
+    );
+  });
+
+  test('105. B-2 Step 4-1: multiline assertion expected value change in unittest and node:test -> FLIP_CONFIRMED', async () => {
+    // 1) unittest
+    const pyRepo = path.join(testRoot, 'b2_s41_t105_unittest_multiline_expect');
+    fs.mkdirSync(pyRepo, { recursive: true });
+    execFileSync('git', ['init', '-b', 'main'], { cwd: pyRepo });
+    execFileSync('git', ['config', 'user.name', 'Tester'], { cwd: pyRepo });
+    execFileSync('git', ['config', 'user.email', 'test@local'], { cwd: pyRepo });
+
+    fs.writeFileSync(path.join(pyRepo, 'calc.py'), 'def add(a, b):\n    return a + b + 1\n');
+    execFileSync('git', ['add', '.'], { cwd: pyRepo });
+    execFileSync('git', ['commit', '-m', 'buggy calc'], { cwd: pyRepo });
+    core.captureCheckpoint(pyRepo, 'Bug state');
+
+    const inc1 = await core.collectIncidentBundle(pyRepo, 'unittest multiline expected bug', 'AssertionError');
+    core.updateProjectSettings(pyRepo, { testCommand: 'python -m unittest' });
+
+    fs.writeFileSync(
+      path.join(pyRepo, 'pre_test.py'),
+      'import unittest\nfrom calc import add\n\nclass TestCalc(unittest.TestCase):\n    def test_add(self):\n        self.assertEqual(\n            add(1, 2),\n            4)\n'
+    );
+    fs.writeFileSync(
+      path.join(pyRepo, 'test_repro.py'),
+      'import unittest\nfrom calc import add\n\nclass TestCalc(unittest.TestCase):\n    def test_add(self):\n        self.assertEqual(\n            add(1, 2),\n            3)\n'
+    );
+
+    const repro1 = await core.runReproduction(pyRepo, inc1.id, 'test_repro.py', {
+      preFlipTestFilePath: 'pre_test.py',
+    });
+
+    assert.strictEqual(repro1.status, 'REPRODUCED');
+    assert.ok(repro1.assertFlip, 'assertFlip must be defined');
+    assert.strictEqual(repro1.assertFlip.verdict, 'FLIP_CONFIRMED');
+
+    // 2) node:test
+    const jsRepo = path.join(testRoot, 'b2_s41_t105_node_multiline_expect');
+    fs.mkdirSync(jsRepo, { recursive: true });
+    execFileSync('git', ['init', '-b', 'main'], { cwd: jsRepo });
+    execFileSync('git', ['config', 'user.name', 'Tester'], { cwd: jsRepo });
+    execFileSync('git', ['config', 'user.email', 'test@local'], { cwd: jsRepo });
+
+    fs.writeFileSync(path.join(jsRepo, 'package.json'), JSON.stringify({ type: 'module' }));
+    fs.writeFileSync(path.join(jsRepo, 'calc.js'), 'export function add(a, b) {\n  return a + b + 1;\n}\n');
+    execFileSync('git', ['add', '.'], { cwd: jsRepo });
+    execFileSync('git', ['commit', '-m', 'buggy calc'], { cwd: jsRepo });
+    core.captureCheckpoint(jsRepo, 'Bug state');
+
+    const inc2 = await core.collectIncidentBundle(jsRepo, 'node multiline expected bug', 'AssertionError');
+    core.updateProjectSettings(jsRepo, { testCommand: 'node --test' });
+
+    fs.writeFileSync(
+      path.join(jsRepo, 'pre_test.js'),
+      'import test from "node:test";\nimport assert from "node:assert";\nimport { add } from "./calc.js";\n\ntest("test add", () => {\n  assert.strictEqual(\n    add(1, 2),\n    4\n  );\n});\n'
+    );
+    fs.writeFileSync(
+      path.join(jsRepo, 'test_repro.js'),
+      'import test from "node:test";\nimport assert from "node:assert";\nimport { add } from "./calc.js";\n\ntest("test add", () => {\n  assert.strictEqual(\n    add(1, 2),\n    3\n  );\n});\n'
+    );
+
+    const repro2 = await core.runReproduction(jsRepo, inc2.id, 'test_repro.js', {
+      preFlipTestFilePath: 'pre_test.js',
+    });
+
+    assert.strictEqual(repro2.status, 'REPRODUCED');
+    assert.ok(repro2.assertFlip, 'assertFlip must be defined');
+    assert.strictEqual(repro2.assertFlip.verdict, 'FLIP_CONFIRMED');
+  });
+
+  test('106. B-2 Step 4-1: brackets inside comments and string literals do not distort statement boundary tracking', async () => {
+    const pyRepo = path.join(testRoot, 'b2_s41_t106_bracket_in_comments_strings');
+    fs.mkdirSync(pyRepo, { recursive: true });
+    execFileSync('git', ['init', '-b', 'main'], { cwd: pyRepo });
+    execFileSync('git', ['config', 'user.name', 'Tester'], { cwd: pyRepo });
+    execFileSync('git', ['config', 'user.email', 'test@local'], { cwd: pyRepo });
+
+    fs.writeFileSync(path.join(pyRepo, 'calc.py'), 'def get_msg():\n    return "hello (world ["\n');
+    execFileSync('git', ['add', '.'], { cwd: pyRepo });
+    execFileSync('git', ['commit', '-m', 'msg calc'], { cwd: pyRepo });
+    core.captureCheckpoint(pyRepo, 'Bug state');
+
+    const inc = await core.collectIncidentBundle(pyRepo, 'comment bracket test', 'AssertionError');
+    core.updateProjectSettings(pyRepo, { testCommand: 'python -m pytest' });
+
+    fs.writeFileSync(
+      path.join(pyRepo, 'pre_test.py'),
+      'from calc import get_msg\n\ndef test_msg():\n    # Comment with open paren ( and brace {\n    msg = get_msg()\n    assert msg == "hello (world ["\n'
+    );
+    fs.writeFileSync(
+      path.join(pyRepo, 'test_repro.py'),
+      'from calc import get_msg\n\ndef test_msg():\n    # Comment with open paren ( and brace {\n    msg = get_msg()\n    assert msg == "hello (world ]"\n'
+    );
+
+    const repro = await core.runReproduction(pyRepo, inc.id, 'test_repro.py', {
+      preFlipTestFilePath: 'pre_test.py',
+    });
+
+    assert.strictEqual(repro.status, 'REPRODUCED');
+    assert.ok(repro.assertFlip, 'assertFlip must be defined');
+    assert.strictEqual(repro.assertFlip.verdict, 'FLIP_CONFIRMED');
+  });
 });

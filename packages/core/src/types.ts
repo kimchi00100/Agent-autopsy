@@ -97,7 +97,13 @@ export interface Checkpoint {
 export const MAX_REPRODUCTION_ATTEMPTS = 3;
 export const ADDITIONAL_ATTEMPTS_PER_GRANT = 3;
 
-export type ReproductionGateState = 'NOT_ATTEMPTED' | 'IN_PROGRESS' | 'REPRODUCED' | 'ABANDONED' | 'WAIVED';
+export type ReproductionGateState =
+  | 'NOT_ATTEMPTED'
+  | 'IN_PROGRESS'
+  | 'REPRODUCED'
+  | 'ABANDONED'
+  | 'WAIVED'
+  | 'AUDIT_BROKEN';
 
 export interface ReproductionGateAttempt {
   attemptedAt: string;
@@ -784,7 +790,8 @@ export type AuditLogKind =
   | 'REPRODUCTION_SUCCEEDED'
   | 'REPRODUCTION_ABANDONED'
   | 'REPRODUCTION_WAIVED'
-  | 'REPRODUCTION_ATTEMPTS_GRANTED';
+  | 'REPRODUCTION_ATTEMPTS_GRANTED'
+  | 'HEAD_ANCHOR_INITIALIZED';
 
 export type AuditEntityType = 'INCIDENT' | 'PROPOSAL' | 'PROJECT' | 'CHECKPOINT';
 
@@ -799,13 +806,30 @@ export interface AuditLogEntry {
   entryHash: string;
 }
 
+export type AuditChainBrokenReasonCode =
+  | 'VALUE_MODIFIED'
+  | 'ORDER_OR_DELETION'
+  | 'KEY_MISMATCH'
+  | 'TRUNCATED'
+  | 'HEAD_MISMATCH'
+  | 'HEAD_ANCHOR_INVALID'
+  | 'HEAD_ANCHOR_MISSING'
+  | string;
+
 export interface AuditChainVerificationResult {
   valid: boolean;
   status: 'OK' | 'BROKEN';
   totalCount: number;
   brokenSeq?: number;
-  reason?: '값 변경' | '항목 삭제/순서 변경' | '키 불일치';
-  reasonCode?: 'VALUE_MODIFIED' | 'ORDER_OR_DELETION' | 'KEY_MISMATCH';
+  reason?: '값 변조' | '항목 삭제/순서 변경' | '키 불일치' | '끝부분 절단' | '기준점 해시 불일치' | '기준점 서명 불일치' | '기준점 누락' | '기준점 손상' | string;
+  reasonCode?: AuditChainBrokenReasonCode;
   message: string;
+}
+
+export interface AuditHeadAnchor {
+  seq: number;
+  entryHash: string;
+  updatedAt: string;
+  signature: string;
 }
 

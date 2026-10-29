@@ -294,6 +294,37 @@ server.tool(
         ],
       };
     } catch (error: any) {
+      if (error.code === 'AUDIT_CHAIN_BROKEN') {
+        const gate = coreManager.getReproductionGateState(incidentId);
+        return {
+          isError: true,
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify(
+                {
+                  success: false,
+                  error: error.message,
+                  code: error.code,
+                  gate: {
+                    state: gate.state,
+                    attempts_used: gate.attemptsUsed,
+                    attempts_allowed: gate.attemptsAllowed,
+                  },
+                  next_action: error.next_action || {
+                    actor: 'USER',
+                    action: 'STOP_AND_REPORT',
+                    agent_should: '감사 기록이 바깥에서 변경되었다. 더 진행하지 말고 사용자에게 알린다.',
+                    forbidden: ['DB 직접 수정', '감사 기록 수정', 'audit_head.json 수정'],
+                  },
+                },
+                null,
+                2
+              ),
+            },
+          ],
+        };
+      }
       if (error.code === 'REPRODUCTION_ABANDONED') {
         const gate = coreManager.getReproductionGateState(incidentId);
         return {

@@ -114,6 +114,7 @@ server.tool(
         'LOCK_REMOVED',
         'INVALID_FILE_PATH',
         'REPRODUCTION_ABANDONED',
+        'AUDIT_CHAIN_BROKEN',
       ];
       const matchedCode = knownRejectionCodes.find(
         (c) => error.code === c || (error.message && error.message.includes(c))
@@ -129,7 +130,12 @@ server.tool(
                   status: matchedCode,
                   code: matchedCode,
                   message: error.message,
-                  next_action: error.next_action || (matchedCode === 'REPRODUCTION_ABANDONED' ? {
+                  next_action: error.next_action || (matchedCode === 'AUDIT_CHAIN_BROKEN' ? {
+                    actor: 'USER',
+                    action: 'STOP_AND_REPORT',
+                    agent_should: '감사 기록이 바깥에서 변경되었다. 더 진행하지 말고 사용자에게 알린다.',
+                    forbidden: ['DB 직접 수정', '감사 기록 수정', 'audit_head.json 수정'],
+                  } : matchedCode === 'REPRODUCTION_ABANDONED' ? {
                     actor: 'USER',
                     action: 'ABSTAIN_REPRODUCTION',
                     agent_should: "재현 시도를 멈추고, 시도한 테스트와 실패 이유를 사용자에게 짧게 요약한 뒤, Agent Autopsy 앱에서 '재현 없이 진행' 또는 '시도 더 허락'을 결정해 달라고 요청한다.",

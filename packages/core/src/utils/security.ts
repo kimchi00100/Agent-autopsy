@@ -2,7 +2,7 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as crypto from 'node:crypto';
 import { resolveDataDir } from './paths.js';
-import { FileChange, ReproductionLock } from '../types.js';
+import { FileChange, ReproductionLock, AuditHeadAnchor } from '../types.js';
 
 let cachedSecretKey: string | null = null;
 
@@ -318,6 +318,40 @@ export function verifyReproductionLockSignature(
   const expected = computeReproductionLockSignature(secretKey, lock);
   try {
     const a = Buffer.from(lock.signature, 'hex');
+    const b = Buffer.from(expected, 'hex');
+    if (a.length !== b.length) return false;
+    return crypto.timingSafeEqual(a, b);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Computes an HMAC-SHA256 signature for the audit head anchor (audit_head.json).
+ */
+export function computeAuditHeadSignature(
+  secretKey: string,
+  payload: { seq: number; entryHash: string; updatedAt: string }
+): string {
+  const data = `audit_head:${payload.seq}:${payload.entryHash}:${payload.updatedAt}`;
+  return crypto.createHmac('sha256', secretKey).update(data).digest('hex');
+}
+
+/**
+ * Verifies the cryptographic HMAC signature of an audit head anchor.
+ */
+export function verifyAuditHeadSignature(
+  secretKey: string,
+  anchor: AuditHeadAnchor | { seq: number; entryHash: string; updatedAt: string; signature?: string }
+): boolean {
+  if (!anchor || !anchor.signature || typeof anchor.signature !== 'string') return false;
+  const expected = computeAuditHeadSignature(secretKey, {
+    seq: Number(anchor.seq),
+    entryHash: String(anchor.entryHash),
+    updatedAt: String(anchor.updatedAt),
+  });
+  try {
+    const a = Buffer.from(anchor.signature, 'hex');
     const b = Buffer.from(expected, 'hex');
     if (a.length !== b.length) return false;
     return crypto.timingSafeEqual(a, b);

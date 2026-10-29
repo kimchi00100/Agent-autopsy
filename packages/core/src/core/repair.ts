@@ -48,8 +48,20 @@ import {
       canonicalPaths.set(change, canonical);
     }
 
-    // Check reproduction gate: if ABANDONED, reject proposal creation
+    // Check reproduction gate: if AUDIT_BROKEN or ABANDONED, reject proposal creation
     const gate = getReproductionGateState(ctx, incidentId);
+    if (gate.state === 'AUDIT_BROKEN') {
+      const err: any = new Error('[AUDIT_CHAIN_BROKEN]: 감사 기록이 바깥에서 변경되었습니다. 더 진행하지 말고 사용자에게 알립니다.');
+      err.code = 'AUDIT_CHAIN_BROKEN';
+      err.next_action = {
+        actor: 'USER',
+        action: 'STOP_AND_REPORT',
+        agent_should: '감사 기록이 바깥에서 변경되었다. 더 진행하지 말고 사용자에게 알린다.',
+        forbidden: ['DB 직접 수정', '감사 기록 수정', 'audit_head.json 수정'],
+      };
+      throw err;
+    }
+
     if (gate.state === 'ABANDONED') {
       ctx.db.appendAuditLog({
         kind: 'REPAIR_REJECTED',

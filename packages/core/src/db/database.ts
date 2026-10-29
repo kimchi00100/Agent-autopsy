@@ -29,6 +29,7 @@ import {
   AuditLogKind,
   AuditEntityType,
   AuditChainVerificationResult,
+  AuditHeadAnchor,
   ProposalIntegrityStatus,
   ProposalIntegrityCode,
 } from '../types.js';
@@ -42,6 +43,8 @@ import {
   verifyProposalRowSignature,
   computeIncidentRowSignature,
   verifyIncidentRowSignature,
+  computeAuditHeadSignature,
+  verifyAuditHeadSignature,
 } from '../utils/security.js';
 
 export class AutopsyDatabase {
@@ -1717,7 +1720,7 @@ export class AutopsyDatabase {
     payloadHash: string;
     createdAt?: string;
   }): AuditLogEntry {
-    return this.runInImmediateTransaction(() => {
+    const result = this.runInImmediateTransaction(() => {
       const createdAt = entry.createdAt || new Date().toISOString();
       const lastRow = this.db
         .prepare('SELECT seq, entry_hash FROM audit_log ORDER BY seq DESC LIMIT 1')
@@ -1754,6 +1757,78 @@ export class AutopsyDatabase {
         entryHash,
       };
     });
+
+    try {
+      this.updateAuditHeadAnchor(result.seq, result.entryHash);
+    } catch (err) {
+      console.error('[Autopsy] Failed to update audit head anchor:', err);
+    }
+
+    return result;
+  }
+
+  public getAnchorPath(): string {
+    const dir = path.dirname(this.resolvedPath);
+    const base = path.basename(this.resolvedPath, path.extname(this.resolvedPath));
+    if (base === 'autopsy') {
+      return path.join(dir, 'audit_head.json');
+    }
+    return path.join(dir, `${base}.audit_head.json`);
+  }
+
+  /**
+   * Updates audit_head.json monotonically if new seq is greater than existing anchor seq.
+   * Uses atomic write (temp file + rename). Does not throw if writing fails.
+   */
+  public updateAuditHeadAnchor(seq: number, entryHash: string): boolean {
+    try {
+      const anchorPath = this.getAnchorPath();
+      const dir = path.dirname(anchorPath);
+      if (!fs.existsSync(dir)) {
+        fs.mkdirSync(dir, { recursive: true });
+      }
+
+      if (fs.existsSync(anchorPath)) {
+        try {
+          const existingRaw = fs.readFileSync(anchorPath, 'utf8');
+          const existing = JSON.parse(existingRaw);
+          if (existing && typeof existing.seq === 'number' && Number(existing.seq) >= seq) {
+            return false;
+          }
+        } catch {
+          // If parse fails, overwrite with new valid anchor
+        }
+      }
+
+      const updatedAt = new Date().toISOString();
+      const secret = getInstallationSecretKey();
+      const signature = computeAuditHeadSignature(secret, { seq, entryHash, updatedAt });
+      const anchor: AuditHeadAnchor = {
+        seq,
+        entryHash,
+        updatedAt,
+        signature,
+      };
+
+      const tmpPath = `${anchorPath}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2, 8)}.tmp`;
+      fs.writeFileSync(tmpPath, JSON.stringify(anchor, null, 2), 'utf8');
+      fs.renameSync(tmpPath, anchorPath);
+      return true;
+    } catch (err) {
+      console.error('[Autopsy] Failed to update audit head anchor:', err);
+      return false;
+    }
+  }
+
+  /**
+   * Checks whether the audit log contains a HEAD_ANCHOR_INITIALIZED entry.
+   * Used to distinguish a pre-feature legacy DB from an active DB whose audit_head.json was deleted.
+   */
+  public hasHeadAnchorInitializedAudit(): boolean {
+    const row = this.db
+      .prepare("SELECT seq FROM audit_log WHERE kind = 'HEAD_ANCHOR_INITIALIZED' LIMIT 1")
+      .get();
+    return !!row;
   }
 
   /**
@@ -1811,7 +1886,38 @@ export class AutopsyDatabase {
    */
   public verifyAuditChain(overrideSecret?: string): AuditChainVerificationResult {
     const rows = this.db.prepare('SELECT * FROM audit_log ORDER BY seq ASC').all() as any[];
+    const secret = overrideSecret || getInstallationSecretKey();
+    const anchorPath = this.getAnchorPath();
+
     if (rows.length === 0) {
+      if (fs.existsSync(anchorPath)) {
+        try {
+          const raw = fs.readFileSync(anchorPath, 'utf8');
+          const anchor: AuditHeadAnchor = JSON.parse(raw);
+          if (verifyAuditHeadSignature(secret, anchor) && Number(anchor.seq) > 0) {
+            return {
+              valid: false,
+              status: 'BROKEN',
+              totalCount: 0,
+              brokenSeq: Number(anchor.seq),
+              reason: '끝부분 절단',
+              reasonCode: 'TRUNCATED',
+              message: `감사 기록 끝부분 절단 감지 (DB 최대 seq 0 < 기준점 seq ${anchor.seq}). 외부에서 모든 감사 기록이 삭제되었습니다.`,
+            };
+          }
+        } catch {
+          return {
+            valid: false,
+            status: 'BROKEN',
+            totalCount: 0,
+            brokenSeq: 1,
+            reason: '기준점 손상',
+            reasonCode: 'HEAD_ANCHOR_INVALID',
+            message: '감사 기록 기준점 파일(audit_head.json)을 파싱할 수 없습니다.',
+          };
+        }
+      }
+
       return {
         valid: true,
         status: 'OK',
@@ -1819,8 +1925,6 @@ export class AutopsyDatabase {
         message: '감사 기록이 비어 있습니다 (0개 항목).',
       };
     }
-
-    const secret = overrideSecret || getInstallationSecretKey();
 
     for (let i = 0; i < rows.length; i++) {
       const row = rows[i];
@@ -1905,6 +2009,92 @@ export class AutopsyDatabase {
           message: `감사 기록 값 변조 감지 (seq ${seq}). 데이터 필드 또는 해시값이 수정되었습니다.`,
         };
       }
+    }
+
+    // 4. Anchor check (audit_head.json)
+    if (!fs.existsSync(anchorPath)) {
+      if (this.hasHeadAnchorInitializedAudit()) {
+        return {
+          valid: false,
+          status: 'BROKEN',
+          totalCount: rows.length,
+          brokenSeq: rows.length,
+          reason: '기준점 누락',
+          reasonCode: 'HEAD_ANCHOR_MISSING',
+          message: '감사 기록 기준점 파일(audit_head.json)이 누락되었습니다. 외부 삭제가 감지되었습니다.',
+        };
+      }
+
+      // Pre-feature legacy DB with existing rows: initialize anchor and append HEAD_ANCHOR_INITIALIZED
+      const lastRow = rows[rows.length - 1];
+      this.updateAuditHeadAnchor(Number(lastRow.seq), String(lastRow.entry_hash));
+      this.appendAuditLog({
+        kind: 'HEAD_ANCHOR_INITIALIZED',
+        entityType: 'SYSTEM',
+        entityId: 'audit_anchor',
+        payloadHash: hashAuditPayload({ initializedAt: new Date().toISOString() }),
+      });
+
+      return {
+        valid: true,
+        status: 'OK',
+        totalCount: rows.length + 1,
+        message: `감사 기록 해시 체인 검증 통과 (기준점 초기화 완료, 총 ${rows.length + 1}개 항목).`,
+      };
+    }
+
+    let anchor: AuditHeadAnchor;
+    try {
+      const raw = fs.readFileSync(anchorPath, 'utf8');
+      anchor = JSON.parse(raw);
+    } catch {
+      return {
+        valid: false,
+        status: 'BROKEN',
+        totalCount: rows.length,
+        brokenSeq: rows.length,
+        reason: '기준점 손상',
+        reasonCode: 'HEAD_ANCHOR_INVALID',
+        message: '감사 기록 기준점 파일(audit_head.json)을 파싱할 수 없습니다.',
+      };
+    }
+
+    if (!verifyAuditHeadSignature(secret, anchor)) {
+      return {
+        valid: false,
+        status: 'BROKEN',
+        totalCount: rows.length,
+        brokenSeq: Number(anchor.seq) || rows.length,
+        reason: '기준점 서명 불일치',
+        reasonCode: 'HEAD_ANCHOR_INVALID',
+        message: '감사 기록 기준점 파일(audit_head.json)의 HMAC 서명이 일치하지 않습니다. 위변조가 감지되었습니다.',
+      };
+    }
+
+    const maxSeq = rows.length;
+    if (maxSeq < Number(anchor.seq)) {
+      return {
+        valid: false,
+        status: 'BROKEN',
+        totalCount: rows.length,
+        brokenSeq: Number(anchor.seq),
+        reason: '끝부분 절단',
+        reasonCode: 'TRUNCATED',
+        message: `감사 기록 끝부분 절단 감지 (DB 최대 seq ${maxSeq} < 기준점 seq ${anchor.seq}). 외부에서 최근 감사 기록이 삭제되었습니다.`,
+      };
+    }
+
+    const anchorRow = rows[Number(anchor.seq) - 1];
+    if (!anchorRow || String(anchorRow.entry_hash) !== String(anchor.entryHash)) {
+      return {
+        valid: false,
+        status: 'BROKEN',
+        totalCount: rows.length,
+        brokenSeq: Number(anchor.seq),
+        reason: '기준점 해시 불일치',
+        reasonCode: 'HEAD_MISMATCH',
+        message: `감사 기록 기준점 해시 불일치 (seq ${anchor.seq}의 실제 해시와 기준점 해시가 일치하지 않습니다).`,
+      };
     }
 
     return {

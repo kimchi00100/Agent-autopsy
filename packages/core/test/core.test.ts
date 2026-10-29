@@ -7,6 +7,7 @@ import * as url from 'node:url';
 import { DatabaseSync } from 'node:sqlite';
 import { execFileSync, execSync, spawn, ChildProcess } from 'node:child_process';
 import { CoreManager } from '../src/core-manager.js';
+import { AutopsyDatabase } from '../src/db/database.js';
 import { detectUnapprovedFiles } from '../src/core/project.js';
 import { buildReproductionCommand } from '../src/core/reproduction.js';
 import { Incident, ReproductionResult } from '../src/types.js';
@@ -19,6 +20,9 @@ import {
   verifyReproductionLockSignature,
   computeNormalizedContentHash,
   computeProposalRowSignature,
+  GENESIS_PREV_HASH,
+  computeAuditEntryHash,
+  computeAuditHeadSignature,
 } from '../src/utils/security.js';
 import {
   resolveDataDir,
@@ -7139,5 +7143,600 @@ def test_slow():
     assert.strictEqual(auditRes.valid, true, 'Audit log chain must be cryptographically valid');
     assert.strictEqual(auditRes.status, 'OK');
     assert.ok(auditRes.totalCount > 0, 'Audit log chain must contain entries');
+  });
+
+  test('144. B-2 Step 4-3b (Q1): Tail audit row deletion detects TRUNCATED, gate AUDIT_BROKEN, and rejects proposal with AUDIT_CHAIN_BROKEN', async () => {
+    const repo = path.join(testRoot, 'b2_s43b_t144_tail_delete');
+    fs.mkdirSync(repo, { recursive: true });
+    execFileSync('git', ['init', '-b', 'main'], { cwd: repo });
+    execFileSync('git', ['config', 'user.name', 'Tester'], { cwd: repo });
+    execFileSync('git', ['config', 'user.email', 'test@local'], { cwd: repo });
+
+    fs.writeFileSync(path.join(repo, 'package.json'), JSON.stringify({ type: 'module' }));
+    fs.writeFileSync(path.join(repo, 'calc.js'), 'export function add(a, b) { return a - b; }\n');
+    execFileSync('git', ['add', '.'], { cwd: repo });
+    execFileSync('git', ['commit', '-m', 'initial'], { cwd: repo });
+    const localCore = new CoreManager({ customDbPath: path.join(repo, 'autopsy.db') });
+    localCore.captureCheckpoint(repo, 'Initial');
+    localCore.updateProjectSettings(repo, { testCommand: 'node --test' });
+
+    const inc = await localCore.collectIncidentBundle(repo, 'calc bug', 'AssertionError');
+    fs.writeFileSync(
+      path.join(repo, 'test_fail.js'),
+      'import test from "node:test";\nimport assert from "node:assert";\nimport { add } from "./calc.js";\ntest("fail", () => { assert.strictEqual(add(1, 2), -1); });\n'
+    );
+
+    for (let i = 0; i < 3; i++) await localCore.runReproduction(repo, inc.id, 'test_fail.js');
+    assert.strictEqual(localCore.getReproductionGateState(inc.id).state, 'ABANDONED');
+
+    const dbPath = (localCore as any).ctx.db.resolvedPath;
+
+    // External process deletes the tail audit rows for this incident
+    const deleteScript = `
+      const { DatabaseSync } = require('node:sqlite');
+      const db = new DatabaseSync(${JSON.stringify(dbPath)});
+      db.prepare("DELETE FROM audit_log WHERE entity_id = ? AND kind IN ('REPRODUCTION_ATTEMPTED', 'REPRODUCTION_ABANDONED')").run(${JSON.stringify(inc.id)});
+      db.close();
+    `;
+    execFileSync(process.execPath, ['-e', deleteScript], {
+      env: {
+        ...process.env,
+        AUTOPSY_DATA_DIR: process.env.AUTOPSY_DATA_DIR,
+        AUTOPSY_CACHE_DIR: process.env.AUTOPSY_CACHE_DIR,
+      },
+    });
+
+    const chainCheck = (localCore as any).ctx.db.verifyAuditChain();
+    assert.strictEqual(chainCheck.valid, false);
+    assert.strictEqual(chainCheck.status, 'BROKEN');
+    assert.strictEqual(chainCheck.reasonCode, 'TRUNCATED');
+
+    const gate = localCore.getReproductionGateState(inc.id);
+    assert.strictEqual(gate.state, 'AUDIT_BROKEN');
+
+    await assert.rejects(
+      async () => {
+        await localCore.proposeAndVerifyRepair(repo, inc.id, 'fix calc after truncation', [
+          {
+            filePath: 'calc.js',
+            replacements: [{ search: 'return a - b;', replace: 'return a + b;' }],
+          },
+        ]);
+      },
+      (err: any) => {
+        assert.strictEqual(err.code, 'AUDIT_CHAIN_BROKEN');
+        assert.strictEqual(err.next_action?.action, 'STOP_AND_REPORT');
+        assert.strictEqual(err.next_action?.actor, 'USER');
+        return true;
+      }
+    );
+
+    const proposals = (localCore as any).ctx.db.listProposalsForIncident(inc.id);
+    assert.strictEqual(proposals.length, 0, 'No proposal row should be created in DB when rejected with AUDIT_CHAIN_BROKEN');
+  });
+
+  test('145. B-2 Step 4-3b (Q2): Audit kind UPDATE to REPRODUCTION_SUCCEEDED detects VALUE_MODIFIED, state AUDIT_BROKEN, repair AUDIT_CHAIN_BROKEN', async () => {
+    const repo = path.join(testRoot, 'b2_s43b_t145_update_kind');
+    fs.mkdirSync(repo, { recursive: true });
+    execFileSync('git', ['init', '-b', 'main'], { cwd: repo });
+    execFileSync('git', ['config', 'user.name', 'Tester'], { cwd: repo });
+    execFileSync('git', ['config', 'user.email', 'test@local'], { cwd: repo });
+
+    fs.writeFileSync(path.join(repo, 'package.json'), JSON.stringify({ type: 'module' }));
+    fs.writeFileSync(path.join(repo, 'calc.js'), 'export function add(a, b) { return a - b; }\n');
+    execFileSync('git', ['add', '.'], { cwd: repo });
+    execFileSync('git', ['commit', '-m', 'initial'], { cwd: repo });
+    const localCore = new CoreManager({ customDbPath: path.join(repo, 'autopsy.db') });
+    localCore.captureCheckpoint(repo, 'Initial');
+    localCore.updateProjectSettings(repo, { testCommand: 'node --test' });
+
+    const inc = await localCore.collectIncidentBundle(repo, 'calc bug', 'AssertionError');
+    fs.writeFileSync(
+      path.join(repo, 'test_fail.js'),
+      'import test from "node:test";\nimport assert from "node:assert";\nimport { add } from "./calc.js";\ntest("fail", () => { assert.strictEqual(add(1, 2), -1); });\n'
+    );
+
+    for (let i = 0; i < 3; i++) await localCore.runReproduction(repo, inc.id, 'test_fail.js');
+    assert.strictEqual(localCore.getReproductionGateState(inc.id).state, 'ABANDONED');
+
+    const dbPath = (localCore as any).ctx.db.resolvedPath;
+
+    // External process updates kind to REPRODUCTION_SUCCEEDED
+    const updateScript = `
+      const { DatabaseSync } = require('node:sqlite');
+      const db = new DatabaseSync(${JSON.stringify(dbPath)});
+      db.prepare("UPDATE audit_log SET kind = 'REPRODUCTION_SUCCEEDED' WHERE seq = (SELECT seq FROM audit_log WHERE entity_id = ? AND kind = 'REPRODUCTION_ATTEMPTED' LIMIT 1)").run(${JSON.stringify(inc.id)});
+      db.close();
+    `;
+    execFileSync(process.execPath, ['-e', updateScript], {
+      env: {
+        ...process.env,
+        AUTOPSY_DATA_DIR: process.env.AUTOPSY_DATA_DIR,
+        AUTOPSY_CACHE_DIR: process.env.AUTOPSY_CACHE_DIR,
+      },
+    });
+
+    const chainCheck = (localCore as any).ctx.db.verifyAuditChain();
+    assert.strictEqual(chainCheck.valid, false);
+    assert.strictEqual(chainCheck.status, 'BROKEN');
+    assert.strictEqual(chainCheck.reasonCode, 'VALUE_MODIFIED');
+
+    const gate = localCore.getReproductionGateState(inc.id);
+    assert.strictEqual(gate.state, 'AUDIT_BROKEN');
+
+    await assert.rejects(
+      async () => {
+        await localCore.proposeAndVerifyRepair(repo, inc.id, 'fix calc after update', [
+          {
+            filePath: 'calc.js',
+            replacements: [{ search: 'return a - b;', replace: 'return a + b;' }],
+          },
+        ]);
+      },
+      (err: any) => {
+        assert.strictEqual(err.code, 'AUDIT_CHAIN_BROKEN');
+        return true;
+      }
+    );
+  });
+
+  test('146. B-2 Step 4-3b (Q3): Inserting fake REPRODUCTION_WAIVED row detects broken chain, state AUDIT_BROKEN, repair AUDIT_CHAIN_BROKEN', async () => {
+    const repo = path.join(testRoot, 'b2_s43b_t146_fake_insert');
+    fs.mkdirSync(repo, { recursive: true });
+    execFileSync('git', ['init', '-b', 'main'], { cwd: repo });
+    execFileSync('git', ['config', 'user.name', 'Tester'], { cwd: repo });
+    execFileSync('git', ['config', 'user.email', 'test@local'], { cwd: repo });
+
+    fs.writeFileSync(path.join(repo, 'package.json'), JSON.stringify({ type: 'module' }));
+    fs.writeFileSync(path.join(repo, 'calc.js'), 'export function add(a, b) { return a - b; }\n');
+    execFileSync('git', ['add', '.'], { cwd: repo });
+    execFileSync('git', ['commit', '-m', 'initial'], { cwd: repo });
+    const localCore = new CoreManager({ customDbPath: path.join(repo, 'autopsy.db') });
+    localCore.captureCheckpoint(repo, 'Initial');
+    localCore.updateProjectSettings(repo, { testCommand: 'node --test' });
+
+    const inc = await localCore.collectIncidentBundle(repo, 'calc bug', 'AssertionError');
+    fs.writeFileSync(
+      path.join(repo, 'test_fail.js'),
+      'import test from "node:test";\nimport assert from "node:assert";\nimport { add } from "./calc.js";\ntest("fail", () => { assert.strictEqual(add(1, 2), -1); });\n'
+    );
+
+    for (let i = 0; i < 3; i++) await localCore.runReproduction(repo, inc.id, 'test_fail.js');
+    assert.strictEqual(localCore.getReproductionGateState(inc.id).state, 'ABANDONED');
+
+    const dbPath = (localCore as any).ctx.db.resolvedPath;
+
+    // External process inserts a fake REPRODUCTION_WAIVED row
+    const insertScript = `
+      const { DatabaseSync } = require('node:sqlite');
+      const db = new DatabaseSync(${JSON.stringify(dbPath)});
+      const last = db.prepare('SELECT seq, entry_hash FROM audit_log ORDER BY seq DESC LIMIT 1').get();
+      const newSeq = Number(last.seq) + 1;
+      db.prepare(\`
+        INSERT INTO audit_log (seq, created_at, kind, entity_type, entity_id, payload_hash, prev_hash, entry_hash)
+        VALUES (?, ?, 'REPRODUCTION_WAIVED', 'INCIDENT', ?, 'fake_payload', ?, 'fake_entry_hash_0000000000000000000000000000000000000000')
+      \`).run(newSeq, new Date().toISOString(), ${JSON.stringify(inc.id)}, String(last.entry_hash));
+      db.close();
+    `;
+    execFileSync(process.execPath, ['-e', insertScript], {
+      env: {
+        ...process.env,
+        AUTOPSY_DATA_DIR: process.env.AUTOPSY_DATA_DIR,
+        AUTOPSY_CACHE_DIR: process.env.AUTOPSY_CACHE_DIR,
+      },
+    });
+
+    const chainCheck = (localCore as any).ctx.db.verifyAuditChain();
+    assert.strictEqual(chainCheck.valid, false);
+    assert.strictEqual(chainCheck.status, 'BROKEN');
+
+    const gate = localCore.getReproductionGateState(inc.id);
+    assert.strictEqual(gate.state, 'AUDIT_BROKEN');
+
+    await assert.rejects(
+      async () => {
+        await localCore.proposeAndVerifyRepair(repo, inc.id, 'fix calc after fake insert', [
+          {
+            filePath: 'calc.js',
+            replacements: [{ search: 'return a - b;', replace: 'return a + b;' }],
+          },
+        ]);
+      },
+      (err: any) => {
+        assert.strictEqual(err.code, 'AUDIT_CHAIN_BROKEN');
+        return true;
+      }
+    );
+  });
+
+  test('147. B-2 Step 4-3b: Tampering with audit_head.json (delete, lower seq, invalid signature, hash mismatch) detects BROKEN with expected reasonCode', async () => {
+    const tmpData = fs.mkdtempSync(path.join(testRoot, 't147_anchor_'));
+    const tDbPath = path.join(tmpData, 'autopsy.db');
+    const tDb = new AutopsyDatabase(tDbPath);
+
+    // Append 3 valid entries
+    tDb.appendAuditLog({ kind: 'EVENT_1', entityType: 'TEST', entityId: 'e1', payloadHash: 'h1' });
+    tDb.appendAuditLog({ kind: 'EVENT_2', entityType: 'TEST', entityId: 'e2', payloadHash: 'h2' });
+    tDb.appendAuditLog({ kind: 'HEAD_ANCHOR_INITIALIZED', entityType: 'SYSTEM', entityId: 'audit_anchor', payloadHash: 'h_init' });
+
+    const anchorPath = tDb.getAnchorPath();
+    assert.ok(fs.existsSync(anchorPath), 'audit_head.json must exist');
+
+    const originalAnchorRaw = fs.readFileSync(anchorPath, 'utf8');
+
+    // 1. Delete audit_head.json -> HEAD_ANCHOR_MISSING
+    fs.unlinkSync(anchorPath);
+    let res = tDb.verifyAuditChain();
+    assert.strictEqual(res.valid, false);
+    assert.strictEqual(res.reasonCode, 'HEAD_ANCHOR_MISSING');
+
+    // 2. Corrupt signature -> HEAD_ANCHOR_INVALID
+    const parsedAnchor = JSON.parse(originalAnchorRaw);
+    fs.writeFileSync(
+      anchorPath,
+      JSON.stringify({ ...parsedAnchor, signature: '00'.repeat(32) }, null, 2),
+      'utf8'
+    );
+    res = tDb.verifyAuditChain();
+    assert.strictEqual(res.valid, false);
+    assert.strictEqual(res.reasonCode, 'HEAD_ANCHOR_INVALID');
+
+    // 3. Lower seq without valid signature -> HEAD_ANCHOR_INVALID
+    fs.writeFileSync(
+      anchorPath,
+      JSON.stringify({ ...parsedAnchor, seq: 1 }, null, 2),
+      'utf8'
+    );
+    res = tDb.verifyAuditChain();
+    assert.strictEqual(res.valid, false);
+    assert.strictEqual(res.reasonCode, 'HEAD_ANCHOR_INVALID');
+
+    // 4. EntryHash mismatch with valid HMAC signature on tampered hash -> HEAD_MISMATCH
+    const secret = getInstallationSecretKey();
+    const badHash = 'ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff';
+    const { computeAuditHeadSignature } = await import('../src/utils/security.js');
+    const badHashSignature = computeAuditHeadSignature(secret, {
+      seq: parsedAnchor.seq,
+      entryHash: badHash,
+      updatedAt: parsedAnchor.updatedAt,
+    });
+    fs.writeFileSync(
+      anchorPath,
+      JSON.stringify({
+        seq: parsedAnchor.seq,
+        entryHash: badHash,
+        updatedAt: parsedAnchor.updatedAt,
+        signature: badHashSignature,
+      }, null, 2),
+      'utf8'
+    );
+    res = tDb.verifyAuditChain();
+    assert.strictEqual(res.valid, false);
+    assert.strictEqual(res.reasonCode, 'HEAD_MISMATCH');
+
+    tDb.close();
+    fs.rmSync(tmpData, { recursive: true, force: true });
+  });
+
+  test('148. B-2 Step 4-3b: Normal flow across multiple projects, multiple incidents, and API decisions maintains valid chain and anchor.seq === DB max seq', async () => {
+    const repo1 = path.join(testRoot, 'b2_s43b_t148_p1');
+    const repo2 = path.join(testRoot, 'b2_s43b_t148_p2');
+    for (const r of [repo1, repo2]) {
+      fs.mkdirSync(r, { recursive: true });
+      execFileSync('git', ['init', '-b', 'main'], { cwd: r });
+      execFileSync('git', ['config', 'user.name', 'Tester'], { cwd: r });
+      execFileSync('git', ['config', 'user.email', 'test@local'], { cwd: r });
+      fs.writeFileSync(path.join(r, 'package.json'), JSON.stringify({ type: 'module' }));
+      fs.writeFileSync(path.join(r, 'index.js'), 'export const v = 1;\n');
+      execFileSync('git', ['add', '.'], { cwd: r });
+      execFileSync('git', ['commit', '-m', 'init'], { cwd: r });
+      core.captureCheckpoint(r, 'CP1');
+      core.updateProjectSettings(r, { testCommand: 'node --test' });
+    }
+
+    const inc1 = await core.collectIncidentBundle(repo1, 'bug 1', 'Error 1');
+    await core.collectIncidentBundle(repo1, 'bug 2', 'Error 2');
+    await core.collectIncidentBundle(repo2, 'bug 3', 'Error 3');
+
+    // Create a failed test for inc1 to abandon and decide
+    fs.writeFileSync(path.join(repo1, 'test_fail.js'), 'import test from "node:test"; test("fail", () => { throw new Error("fail"); });');
+    for (let i = 0; i < 3; i++) await core.runReproduction(repo1, inc1.id, 'test_fail.js');
+    assert.strictEqual(core.getReproductionGateState(inc1.id).state, 'ABANDONED');
+
+    core.decideReproduction(inc1.id, 'PROCEED_WITHOUT_REPRODUCTION', repo1, 'waived by user');
+    assert.strictEqual(core.getReproductionGateState(inc1.id).state, 'WAIVED');
+
+    const verifyRes = (core as any).ctx.db.verifyAuditChain();
+    assert.strictEqual(verifyRes.valid, true);
+    assert.strictEqual(verifyRes.status, 'OK');
+
+    const anchorPath = (core as any).ctx.db.getAnchorPath();
+    const anchor = JSON.parse(fs.readFileSync(anchorPath, 'utf8'));
+    const maxRow = (core as any).ctx.db.db.prepare('SELECT MAX(seq) as maxSeq FROM audit_log').get();
+    assert.strictEqual(anchor.seq, Number(maxRow.maxSeq), 'Anchor seq must strictly match DB max seq');
+  });
+
+  test('149. B-2 Step 4-3b: 4 concurrent processes appending audit logs verifyAuditChain remains OK (handles DB ahead of anchor gracefully)', async () => {
+    const tmpData = fs.mkdtempSync(path.join(testRoot, 't149_concurrent_'));
+    const concurrentDbPath = path.join(tmpData, 'autopsy.db');
+    const initDb = new AutopsyDatabase(concurrentDbPath);
+    initDb.close();
+
+    const workerScriptPath = path.join(tmpData, 'worker.mjs');
+    const workerScriptContent = `
+import { AutopsyDatabase } from 'file:///C:/Users/xjwoz/OneDrive/Desktop/procject/packages/core/dist/src/db/database.js';
+
+const dbPath = process.argv[2];
+const workerId = process.argv[3];
+const count = parseInt(process.argv[4], 10) || 20;
+
+const db = new AutopsyDatabase(dbPath);
+for (let i = 0; i < count; i++) {
+  db.appendAuditLog({
+    kind: 'WORKER_EVENT',
+    entityType: 'CONCURRENT',
+    entityId: workerId + '_' + i,
+    payloadHash: 'hash_' + workerId + '_' + i,
+  });
+}
+db.close();
+`;
+    fs.writeFileSync(workerScriptPath, workerScriptContent, 'utf8');
+
+    const workerCount = 4;
+    const countPerWorker = 20;
+    const promises = Array.from({ length: workerCount }, (_, i) => {
+      return new Promise<void>((resolve, reject) => {
+        const child = spawn(process.execPath, [workerScriptPath, concurrentDbPath, String(i), String(countPerWorker)], {
+          env: {
+            ...process.env,
+          },
+        });
+        child.on('close', (code) => {
+          if (code === 0) resolve();
+          else reject(new Error('Worker ' + i + ' exited with ' + code));
+        });
+      });
+    });
+
+    await Promise.all(promises);
+
+    const checkDb = new AutopsyDatabase(concurrentDbPath);
+    const verifyRes = checkDb.verifyAuditChain();
+    assert.strictEqual(verifyRes.valid, true);
+    assert.strictEqual(verifyRes.status, 'OK');
+    assert.strictEqual(verifyRes.totalCount, workerCount * countPerWorker);
+
+    checkDb.close();
+    fs.rmSync(tmpData, { recursive: true, force: true });
+  });
+
+  test('150. B-2 Step 4-3b: Pre-feature legacy DB without anchor file is initialized on first check with HEAD_ANCHOR_INITIALIZED, then OK', async () => {
+    const tmpData = fs.mkdtempSync(path.join(testRoot, 't150_legacy_'));
+    const legDbPath = path.join(tmpData, 'autopsy.db');
+
+    // Create raw DB with 3 valid audit log entries
+    const rawDb = new DatabaseSync(legDbPath);
+    rawDb.exec(`
+      CREATE TABLE audit_log (
+        seq INTEGER PRIMARY KEY,
+        created_at TEXT NOT NULL,
+        kind TEXT NOT NULL,
+        entity_type TEXT NOT NULL,
+        entity_id TEXT NOT NULL,
+        payload_hash TEXT NOT NULL,
+        prev_hash TEXT NOT NULL,
+        entry_hash TEXT NOT NULL
+      );
+    `);
+
+    const secret = getInstallationSecretKey();
+    let prev = GENESIS_PREV_HASH;
+    for (let i = 1; i <= 3; i++) {
+      const createdAt = new Date().toISOString();
+      const entryHash = computeAuditEntryHash(secret, {
+        prev_hash: prev,
+        seq: i,
+        created_at: createdAt,
+        kind: 'LEGACY_EVENT',
+        entity_type: 'LEGACY',
+        entity_id: 'leg_' + i,
+        payload_hash: 'hash_' + i,
+      });
+      rawDb.prepare(`
+        INSERT INTO audit_log (seq, created_at, kind, entity_type, entity_id, payload_hash, prev_hash, entry_hash)
+        VALUES (?, ?, 'LEGACY_EVENT', 'LEGACY', ?, ?, ?, ?)
+      `).run(i, createdAt, 'leg_' + i, 'hash_' + i, prev, entryHash);
+      prev = entryHash;
+    }
+    rawDb.close();
+
+    const anchorPath = path.join(tmpData, 'audit_head.json');
+    assert.strictEqual(fs.existsSync(anchorPath), false, 'Anchor file must not exist before first check');
+
+    const db = new AutopsyDatabase(legDbPath);
+    assert.strictEqual(db.hasHeadAnchorInitializedAudit(), false);
+
+    // First verifyAuditChain: initializes anchor and appends HEAD_ANCHOR_INITIALIZED
+    const firstCheck = db.verifyAuditChain();
+    assert.strictEqual(firstCheck.valid, true);
+    assert.strictEqual(firstCheck.status, 'OK');
+    assert.strictEqual(firstCheck.totalCount, 4, '3 original + 1 HEAD_ANCHOR_INITIALIZED');
+    assert.ok(fs.existsSync(anchorPath), 'audit_head.json must be created');
+    assert.strictEqual(db.hasHeadAnchorInitializedAudit(), true);
+
+    // Second check: already initialized, remains OK
+    const secondCheck = db.verifyAuditChain();
+    assert.strictEqual(secondCheck.valid, true);
+    assert.strictEqual(secondCheck.totalCount, 4);
+
+    // If anchor is now deleted, it must detect HEAD_ANCHOR_MISSING
+    fs.unlinkSync(anchorPath);
+    const brokenCheck = db.verifyAuditChain();
+    assert.strictEqual(brokenCheck.valid, false);
+    assert.strictEqual(brokenCheck.status, 'BROKEN');
+    assert.strictEqual(brokenCheck.reasonCode, 'HEAD_ANCHOR_MISSING');
+
+    db.close();
+    fs.rmSync(tmpData, { recursive: true, force: true });
+  });
+
+  test('151. B-2 Step 4-3b: App API under broken chain: PROCEED_WITHOUT_REPRODUCTION succeeds (proposal proceeds), ALLOW_MORE_ATTEMPTS returns 409, missing token 401', async () => {
+    const repo = path.join(testRoot, 'b2_s43b_t151_api_broken');
+    fs.mkdirSync(repo, { recursive: true });
+    execFileSync('git', ['init', '-b', 'main'], { cwd: repo });
+    execFileSync('git', ['config', 'user.name', 'Tester'], { cwd: repo });
+    execFileSync('git', ['config', 'user.email', 'test@local'], { cwd: repo });
+
+    fs.writeFileSync(path.join(repo, 'package.json'), JSON.stringify({ type: 'module' }));
+    fs.writeFileSync(path.join(repo, 'calc.js'), 'export function add(a, b) { return a - b; }\n');
+    execFileSync('git', ['add', '.'], { cwd: repo });
+    execFileSync('git', ['commit', '-m', 'initial'], { cwd: repo });
+    const localCore = new CoreManager({ customDbPath: path.join(repo, 'autopsy.db') });
+    localCore.captureCheckpoint(repo, 'Initial');
+    localCore.updateProjectSettings(repo, { testCommand: 'node --test' });
+
+    const inc = await localCore.collectIncidentBundle(repo, 'calc bug', 'AssertionError');
+    fs.writeFileSync(
+      path.join(repo, 'test_fail.js'),
+      'import test from "node:test";\nimport assert from "node:assert";\nimport { add } from "./calc.js";\ntest("fail", () => { assert.strictEqual(add(1, 2), -1); });\n'
+    );
+
+    for (let i = 0; i < 3; i++) await localCore.runReproduction(repo, inc.id, 'test_fail.js');
+    assert.strictEqual(localCore.getReproductionGateState(inc.id).state, 'ABANDONED');
+
+    const dbPath = (localCore as any).ctx.db.resolvedPath;
+
+    // Tamper with audit_log: modify an earlier row's payload_hash
+    const tamperScript = `
+      const { DatabaseSync } = require('node:sqlite');
+      const db = new DatabaseSync(${JSON.stringify(dbPath)});
+      db.prepare("UPDATE audit_log SET payload_hash = 'tampered' WHERE seq = 1").run();
+      db.close();
+    `;
+    execFileSync(process.execPath, ['-e', tamperScript], {
+      env: {
+        ...process.env,
+        AUTOPSY_DATA_DIR: process.env.AUTOPSY_DATA_DIR,
+        AUTOPSY_CACHE_DIR: process.env.AUTOPSY_CACHE_DIR,
+      },
+    });
+
+    assert.strictEqual(localCore.getReproductionGateState(inc.id).state, 'AUDIT_BROKEN');
+
+    const apiServer = new ApiServer(localCore);
+    const port = await apiServer.start(3898);
+    const token = apiServer.getSessionToken();
+
+    try {
+      // 1. Without token -> 401
+      const resNoToken = await fetch(`http://127.0.0.1:${port}/api/incidents/${inc.id}/reproduction-decision`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ decision: 'PROCEED_WITHOUT_REPRODUCTION', repoPath: repo }),
+      });
+      assert.strictEqual(resNoToken.status, 401);
+
+      // 2. ALLOW_MORE_ATTEMPTS under AUDIT_BROKEN -> 409
+      const resGrant = await fetch(`http://127.0.0.1:${port}/api/incidents/${inc.id}/reproduction-decision`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-autopsy-token': token },
+        body: JSON.stringify({ decision: 'ALLOW_MORE_ATTEMPTS', repoPath: repo, reason: 'try more' }),
+      });
+      assert.strictEqual(resGrant.status, 409);
+
+      // 3. PROCEED_WITHOUT_REPRODUCTION under AUDIT_BROKEN -> 200, state WAIVED
+      const resWaive = await fetch(`http://127.0.0.1:${port}/api/incidents/${inc.id}/reproduction-decision`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-autopsy-token': token },
+        body: JSON.stringify({ decision: 'PROCEED_WITHOUT_REPRODUCTION', repoPath: repo, reason: 'user bypasses broken repro' }),
+      });
+      assert.strictEqual(resWaive.status, 200);
+      const waiveJson = await resWaive.json();
+      assert.strictEqual(waiveJson.success, true);
+      assert.strictEqual(waiveJson.result.state, 'WAIVED');
+
+      // State is WAIVED and repair proposal succeeds
+      const gateState = localCore.getReproductionGateState(inc.id);
+      assert.strictEqual(gateState.state, 'WAIVED');
+
+      const { proposal } = await localCore.proposeAndVerifyRepair(repo, inc.id, 'fix calc after waiver', [
+        {
+          filePath: 'calc.js',
+          replacements: [{ search: 'return a - b;', replace: 'return a + b;' }],
+        },
+      ]);
+      assert.ok(proposal);
+      assert.strictEqual(proposal.verificationStatus, 'VERIFIED_PASS');
+    } finally {
+      await apiServer.stop();
+    }
+  });
+
+  test('152. B-2 Step 4-3b: LOCK_REMOVED with lock NULL + tail audit deletion rejected as AUDIT_CHAIN_BROKEN', async () => {
+    const repo = path.join(testRoot, 'b2_s43b_t152_lock_tail_delete');
+    fs.mkdirSync(repo, { recursive: true });
+    execFileSync('git', ['init', '-b', 'main'], { cwd: repo });
+    execFileSync('git', ['config', 'user.name', 'Tester'], { cwd: repo });
+    execFileSync('git', ['config', 'user.email', 'test@local'], { cwd: repo });
+
+    fs.writeFileSync(path.join(repo, 'package.json'), JSON.stringify({ type: 'module' }));
+    fs.writeFileSync(path.join(repo, 'calc.js'), 'export function add(a, b) { return a - b; }\n');
+    execFileSync('git', ['add', '.'], { cwd: repo });
+    execFileSync('git', ['commit', '-m', 'initial'], { cwd: repo });
+
+    const localCore = new CoreManager({ customDbPath: path.join(repo, 'autopsy.db') });
+    localCore.captureCheckpoint(repo, 'Initial');
+    localCore.updateProjectSettings(repo, { testCommand: 'node --test' });
+
+    const inc = await localCore.collectIncidentBundle(repo, 'calc bug', 'AssertionError');
+    fs.writeFileSync(
+      path.join(repo, 'test_repro.js'),
+      'import test from "node:test";\nimport assert from "node:assert";\nimport { add } from "./calc.js";\ntest("add test", () => { assert.strictEqual(add(1, 2), 3); });\n'
+    );
+
+    // Reproduction succeeds -> creates lock
+    const reproRes = await localCore.runReproduction(repo, inc.id, 'test_repro.js');
+    assert.strictEqual(reproRes.status, 'REPRODUCED');
+    assert.ok((localCore as any).ctx.db.getIncident(inc.id)?.reproductionLock);
+
+    const dbPath = (localCore as any).ctx.db.resolvedPath;
+
+    // Attacker sets reproduction_lock_json = NULL AND deletes reproduction audit rows from tail of audit_log
+    const tamperScript = `
+      const { DatabaseSync } = require('node:sqlite');
+      const db = new DatabaseSync(${JSON.stringify(dbPath)});
+      db.prepare('UPDATE incidents SET reproduction_lock_json = NULL WHERE id = ?').run(${JSON.stringify(inc.id)});
+      db.prepare("DELETE FROM audit_log WHERE entity_id = ? AND kind IN ('REPRODUCTION_LOCKED', 'REPRODUCTION_SUCCEEDED')").run(${JSON.stringify(inc.id)});
+      db.close();
+    `;
+    execFileSync(process.execPath, ['-e', tamperScript], {
+      env: {
+        ...process.env,
+        AUTOPSY_DATA_DIR: process.env.AUTOPSY_DATA_DIR,
+        AUTOPSY_CACHE_DIR: process.env.AUTOPSY_CACHE_DIR,
+      },
+    });
+
+    // Verification must detect TRUNCATED, gate AUDIT_BROKEN, and proposal rejected with AUDIT_CHAIN_BROKEN
+    const chainCheck = (localCore as any).ctx.db.verifyAuditChain();
+    assert.strictEqual(chainCheck.valid, false);
+    assert.strictEqual(chainCheck.reasonCode, 'TRUNCATED');
+
+    await assert.rejects(
+      async () => {
+        await localCore.proposeAndVerifyRepair(repo, inc.id, 'bypass lock via tail delete', [
+          {
+            filePath: 'calc.js',
+            replacements: [{ search: 'return a - b;', replace: 'return a + b;' }],
+          },
+        ]);
+      },
+      (err: any) => {
+        assert.strictEqual(err.code, 'AUDIT_CHAIN_BROKEN');
+        assert.strictEqual(err.next_action?.action, 'STOP_AND_REPORT');
+        return true;
+      }
+    );
   });
 });

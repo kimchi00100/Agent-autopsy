@@ -113,6 +113,7 @@ server.tool(
         'LOCK_SIGNATURE_INVALID',
         'LOCK_REMOVED',
         'INVALID_FILE_PATH',
+        'REPRODUCTION_ABANDONED',
       ];
       const matchedCode = knownRejectionCodes.find(
         (c) => error.code === c || (error.message && error.message.includes(c))
@@ -128,12 +129,17 @@ server.tool(
                   status: matchedCode,
                   code: matchedCode,
                   message: error.message,
-                  next_action: error.next_action || {
+                  next_action: error.next_action || (matchedCode === 'REPRODUCTION_ABANDONED' ? {
+                    actor: 'USER',
+                    action: 'ABSTAIN_REPRODUCTION',
+                    agent_should: "재현 시도를 멈추고, 시도한 테스트와 실패 이유를 사용자에게 짧게 요약한 뒤, Agent Autopsy 앱에서 '재현 없이 진행' 또는 '시도 더 허락'을 결정해 달라고 요청한다.",
+                    forbidden: ['재현 없이 수정안 제출', 'DB 직접 수정', '감사 기록 수정', '재현 테스트를 다른 이름으로 다시 시도'],
+                  } : {
                     actor: 'AGENT',
                     action: 'FIX_REPAIR',
                     agent_should: `수정안 제출 거부 (${matchedCode}): ${error.message}`,
                     forbidden: ['원본 파일 직접 수정', 'DB 직접 수정'],
-                  },
+                  }),
                 },
                 null,
                 2

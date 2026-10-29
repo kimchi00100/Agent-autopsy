@@ -94,6 +94,26 @@ export interface Checkpoint {
   createdAt: string;
 }
 
+export const MAX_REPRODUCTION_ATTEMPTS = 3;
+export const ADDITIONAL_ATTEMPTS_PER_GRANT = 3;
+
+export type ReproductionGateState = 'NOT_ATTEMPTED' | 'IN_PROGRESS' | 'REPRODUCED' | 'ABANDONED' | 'WAIVED';
+
+export interface ReproductionGateAttempt {
+  attemptedAt: string;
+  status: ReproductionStatus;
+  failureKind?: ReproductionFailureKind | null;
+  testFilePath: string;
+}
+
+export interface ReproductionGateInfo {
+  state: ReproductionGateState;
+  attemptsUsed: number;
+  attemptsAllowed: number;
+  history?: ReproductionGateAttempt[];
+  discrepancyWarning?: string;
+}
+
 export type ReproductionStatus =
   | 'REPRODUCED'
   | 'NOT_REPRODUCED'
@@ -216,6 +236,7 @@ export interface ReproductionResult {
   lockStatus?: ReproductionLockStatus;
   reproductionLock?: ReproductionLock;
   lockWarning?: string;
+  reproductionGate?: ReproductionGateInfo;
   next_action?: NextAction;
 }
 
@@ -345,6 +366,8 @@ export interface Incident {
   integrityStatus?: IncidentIntegrityStatus;
   integrityCode?: IncidentIntegrityCode;
   reproductionLock?: ReproductionLock | null;
+  reproductionGate?: ReproductionGateInfo | null;
+  reproductionGateJson?: string | null;
   createdAt: string;
 }
 
@@ -756,7 +779,12 @@ export type AuditLogKind =
   | 'ROLLBACK_EXECUTED'
   | 'REPRODUCTION_LOCKED'
   | 'REPRODUCTION_LOCK_REPLACED'
-  | 'REPAIR_REJECTED';
+  | 'REPAIR_REJECTED'
+  | 'REPRODUCTION_ATTEMPTED'
+  | 'REPRODUCTION_SUCCEEDED'
+  | 'REPRODUCTION_ABANDONED'
+  | 'REPRODUCTION_WAIVED'
+  | 'REPRODUCTION_ATTEMPTS_GRANTED';
 
 export type AuditEntityType = 'INCIDENT' | 'PROPOSAL' | 'PROJECT' | 'CHECKPOINT';
 

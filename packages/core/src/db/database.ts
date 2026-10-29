@@ -23,6 +23,7 @@ import {
   ConfirmedIntentData,
   ReproductionResult,
   ReproductionLock,
+  ReproductionGateInfo,
   CauseVerdict,
   AuditLogEntry,
   AuditLogKind,
@@ -165,6 +166,7 @@ export class AutopsyDatabase {
         reproduction_result_json TEXT,
         coverage_lines_json TEXT,
         reproduction_lock_json TEXT,
+        reproduction_gate_json TEXT,
         change_scope_summary_json TEXT,
         agent_name TEXT DEFAULT 'agent',
         session_id TEXT,
@@ -347,6 +349,7 @@ export class AutopsyDatabase {
       `ALTER TABLE incidents ADD COLUMN missing_intents_json TEXT DEFAULT '[]';`,
       `ALTER TABLE incidents ADD COLUMN change_scope_summary_json TEXT;`,
       `ALTER TABLE incidents ADD COLUMN reproduction_lock_json TEXT;`,
+      `ALTER TABLE incidents ADD COLUMN reproduction_gate_json TEXT;`,
       `ALTER TABLE repair_proposals ADD COLUMN rejection_reason TEXT;`,
       `ALTER TABLE repair_proposals ADD COLUMN row_signature TEXT;`,
       `ALTER TABLE incidents ADD COLUMN row_signature TEXT;`,
@@ -1050,6 +1053,16 @@ export class AutopsyDatabase {
             }
           })()
         : undefined,
+      reproductionGate: row.reproduction_gate_json
+        ? (() => {
+            try {
+              return JSON.parse(row.reproduction_gate_json);
+            } catch {
+              return undefined;
+            }
+          })()
+        : undefined,
+      reproductionGateJson: row.reproduction_gate_json ?? null,
       rowSignature: row.row_signature || null,
       integrityStatus,
       integrityCode,
@@ -1144,6 +1157,13 @@ export class AutopsyDatabase {
     this.runInImmediateTransaction(() => {
       const stmt = this.db.prepare(`UPDATE incidents SET reproduction_lock_json = ? WHERE id = ?`);
       stmt.run(lock ? JSON.stringify(lock) : null, id);
+    });
+  }
+
+  public updateIncidentReproductionGate(id: string, gate: ReproductionGateInfo | null): void {
+    this.runInImmediateTransaction(() => {
+      const stmt = this.db.prepare(`UPDATE incidents SET reproduction_gate_json = ? WHERE id = ?`);
+      stmt.run(gate ? JSON.stringify(gate) : null, id);
     });
   }
 
@@ -1764,6 +1784,24 @@ export class AutopsyDatabase {
       )
       .get(incidentId);
     return !!row;
+  }
+
+  /**
+   * Retrieves reproduction-related audit log entries for an incident in sequence order.
+   * Used by getReproductionGateState to compute attempts and gate state tamper-resistantly.
+   */
+  public getIncidentReproductionAuditLogs(incidentId: string): Array<{ seq: number; createdAt: string; kind: string; payloadHash: string }> {
+    const rows = this.db
+      .prepare(
+        "SELECT seq, created_at, kind, payload_hash FROM audit_log WHERE entity_type = 'INCIDENT' AND entity_id = ? AND kind IN ('REPRODUCTION_ATTEMPTED', 'REPRODUCTION_SUCCEEDED', 'REPRODUCTION_ABANDONED', 'REPRODUCTION_WAIVED', 'REPRODUCTION_ATTEMPTS_GRANTED') ORDER BY seq ASC"
+      )
+      .all(incidentId) as any[];
+    return rows.map((r) => ({
+      seq: Number(r.seq),
+      createdAt: String(r.created_at),
+      kind: String(r.kind),
+      payloadHash: String(r.payload_hash),
+    }));
   }
 
   /**

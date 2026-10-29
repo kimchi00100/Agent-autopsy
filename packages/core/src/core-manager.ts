@@ -27,7 +27,7 @@ import {
   acknowledgeDirective,
 } from './core/directives.js';
 import { evaluateOrchestrationDecision, createReviewChallenge, submitOrchestrationReview } from './core/orchestration.js';
-import { runReproduction } from './core/reproduction.js';
+import { runReproduction, getReproductionGateState, decideReproduction } from './core/reproduction.js';
 import { searchHistory, getIncidentAttempts, getChangesSinceGoodCheckpoint } from './core/history.js';
 import { captureCheckpoint, rollbackToCheckpoint } from './core/checkpoint.js';
 import { packChangeScope, PackagedChangeScope, PackChangeScopeOptions } from './localization/context-packer.js';
@@ -122,6 +122,7 @@ import {
   AuditLogEntry,
   AuditChainVerificationResult,
   ProposalIntegrityResult,
+  ReproductionGateInfo,
 } from './types.js';
 import { analyzeIncident, IncidentAnalysis, parseUnifiedDiff, parseStackFrames } from './analysis/analyzer.js';
 
@@ -532,6 +533,19 @@ export class CoreManager {
       effectiveTimeout = options.timeoutMs ?? timeoutMs;
     }
     return runReproduction(this.ctx, repoPath, incidentId, testFilePath, options, effectiveTimeout);
+  }
+
+  public getReproductionGateState(incidentId: string): ReproductionGateInfo {
+    return getReproductionGateState(this.ctx, incidentId);
+  }
+
+  public decideReproduction(
+    incidentId: string,
+    decision: 'PROCEED_WITHOUT_REPRODUCTION' | 'ALLOW_MORE_ATTEMPTS',
+    repoPath: string,
+    reason?: string
+  ): ReproductionGateInfo {
+    return decideReproduction(this.ctx, incidentId, decision, repoPath, reason);
   }
 
 

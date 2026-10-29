@@ -18,6 +18,11 @@ import {
   ReproductionLockHistoryEntry,
   ReproductionLockStatus,
   NextAction,
+  MAX_REPRODUCTION_ATTEMPTS,
+  ADDITIONAL_ATTEMPTS_PER_GRANT,
+  ReproductionGateState,
+  ReproductionGateAttempt,
+  ReproductionGateInfo,
 } from '../types.js';
 import { parseStackFrames, analyzeIncident } from '../analysis/analyzer.js';
 import {
@@ -523,6 +528,157 @@ async function executeTestRuns(
   return { runs, lastEval, lastTestResult, durationNote };
 }
 
+export function getReproductionGateState(ctx: CoreContext, incidentId: string): ReproductionGateInfo {
+  const incident = ctx.db.getIncident(incidentId);
+  const auditLogs = ctx.db.getIncidentReproductionAuditLogs(incidentId);
+
+  let hasReproduced = false;
+  let hasWaived = false;
+  let grantsCount = 0;
+  let failedAttempts = 0;
+  let hasAbandonedLog = false;
+
+  for (const entry of auditLogs) {
+    if (entry.kind === 'REPRODUCTION_SUCCEEDED') {
+      hasReproduced = true;
+    } else if (entry.kind === 'REPRODUCTION_ATTEMPTED') {
+      failedAttempts++;
+    } else if (entry.kind === 'REPRODUCTION_WAIVED') {
+      hasWaived = true;
+    } else if (entry.kind === 'REPRODUCTION_ATTEMPTS_GRANTED') {
+      grantsCount++;
+    } else if (entry.kind === 'REPRODUCTION_ABANDONED') {
+      hasAbandonedLog = true;
+    }
+  }
+
+  const allowedAttempts = MAX_REPRODUCTION_ATTEMPTS + ADDITIONAL_ATTEMPTS_PER_GRANT * grantsCount;
+  const attemptsUsed = failedAttempts;
+
+  let state: ReproductionGateState;
+  if (hasReproduced) {
+    state = 'REPRODUCED';
+  } else if (hasWaived) {
+    state = 'WAIVED';
+  } else if (failedAttempts >= allowedAttempts) {
+    state = 'ABANDONED';
+    if (!hasAbandonedLog) {
+      ctx.db.appendAuditLog({
+        kind: 'REPRODUCTION_ABANDONED',
+        entityType: 'INCIDENT',
+        entityId: incidentId,
+        payloadHash: hashAuditPayload({
+          incidentId,
+          attemptsUsed,
+          attemptsAllowed: allowedAttempts,
+          abandonedAt: new Date().toISOString(),
+        }),
+      });
+    }
+  } else if (failedAttempts === 0) {
+    state = 'NOT_ATTEMPTED';
+  } else {
+    state = 'IN_PROGRESS';
+  }
+
+  let discrepancyWarning: string | null = null;
+  const storedGate = incident?.reproductionGate;
+  if (storedGate) {
+    if (
+      storedGate.state !== state ||
+      storedGate.attemptsUsed !== attemptsUsed ||
+      storedGate.attemptsAllowed !== allowedAttempts
+    ) {
+      discrepancyWarning = `Reproduction gate discrepancy detected: audit calculation (state: ${state}, used: ${attemptsUsed}, allowed: ${allowedAttempts}) does not match incident stored gate (state: ${storedGate.state}, used: ${storedGate.attemptsUsed}, allowed: ${storedGate.attemptsAllowed}). Audit log state takes precedence.`;
+    }
+  } else if (state !== 'NOT_ATTEMPTED' && incident) {
+    discrepancyWarning = `Reproduction gate discrepancy detected: reproduction_gate_json is missing in database, but audit log indicates state '${state}' with ${attemptsUsed}/${allowedAttempts} attempts. Audit log state takes precedence.`;
+  }
+
+  return {
+    state,
+    attemptsUsed,
+    attemptsAllowed: allowedAttempts,
+    history: storedGate?.history,
+    discrepancyWarning: discrepancyWarning ?? undefined,
+  };
+}
+
+export function decideReproduction(
+  ctx: CoreContext,
+  incidentId: string,
+  decision: 'PROCEED_WITHOUT_REPRODUCTION' | 'ALLOW_MORE_ATTEMPTS',
+  repoPath: string,
+  reason?: string
+): ReproductionGateInfo {
+  const incident = ctx.db.getIncident(incidentId);
+  if (!incident) {
+    const err: any = new Error(`Incident with ID "${incidentId}" not found.`);
+    err.code = 'INCIDENT_NOT_FOUND';
+    err.statusCode = 404;
+    throw err;
+  }
+
+  const project = ctx.ensureProject(repoPath);
+  if (incident.projectId !== project.id) {
+    const err: any = new Error(`[PROJECT_MISMATCH]: Incident ${incidentId} does not belong to project ${project.id}.`);
+    err.code = 'PROJECT_MISMATCH';
+    err.statusCode = 403;
+    throw err;
+  }
+
+  const currentState = getReproductionGateState(ctx, incidentId);
+  if (currentState.state !== 'ABANDONED') {
+    const err: any = new Error(`[NOT_ABANDONED]: Incident reproduction gate is currently "${currentState.state}", not "ABANDONED". Decision can only be made on abandoned incidents.`);
+    err.code = 'NOT_ABANDONED';
+    err.statusCode = 409;
+    throw err;
+  }
+
+  const decidedAt = new Date().toISOString();
+  if (decision === 'PROCEED_WITHOUT_REPRODUCTION') {
+    ctx.db.appendAuditLog({
+      kind: 'REPRODUCTION_WAIVED',
+      entityType: 'INCIDENT',
+      entityId: incidentId,
+      payloadHash: hashAuditPayload({
+        incidentId,
+        decision,
+        reason: reason || null,
+        decidedAt,
+      }),
+    });
+  } else if (decision === 'ALLOW_MORE_ATTEMPTS') {
+    ctx.db.appendAuditLog({
+      kind: 'REPRODUCTION_ATTEMPTS_GRANTED',
+      entityType: 'INCIDENT',
+      entityId: incidentId,
+      payloadHash: hashAuditPayload({
+        incidentId,
+        decision,
+        additionalAttempts: ADDITIONAL_ATTEMPTS_PER_GRANT,
+        reason: reason || null,
+        decidedAt,
+      }),
+    });
+  } else {
+    const err: any = new Error(`[INVALID_DECISION]: Unsupported reproduction decision "${decision}".`);
+    err.code = 'INVALID_ARGUMENT';
+    err.statusCode = 400;
+    throw err;
+  }
+
+  const updatedGate = getReproductionGateState(ctx, incidentId);
+  ctx.db.updateIncidentReproductionGate(incidentId, updatedGate);
+
+  ctx.emitChange('incident_updated', {
+    incidentId,
+    reproductionGate: updatedGate,
+  });
+
+  return updatedGate;
+}
+
 export async function runReproduction(
   ctx: CoreContext,
   repoPath: string,
@@ -546,6 +702,20 @@ export async function runReproduction(
   }
 
   const project = ctx.ensureProject(targetPath);
+
+  // Check reproduction gate: if ABANDONED, reject before doing any execution
+  const currentGate = getReproductionGateState(ctx, incidentId);
+  if (currentGate.state === 'ABANDONED') {
+    const err: any = new Error('[REPRODUCTION_ABANDONED]: 재현 시도가 3회 실패하여 사건이 기권 상태입니다. 사용자가 앱에서 결정을 내릴 때까지 추가 재현 또는 수정안 제출이 거부됩니다.');
+    err.code = 'REPRODUCTION_ABANDONED';
+    err.next_action = {
+      actor: 'USER',
+      action: 'ABSTAIN_REPRODUCTION',
+      agent_should: "재현 시도를 멈추고, 시도한 테스트와 실패 이유를 사용자에게 짧게 요약한 뒤, Agent Autopsy 앱에서 '재현 없이 진행' 또는 '시도 더 허락'을 결정해 달라고 요청한다.",
+      forbidden: ['재현 없이 수정안 제출', 'DB 직접 수정', '감사 기록 수정', '재현 테스트를 다른 이름으로 다시 시도'],
+    };
+    throw err;
+  }
 
   // Check reproduction test lock at start
   let initialLockStatus: ReproductionLockStatus | undefined;
@@ -599,6 +769,7 @@ export async function runReproduction(
     };
     const causeEvidence = [...(incident.causeEvidence || []), `[실행 증거] 재현 테스트 실행 불가 - 파일 경로 유효성 검증 실패`];
     ctx.db.updateIncidentReproduction(incidentId, reproductionResult, incident.causeVerdict, causeEvidence);
+    reproductionResult.reproductionGate = getReproductionGateState(ctx, incidentId);
     return reproductionResult;
   }
 
@@ -614,6 +785,7 @@ export async function runReproduction(
     };
     const causeEvidence = [...(incident.causeEvidence || []), `[실행 증거] 재현 테스트 실행 불가 - 저장소 밖 경로는 재현 테스트로 쓸 수 없음`];
     ctx.db.updateIncidentReproduction(incidentId, reproductionResult, incident.causeVerdict, causeEvidence);
+    reproductionResult.reproductionGate = getReproductionGateState(ctx, incidentId);
     return reproductionResult;
   }
 
@@ -633,6 +805,7 @@ export async function runReproduction(
       };
       const causeEvidence = [...(incident.causeEvidence || []), `[실행 증거] 재현 테스트 실행 불가 - 뒤집기 전 파일 경로 유효성 검증 실패`];
       ctx.db.updateIncidentReproduction(incidentId, reproductionResult, incident.causeVerdict, causeEvidence);
+      reproductionResult.reproductionGate = getReproductionGateState(ctx, incidentId);
       return reproductionResult;
     }
     hostPreFlipFile = path.resolve(targetPath, rawPreFlip);
@@ -647,6 +820,7 @@ export async function runReproduction(
       };
       const causeEvidence = [...(incident.causeEvidence || []), `[실행 증거] 재현 테스트 실행 불가 - 저장소 밖 경로는 재현 테스트로 쓸 수 없음`];
       ctx.db.updateIncidentReproduction(incidentId, reproductionResult, incident.causeVerdict, causeEvidence);
+      reproductionResult.reproductionGate = getReproductionGateState(ctx, incidentId);
       return reproductionResult;
     }
     if (!fs.existsSync(hostPreFlipFile) || !fs.statSync(hostPreFlipFile).isFile()) {
@@ -660,6 +834,7 @@ export async function runReproduction(
       };
       const causeEvidence = [...(incident.causeEvidence || []), `[실행 증거] 재현 테스트 실행 불가 - 뒤집기 전 파일 없음: ${rawPreFlip}`];
       ctx.db.updateIncidentReproduction(incidentId, reproductionResult, incident.causeVerdict, causeEvidence);
+      reproductionResult.reproductionGate = getReproductionGateState(ctx, incidentId);
       return reproductionResult;
     }
     relPreFlipPath = path.relative(targetPath, hostPreFlipFile).replace(/\\/g, '/');
@@ -677,6 +852,7 @@ export async function runReproduction(
     };
     const causeEvidence = [...(incident.causeEvidence || []), `[실행 증거] 재현 테스트 실행 불가 - 파일 없음: ${rawPath}`];
     ctx.db.updateIncidentReproduction(incidentId, reproductionResult, incident.causeVerdict, causeEvidence);
+    reproductionResult.reproductionGate = getReproductionGateState(ctx, incidentId);
     return reproductionResult;
   }
 
@@ -698,6 +874,7 @@ export async function runReproduction(
     };
     const causeEvidence = [...(incident.causeEvidence || []), `[실행 증거] 재현 테스트 실행 불가 - 확정된 테스트 러너 없음`];
     ctx.db.updateIncidentReproduction(incidentId, reproductionResult, incident.causeVerdict, causeEvidence);
+    reproductionResult.reproductionGate = getReproductionGateState(ctx, incidentId);
     return reproductionResult;
   }
 
@@ -745,6 +922,7 @@ export async function runReproduction(
         `[실행 증거] 현재 작업 폴더 스냅샷을 만들지 못해 재현하지 않음: ${errMsg} - ${effectiveCommand}`,
       ];
       ctx.db.updateIncidentReproduction(incidentId, reproductionResult, incident.causeVerdict, causeEvidence);
+      reproductionResult.reproductionGate = getReproductionGateState(ctx, incidentId);
       return reproductionResult;
     }
     const currentCommit = currentSnapshot.worktreeCommitSha;
@@ -1149,10 +1327,48 @@ export async function runReproduction(
       causeEvidence
     );
 
+    // Record reproduction attempt in audit log
+    const attemptedAt = new Date().toISOString();
+    const isSuccess = currentStatus === 'REPRODUCED';
+    const auditKind = isSuccess ? 'REPRODUCTION_SUCCEEDED' : 'REPRODUCTION_ATTEMPTED';
+
+    ctx.db.appendAuditLog({
+      kind: auditKind,
+      entityType: 'INCIDENT',
+      entityId: incidentId,
+      payloadHash: hashAuditPayload({
+        incidentId,
+        status: currentStatus,
+        failureKind: currentFailureKind ?? null,
+        testFilePath: relTestPath,
+        attemptedAt,
+      }),
+    });
+
+    // Compute updated gate state & persist history to display column
+    const latestIncident = ctx.db.getIncident(incidentId);
+    const existingHistory = latestIncident?.reproductionGate?.history || [];
+    const updatedHistory: ReproductionGateAttempt[] = [
+      ...existingHistory,
+      {
+        attemptedAt,
+        status: currentStatus,
+        failureKind: currentFailureKind ?? null,
+        testFilePath: relTestPath,
+      },
+    ].slice(-20);
+
+    const updatedGate = getReproductionGateState(ctx, incidentId);
+    updatedGate.history = updatedHistory;
+    ctx.db.updateIncidentReproductionGate(incidentId, updatedGate);
+
+    reproductionResult.reproductionGate = updatedGate;
+
     ctx.emitChange('incident_updated', {
       incidentId,
       reproductionResult,
       causeVerdict: analysis.causeVerdict,
+      reproductionGate: updatedGate,
     });
 
     return reproductionResult;

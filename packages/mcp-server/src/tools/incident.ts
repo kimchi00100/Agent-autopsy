@@ -262,6 +262,15 @@ server.tool(
       if (result.lockWarning) {
         message += ` (경고: ${result.lockWarning})`;
       }
+      const gate = coreManager.getReproductionGateState(incidentId);
+      if (gate.state === 'ABANDONED') {
+        next_action = {
+          actor: 'USER',
+          action: 'ABSTAIN_REPRODUCTION',
+          agent_should: "재현 시도를 멈추고, 시도한 테스트와 실패 이유를 사용자에게 짧게 요약한 뒤, Agent Autopsy 앱에서 '재현 없이 진행' 또는 '시도 더 허락'을 결정해 달라고 요청한다.",
+          forbidden: ['재현 없이 수정안 제출', 'DB 직접 수정', '감사 기록 수정', '재현 테스트를 다른 이름으로 다시 시도'],
+        };
+      }
       return {
         content: [
           {
@@ -270,6 +279,11 @@ server.tool(
               {
                 success: true,
                 message,
+                gate: {
+                  state: gate.state,
+                  attempts_used: gate.attemptsUsed,
+                  attempts_allowed: gate.attemptsAllowed,
+                },
                 reproduction: result,
                 next_action,
               },
@@ -280,6 +294,37 @@ server.tool(
         ],
       };
     } catch (error: any) {
+      if (error.code === 'REPRODUCTION_ABANDONED') {
+        const gate = coreManager.getReproductionGateState(incidentId);
+        return {
+          isError: true,
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify(
+                {
+                  success: false,
+                  error: error.message,
+                  code: error.code,
+                  gate: {
+                    state: gate.state,
+                    attempts_used: gate.attemptsUsed,
+                    attempts_allowed: gate.attemptsAllowed,
+                  },
+                  next_action: error.next_action || {
+                    actor: 'USER',
+                    action: 'ABSTAIN_REPRODUCTION',
+                    agent_should: "재현 시도를 멈추고, 시도한 테스트와 실패 이유를 사용자에게 짧게 요약한 뒤, Agent Autopsy 앱에서 '재현 없이 진행' 또는 '시도 더 허락'을 결정해 달라고 요청한다.",
+                    forbidden: ['재현 없이 수정안 제출', 'DB 직접 수정', '감사 기록 수정', '재현 테스트를 다른 이름으로 다시 시도'],
+                  },
+                },
+                null,
+                2
+              ),
+            },
+          ],
+        };
+      }
       return {
         isError: true,
         content: [

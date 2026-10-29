@@ -721,6 +721,33 @@ export class ApiServer {
       return;
     }
 
+    // POST /api/incidents/:incidentId/reproduction-decision
+    const reproDecisionMatch = pathname.match(/^\/api\/incidents\/([^\/]+)\/reproduction-decision$/);
+    if (req.method === 'POST' && reproDecisionMatch) {
+      if (!this.verifySessionToken(req)) {
+        res.writeHead(401, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Unauthorized: Valid X-Autopsy-Token is required to decide reproduction.' }));
+        return;
+      }
+      const incidentId = reproDecisionMatch[1];
+      const body = await this.parseJsonBody(req);
+      try {
+        const result = this.coreManager.decideReproduction(
+          incidentId,
+          body.decision,
+          body.repoPath,
+          body.reason
+        );
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: true, result }));
+      } catch (err: any) {
+        const statusCode = err.statusCode || (err.code === 'PROJECT_MISMATCH' ? 403 : err.code === 'NOT_ABANDONED' ? 409 : 400);
+        res.writeHead(statusCode, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: false, error: err.message, code: err.code }));
+      }
+      return;
+    }
+
     // POST /api/directives/:directiveId/acknowledge
     const ackDirMatch = pathname.match(/^\/api\/directives\/([^\/]+)\/acknowledge$/);
     if (req.method === 'POST' && ackDirMatch) {

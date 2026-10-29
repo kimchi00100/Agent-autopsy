@@ -6703,4 +6703,441 @@ def test_slow():
       assert.strictEqual(resolved, 'test_repro.js', 'validateRepoRelativeFilePath must return canonical long name');
     }
   });
+
+  test('136. B-2 Step 4-3: 3 failed reproduction attempts lead to ABANDONED state, single REPRODUCTION_ABANDONED audit log, and proposeAndVerifyRepair rejected with no proposal row in DB', async () => {
+    const repo = path.join(testRoot, 'b2_s43_t136_abandoned');
+    fs.mkdirSync(repo, { recursive: true });
+    execFileSync('git', ['init', '-b', 'main'], { cwd: repo });
+    execFileSync('git', ['config', 'user.name', 'Tester'], { cwd: repo });
+    execFileSync('git', ['config', 'user.email', 'test@local'], { cwd: repo });
+
+    fs.writeFileSync(path.join(repo, 'package.json'), JSON.stringify({ type: 'module' }));
+    fs.writeFileSync(path.join(repo, 'calc.js'), 'export function add(a, b) { return a - b; }\n');
+    execFileSync('git', ['add', '.'], { cwd: repo });
+    execFileSync('git', ['commit', '-m', 'initial'], { cwd: repo });
+    core.captureCheckpoint(repo, 'Initial checkpoint');
+    core.updateProjectSettings(repo, { testCommand: 'node --test' });
+
+    const inc = await core.collectIncidentBundle(repo, 'calc subtraction bug', 'AssertionError: add');
+
+    fs.writeFileSync(
+      path.join(repo, 'test_fail.js'),
+      'import test from "node:test";\nimport assert from "node:assert";\nimport { add } from "./calc.js";\ntest("fail", () => { assert.strictEqual(add(1, 2), -1); });\n'
+    );
+
+    const res1 = await core.runReproduction(repo, inc.id, 'test_fail.js');
+    assert.strictEqual(res1.status, 'NOT_REPRODUCED');
+    let gate = core.getReproductionGateState(inc.id);
+    assert.strictEqual(gate.attemptsUsed, 1);
+    assert.strictEqual(gate.state, 'IN_PROGRESS');
+
+    const res2 = await core.runReproduction(repo, inc.id, 'test_fail.js');
+    assert.strictEqual(res2.status, 'NOT_REPRODUCED');
+    gate = core.getReproductionGateState(inc.id);
+    assert.strictEqual(gate.attemptsUsed, 2);
+    assert.strictEqual(gate.state, 'IN_PROGRESS');
+
+    const res3 = await core.runReproduction(repo, inc.id, 'test_fail.js');
+    assert.strictEqual(res3.status, 'NOT_REPRODUCED');
+    gate = core.getReproductionGateState(inc.id);
+    assert.strictEqual(gate.attemptsUsed, 3);
+    assert.strictEqual(gate.attemptsAllowed, 3);
+    assert.strictEqual(gate.state, 'ABANDONED');
+
+    const auditLogs = (core as any).ctx.db.getIncidentReproductionAuditLogs(inc.id);
+    const abandonedLogs = auditLogs.filter((l: any) => l.kind === 'REPRODUCTION_ABANDONED');
+    assert.strictEqual(abandonedLogs.length, 1, 'Exactly one REPRODUCTION_ABANDONED audit log entry must be present');
+
+    await assert.rejects(
+      async () => {
+        await core.proposeAndVerifyRepair(repo, inc.id, 'fix calc', [
+          {
+            filePath: 'calc.js',
+            replacements: [{ search: 'return a - b;', replace: 'return a + b;' }],
+          },
+        ]);
+      },
+      (err: any) => {
+        assert.strictEqual(err.code, 'REPRODUCTION_ABANDONED');
+        assert.strictEqual(err.next_action?.action, 'ABSTAIN_REPRODUCTION');
+        return true;
+      }
+    );
+
+    const proposals = (core as any).ctx.db.listProposalsForIncident(inc.id);
+    assert.strictEqual(proposals.length, 0, 'No proposal row should be created in DB when rejected by reproduction gate');
+  });
+
+  test('137. B-2 Step 4-3: Calling runReproduction in ABANDONED state does not execute test and throws REPRODUCTION_ABANDONED without incrementing attempts', async () => {
+    const repo = path.join(testRoot, 'b2_s43_t137_abandoned_no_exec');
+    fs.mkdirSync(repo, { recursive: true });
+    execFileSync('git', ['init', '-b', 'main'], { cwd: repo });
+    execFileSync('git', ['config', 'user.name', 'Tester'], { cwd: repo });
+    execFileSync('git', ['config', 'user.email', 'test@local'], { cwd: repo });
+
+    fs.writeFileSync(path.join(repo, 'package.json'), JSON.stringify({ type: 'module' }));
+    fs.writeFileSync(path.join(repo, 'calc.js'), 'export function add(a, b) { return a - b; }\n');
+    execFileSync('git', ['add', '.'], { cwd: repo });
+    execFileSync('git', ['commit', '-m', 'initial'], { cwd: repo });
+    core.captureCheckpoint(repo, 'Initial checkpoint');
+    core.updateProjectSettings(repo, { testCommand: 'node --test' });
+
+    const inc = await core.collectIncidentBundle(repo, 'calc bug', 'AssertionError: add');
+    fs.writeFileSync(
+      path.join(repo, 'test_fail.js'),
+      'import test from "node:test";\nimport assert from "node:assert";\nimport { add } from "./calc.js";\ntest("fail", () => { assert.strictEqual(add(1, 2), -1); });\n'
+    );
+
+    for (let i = 0; i < 3; i++) {
+      await core.runReproduction(repo, inc.id, 'test_fail.js');
+    }
+    const gateBefore = core.getReproductionGateState(inc.id);
+    assert.strictEqual(gateBefore.state, 'ABANDONED');
+    assert.strictEqual(gateBefore.attemptsUsed, 3);
+
+    const canaryPath = path.join(repo, 'canary_side_effect.txt');
+    if (fs.existsSync(canaryPath)) fs.unlinkSync(canaryPath);
+
+    fs.writeFileSync(
+      path.join(repo, 'test_canary.js'),
+      `import test from "node:test";\nimport fs from "node:fs";\ntest("canary", () => { fs.writeFileSync(${JSON.stringify(canaryPath)}, "executed"); });\n`
+    );
+
+    await assert.rejects(
+      async () => {
+        await core.runReproduction(repo, inc.id, 'test_canary.js');
+      },
+      (err: any) => {
+        assert.strictEqual(err.code, 'REPRODUCTION_ABANDONED');
+        assert.strictEqual(err.next_action?.action, 'ABSTAIN_REPRODUCTION');
+        return true;
+      }
+    );
+
+    assert.strictEqual(fs.existsSync(canaryPath), false, 'Canary side-effect file must not exist, confirming test was not executed');
+
+    const gateAfter = core.getReproductionGateState(inc.id);
+    assert.strictEqual(gateAfter.attemptsUsed, 3, 'Attempts count must not increase on rejected runReproduction call');
+  });
+
+  test('138. B-2 Step 4-3: Calling runReproduction with unconfirmed test command 4 times does not count as attempts (0 attempts, NOT_ATTEMPTED)', async () => {
+    const repo = path.join(testRoot, 'b2_s43_t138_unconfirmed');
+    fs.mkdirSync(repo, { recursive: true });
+    execFileSync('git', ['init', '-b', 'main'], { cwd: repo });
+    execFileSync('git', ['config', 'user.name', 'Tester'], { cwd: repo });
+    execFileSync('git', ['config', 'user.email', 'test@local'], { cwd: repo });
+
+    fs.writeFileSync(path.join(repo, 'package.json'), JSON.stringify({ type: 'module' }));
+    fs.writeFileSync(path.join(repo, 'calc.js'), 'export function add(a, b) { return a - b; }\n');
+    execFileSync('git', ['add', '.'], { cwd: repo });
+    execFileSync('git', ['commit', '-m', 'initial'], { cwd: repo });
+    core.captureCheckpoint(repo, 'Initial checkpoint');
+
+    const inc = await core.collectIncidentBundle(repo, 'unconfirmed test', 'AssertionError: calc');
+    fs.writeFileSync(
+      path.join(repo, 'test_repro.js'),
+      'import test from "node:test";\nimport assert from "node:assert";\nimport { add } from "./calc.js";\ntest("repro", () => { assert.strictEqual(add(1, 2), 3); });\n'
+    );
+
+    for (let i = 0; i < 4; i++) {
+      const res = await core.runReproduction(repo, inc.id, 'test_repro.js');
+      assert.strictEqual(res.status, 'CANNOT_RUN');
+    }
+
+    const gate = core.getReproductionGateState(inc.id);
+    assert.strictEqual(gate.attemptsUsed, 0, 'Pre-execution rejections must not be counted as attempts');
+    assert.strictEqual(gate.state, 'NOT_ATTEMPTED');
+  });
+
+  test('139. B-2 Step 4-3: Incident with 2 failures -> 1 REPRODUCED -> 3 failures maintains REPRODUCED state and permits proposal submission', async () => {
+    const repo = path.join(testRoot, 'b2_s43_t139_reproduced_perm');
+    fs.mkdirSync(repo, { recursive: true });
+    execFileSync('git', ['init', '-b', 'main'], { cwd: repo });
+    execFileSync('git', ['config', 'user.name', 'Tester'], { cwd: repo });
+    execFileSync('git', ['config', 'user.email', 'test@local'], { cwd: repo });
+
+    fs.writeFileSync(path.join(repo, 'package.json'), JSON.stringify({ type: 'module' }));
+    fs.writeFileSync(path.join(repo, 'calc.js'), 'export function add(a, b) { return a - b; }\n');
+    execFileSync('git', ['add', '.'], { cwd: repo });
+    execFileSync('git', ['commit', '-m', 'initial'], { cwd: repo });
+    core.captureCheckpoint(repo, 'Initial checkpoint');
+    core.updateProjectSettings(repo, { testCommand: 'node --test' });
+
+    const inc = await core.collectIncidentBundle(repo, 'calc bug', 'AssertionError: add');
+    fs.writeFileSync(
+      path.join(repo, 'test_fail.js'),
+      'import test from "node:test";\nimport assert from "node:assert";\nimport { add } from "./calc.js";\ntest("fail", () => { assert.strictEqual(add(1, 2), -1); });\n'
+    );
+
+    await core.runReproduction(repo, inc.id, 'test_fail.js');
+    await core.runReproduction(repo, inc.id, 'test_fail.js');
+    let gate = core.getReproductionGateState(inc.id);
+    assert.strictEqual(gate.state, 'IN_PROGRESS');
+
+    fs.writeFileSync(
+      path.join(repo, 'test_repro.js'),
+      'import test from "node:test";\nimport assert from "node:assert";\nimport { add } from "./calc.js";\ntest("repro", () => { assert.strictEqual(add(1, 2), 3); });\n'
+    );
+    const reproRes = await core.runReproduction(repo, inc.id, 'test_repro.js', { replace_lock: true, replace_reason: 'reproduce' });
+    assert.strictEqual(reproRes.status, 'REPRODUCED');
+    gate = core.getReproductionGateState(inc.id);
+    assert.strictEqual(gate.state, 'REPRODUCED');
+
+    for (let i = 0; i < 3; i++) {
+      await core.runReproduction(repo, inc.id, 'test_fail.js', { replace_lock: true, replace_reason: `fail ${i}` });
+    }
+
+    gate = core.getReproductionGateState(inc.id);
+    assert.strictEqual(gate.state, 'REPRODUCED', 'Once REPRODUCED, state must not transition to ABANDONED');
+
+    const { proposal } = await core.proposeAndVerifyRepair(repo, inc.id, 'fix calc', [
+      {
+        filePath: 'calc.js',
+        replacements: [{ search: 'return a - b;', replace: 'return a + b;' }],
+      },
+    ]);
+    assert.ok(proposal);
+    assert.strictEqual(proposal.verificationStatus, 'VERIFIED_PASS');
+  });
+
+  test('140. B-2 Step 4-3: Incident with 0 reproduction attempts allows repair proposal to proceed directly to VERIFIED_PASS', async () => {
+    const repo = path.join(testRoot, 'b2_s43_t140_zero_attempts');
+    fs.mkdirSync(repo, { recursive: true });
+    execFileSync('git', ['init', '-b', 'main'], { cwd: repo });
+    execFileSync('git', ['config', 'user.name', 'Tester'], { cwd: repo });
+    execFileSync('git', ['config', 'user.email', 'test@local'], { cwd: repo });
+
+    fs.writeFileSync(path.join(repo, 'package.json'), JSON.stringify({ type: 'module' }));
+    fs.writeFileSync(path.join(repo, 'calc.js'), 'export function add(a, b) { return a - b; }\n');
+    execFileSync('git', ['add', '.'], { cwd: repo });
+    execFileSync('git', ['commit', '-m', 'initial'], { cwd: repo });
+    core.captureCheckpoint(repo, 'Initial checkpoint');
+    core.updateProjectSettings(repo, { testCommand: 'node --test' });
+
+    const inc = await core.collectIncidentBundle(repo, 'zero attempts incident', 'AssertionError: add');
+    const gate = core.getReproductionGateState(inc.id);
+    assert.strictEqual(gate.state, 'NOT_ATTEMPTED');
+
+    const { proposal } = await core.proposeAndVerifyRepair(repo, inc.id, 'fix calc directly', [
+      {
+        filePath: 'calc.js',
+        replacements: [{ search: 'return a - b;', replace: 'return a + b;' }],
+      },
+    ]);
+    assert.ok(proposal);
+    assert.strictEqual(proposal.verificationStatus, 'VERIFIED_PASS');
+  });
+
+  test('141. B-2 Step 4-3: API endpoints enforce token auth (401), non-abandoned rejection (409), project matching (403), WAIVED transition, and ALLOW_MORE_ATTEMPTS grant', async () => {
+    const repoA = path.join(testRoot, 'b2_s43_t141_repoA');
+    const repoB = path.join(testRoot, 'b2_s43_t141_repoB');
+    for (const r of [repoA, repoB]) {
+      fs.mkdirSync(r, { recursive: true });
+      execFileSync('git', ['init', '-b', 'main'], { cwd: r });
+      execFileSync('git', ['config', 'user.name', 'Tester'], { cwd: r });
+      execFileSync('git', ['config', 'user.email', 'test@local'], { cwd: r });
+      fs.writeFileSync(path.join(r, 'package.json'), JSON.stringify({ type: 'module' }));
+      fs.writeFileSync(path.join(r, 'calc.js'), 'export function add(a, b) { return a - b; }\n');
+      execFileSync('git', ['add', '.'], { cwd: r });
+      execFileSync('git', ['commit', '-m', 'initial'], { cwd: r });
+      core.captureCheckpoint(r, 'Initial');
+      core.updateProjectSettings(r, { testCommand: 'node --test' });
+    }
+
+    const inc1 = await core.collectIncidentBundle(repoA, 'incident 1', 'AssertionError');
+    const inc2 = await core.collectIncidentBundle(repoA, 'incident 2', 'AssertionError');
+    const inc3 = await core.collectIncidentBundle(repoA, 'incident 3', 'AssertionError');
+
+    fs.writeFileSync(
+      path.join(repoA, 'test_fail.js'),
+      'import test from "node:test";\nimport assert from "node:assert";\nimport { add } from "./calc.js";\ntest("fail", () => { assert.strictEqual(add(1, 2), -1); });\n'
+    );
+
+    for (let i = 0; i < 3; i++) await core.runReproduction(repoA, inc1.id, 'test_fail.js');
+    assert.strictEqual(core.getReproductionGateState(inc1.id).state, 'ABANDONED');
+
+    await core.runReproduction(repoA, inc2.id, 'test_fail.js');
+    assert.strictEqual(core.getReproductionGateState(inc2.id).state, 'IN_PROGRESS');
+
+    for (let i = 0; i < 3; i++) await core.runReproduction(repoA, inc3.id, 'test_fail.js');
+    assert.strictEqual(core.getReproductionGateState(inc3.id).state, 'ABANDONED');
+
+    const apiServer = new ApiServer(core);
+    const port = await apiServer.start(3897);
+    const token = apiServer.getSessionToken();
+
+    try {
+      // 1. Without token -> 401
+      const resNoToken = await fetch(`http://127.0.0.1:${port}/api/incidents/${inc1.id}/reproduction-decision`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ decision: 'PROCEED_WITHOUT_REPRODUCTION', repoPath: repoA }),
+      });
+      assert.strictEqual(resNoToken.status, 401);
+      assert.strictEqual(core.getReproductionGateState(inc1.id).state, 'ABANDONED');
+
+      // 2. Not abandoned (inc2 is IN_PROGRESS) -> 409
+      const resNotAb = await fetch(`http://127.0.0.1:${port}/api/incidents/${inc2.id}/reproduction-decision`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-autopsy-token': token },
+        body: JSON.stringify({ decision: 'PROCEED_WITHOUT_REPRODUCTION', repoPath: repoA }),
+      });
+      assert.strictEqual(resNotAb.status, 409);
+
+      // 3. Project mismatch (inc1 belongs to repoA, called with repoB) -> 403
+      const resMismatch = await fetch(`http://127.0.0.1:${port}/api/incidents/${inc1.id}/reproduction-decision`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-autopsy-token': token },
+        body: JSON.stringify({ decision: 'PROCEED_WITHOUT_REPRODUCTION', repoPath: repoB }),
+      });
+      assert.strictEqual(resMismatch.status, 403);
+
+      // 4. PROCEED_WITHOUT_REPRODUCTION on inc1 with valid token -> 200, state WAIVED
+      const resWaive = await fetch(`http://127.0.0.1:${port}/api/incidents/${inc1.id}/reproduction-decision`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-autopsy-token': token },
+        body: JSON.stringify({ decision: 'PROCEED_WITHOUT_REPRODUCTION', repoPath: repoA, reason: 'proceed without repro test' }),
+      });
+      assert.strictEqual(resWaive.status, 200);
+      const waiveJson = await resWaive.json();
+      assert.strictEqual(waiveJson.success, true);
+      assert.strictEqual(waiveJson.result.state, 'WAIVED');
+
+      const auditLogsInc1 = (core as any).ctx.db.getIncidentReproductionAuditLogs(inc1.id);
+      assert.ok(auditLogsInc1.some((l: any) => l.kind === 'REPRODUCTION_WAIVED'));
+
+      const { proposal } = await core.proposeAndVerifyRepair(repoA, inc1.id, 'fix calc after waive', [
+        {
+          filePath: 'calc.js',
+          replacements: [{ search: 'return a - b;', replace: 'return a + b;' }],
+        },
+      ]);
+      assert.ok(proposal);
+      assert.strictEqual(proposal.verificationStatus, 'VERIFIED_PASS');
+
+      // 5. ALLOW_MORE_ATTEMPTS on inc3 with valid token -> 200, state IN_PROGRESS, allowed 6
+      const resGrant = await fetch(`http://127.0.0.1:${port}/api/incidents/${inc3.id}/reproduction-decision`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-autopsy-token': token },
+        body: JSON.stringify({ decision: 'ALLOW_MORE_ATTEMPTS', repoPath: repoA, reason: 'grant 3 more attempts' }),
+      });
+      assert.strictEqual(resGrant.status, 200);
+      const grantJson = await resGrant.json();
+      assert.strictEqual(grantJson.success, true);
+      assert.strictEqual(grantJson.result.state, 'IN_PROGRESS');
+      assert.strictEqual(grantJson.result.attemptsAllowed, 6);
+
+      for (let i = 0; i < 3; i++) await core.runReproduction(repoA, inc3.id, 'test_fail.js');
+      const gateInc3 = core.getReproductionGateState(inc3.id);
+      assert.strictEqual(gateInc3.attemptsUsed, 6);
+      assert.strictEqual(gateInc3.attemptsAllowed, 6);
+      assert.strictEqual(gateInc3.state, 'ABANDONED');
+    } finally {
+      await apiServer.stop();
+    }
+  });
+
+  test('142. B-2 Step 4-3: External tampering with reproduction_gate_json via node:sqlite does not bypass ABANDONED gate and triggers discrepancy warning', async () => {
+    const repo = path.join(testRoot, 'b2_s43_t142_tamper');
+    fs.mkdirSync(repo, { recursive: true });
+    execFileSync('git', ['init', '-b', 'main'], { cwd: repo });
+    execFileSync('git', ['config', 'user.name', 'Tester'], { cwd: repo });
+    execFileSync('git', ['config', 'user.email', 'test@local'], { cwd: repo });
+
+    fs.writeFileSync(path.join(repo, 'package.json'), JSON.stringify({ type: 'module' }));
+    fs.writeFileSync(path.join(repo, 'calc.js'), 'export function add(a, b) { return a - b; }\n');
+    execFileSync('git', ['add', '.'], { cwd: repo });
+    execFileSync('git', ['commit', '-m', 'initial'], { cwd: repo });
+    core.captureCheckpoint(repo, 'Initial');
+    core.updateProjectSettings(repo, { testCommand: 'node --test' });
+
+    const inc = await core.collectIncidentBundle(repo, 'calc bug', 'AssertionError');
+    fs.writeFileSync(
+      path.join(repo, 'test_fail.js'),
+      'import test from "node:test";\nimport assert from "node:assert";\nimport { add } from "./calc.js";\ntest("fail", () => { assert.strictEqual(add(1, 2), -1); });\n'
+    );
+
+    for (let i = 0; i < 3; i++) await core.runReproduction(repo, inc.id, 'test_fail.js');
+    assert.strictEqual(core.getReproductionGateState(inc.id).state, 'ABANDONED');
+
+    const dbPath = (core as any).ctx.db.resolvedPath;
+
+    // 1. External process sets reproduction_gate_json to NULL
+    const scriptNull = `
+      const { DatabaseSync } = require('node:sqlite');
+      const db = new DatabaseSync(${JSON.stringify(dbPath)});
+      db.prepare('UPDATE incidents SET reproduction_gate_json = NULL WHERE id = ?').run(${JSON.stringify(inc.id)});
+      db.close();
+    `;
+    execFileSync(process.execPath, ['-e', scriptNull], {
+      env: {
+        ...process.env,
+        AUTOPSY_DATA_DIR: process.env.AUTOPSY_DATA_DIR,
+        AUTOPSY_CACHE_DIR: process.env.AUTOPSY_CACHE_DIR,
+      },
+    });
+
+    await assert.rejects(
+      async () => {
+        await core.proposeAndVerifyRepair(repo, inc.id, 'fix calc', [
+          {
+            filePath: 'calc.js',
+            replacements: [{ search: 'return a - b;', replace: 'return a + b;' }],
+          },
+        ]);
+      },
+      (err: any) => {
+        assert.strictEqual(err.code, 'REPRODUCTION_ABANDONED');
+        return true;
+      }
+    );
+
+    let gateState = core.getReproductionGateState(inc.id);
+    assert.strictEqual(gateState.state, 'ABANDONED');
+    assert.ok(gateState.discrepancyWarning, 'discrepancyWarning must be set when reproduction_gate_json is NULL in DB');
+
+    // 2. External process fakes state to 'WAIVED'
+    const scriptWaived = `
+      const { DatabaseSync } = require('node:sqlite');
+      const db = new DatabaseSync(${JSON.stringify(dbPath)});
+      db.prepare('UPDATE incidents SET reproduction_gate_json = ? WHERE id = ?').run(
+        JSON.stringify({ state: 'WAIVED', attemptsUsed: 0, attemptsAllowed: 3 }),
+        ${JSON.stringify(inc.id)}
+      );
+      db.close();
+    `;
+    execFileSync(process.execPath, ['-e', scriptWaived], {
+      env: {
+        ...process.env,
+        AUTOPSY_DATA_DIR: process.env.AUTOPSY_DATA_DIR,
+        AUTOPSY_CACHE_DIR: process.env.AUTOPSY_CACHE_DIR,
+      },
+    });
+
+    await assert.rejects(
+      async () => {
+        await core.proposeAndVerifyRepair(repo, inc.id, 'fix calc', [
+          {
+            filePath: 'calc.js',
+            replacements: [{ search: 'return a - b;', replace: 'return a + b;' }],
+          },
+        ]);
+      },
+      (err: any) => {
+        assert.strictEqual(err.code, 'REPRODUCTION_ABANDONED');
+        return true;
+      }
+    );
+
+    gateState = core.getReproductionGateState(inc.id);
+    assert.strictEqual(gateState.state, 'ABANDONED');
+    assert.ok(gateState.discrepancyWarning, 'discrepancyWarning must be set when reproduction_gate_json has faked state');
+  });
+
+  test('143. B-2 Step 4-3: Audit log HMAC hash chain remains valid across all reproduction gate events (verifyAuditChain is OK)', async () => {
+    const auditRes = (core as any).ctx.db.verifyAuditChain();
+    assert.strictEqual(auditRes.valid, true, 'Audit log chain must be cryptographically valid');
+    assert.strictEqual(auditRes.status, 'OK');
+    assert.ok(auditRes.totalCount > 0, 'Audit log chain must contain entries');
+  });
 });

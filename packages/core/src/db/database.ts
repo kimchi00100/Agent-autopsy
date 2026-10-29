@@ -1754,6 +1754,19 @@ export class AutopsyDatabase {
   }
 
   /**
+   * Checks whether the audit log contains any reproduction lock creation or replacement events for an incident.
+   * Used to detect unauthorized external deletion of reproduction_lock_json in the incidents table.
+   */
+  public hasIncidentReproductionLockAudit(incidentId: string): boolean {
+    const row = this.db
+      .prepare(
+        "SELECT seq FROM audit_log WHERE entity_id = ? AND kind IN ('REPRODUCTION_LOCKED', 'REPRODUCTION_LOCK_REPLACED') LIMIT 1"
+      )
+      .get(incidentId);
+    return !!row;
+  }
+
+  /**
    * Verifies the cryptographic integrity of the entire audit log chain.
    * Recalculates HMAC for every row from sequence 1 to N.
    * Returns OK and item count if valid, or the first broken seq and reason ('값 변경' | '항목 삭제/순서 변경' | '키 불일치').

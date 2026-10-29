@@ -5824,4 +5824,312 @@ def test_slow():
     ]);
     assert.strictEqual(proposal.verificationStatus, 'VERIFIED_PASS');
   });
+
+  test('121. B-2 Step 4-2: Path normalization prevents bypass via ./, .\\, sub/../, and absolute paths', async () => {
+    const jsRepo = path.join(testRoot, 'b2_s42_t121_path_norm');
+    fs.mkdirSync(jsRepo, { recursive: true });
+    execFileSync('git', ['init', '-b', 'main'], { cwd: jsRepo });
+    execFileSync('git', ['config', 'user.name', 'Tester'], { cwd: jsRepo });
+    execFileSync('git', ['config', 'user.email', 'test@local'], { cwd: jsRepo });
+
+    fs.writeFileSync(path.join(jsRepo, 'package.json'), JSON.stringify({ type: 'module' }));
+    fs.writeFileSync(path.join(jsRepo, 'calc.js'), 'export function add(a, b) { return a + b + 1; }\n');
+    execFileSync('git', ['add', '.'], { cwd: jsRepo });
+    execFileSync('git', ['commit', '-m', 'buggy calc'], { cwd: jsRepo });
+    core.captureCheckpoint(jsRepo, 'Initial checkpoint');
+
+    core.updateProjectSettings(jsRepo, { testCommand: 'node --test' });
+    const inc = await core.collectIncidentBundle(jsRepo, 'Path Normalization Incident', 'AssertionError');
+
+    fs.writeFileSync(
+      path.join(jsRepo, 'test_repro.js'),
+      'import test from "node:test";\nimport assert from "node:assert";\nimport { add } from "./calc.js";\n\ntest("repro", () => {\n  assert.strictEqual(add(1, 2), 3);\n});\n'
+    );
+    const reproRes = await core.runReproduction(jsRepo, inc.id, 'test_repro.js');
+    assert.strictEqual(reproRes.status, 'REPRODUCED');
+    assert.strictEqual(reproRes.lockStatus, 'LOCKED');
+
+    // Variants attempting to modify locked test file
+    const bypassVariants = [
+      './test_repro.js',
+      '.\\test_repro.js',
+      'sub/../test_repro.js',
+      path.resolve(jsRepo, 'test_repro.js'),
+    ];
+
+    for (const variant of bypassVariants) {
+      await assert.rejects(
+        async () => {
+          await core.proposeAndVerifyRepair(jsRepo, inc.id, `우회 시도 (${variant})`, [
+            { filePath: variant, replacements: [{ search: 'add(1, 2), 3', replace: 'add(1, 2), 4' }] },
+          ]);
+        },
+        (err: any) => {
+          assert.strictEqual(err.code, 'REPAIR_MODIFIES_LOCKED_TEST');
+          assert.strictEqual(err.next_action?.action, 'REMOVE_TEST_CHANGES_FROM_REPAIR');
+          return true;
+        }
+      );
+    }
+  });
+
+  test('122. B-2 Step 4-2: Case-insensitive path comparison prevents bypass on Windows', async () => {
+    if (process.platform !== 'win32') {
+      return; // Case-insensitivity test is specific to Windows
+    }
+    const jsRepo = path.join(testRoot, 'b2_s42_t122_case_bypass');
+    fs.mkdirSync(jsRepo, { recursive: true });
+    execFileSync('git', ['init', '-b', 'main'], { cwd: jsRepo });
+    execFileSync('git', ['config', 'user.name', 'Tester'], { cwd: jsRepo });
+    execFileSync('git', ['config', 'user.email', 'test@local'], { cwd: jsRepo });
+
+    fs.writeFileSync(path.join(jsRepo, 'package.json'), JSON.stringify({ type: 'module' }));
+    fs.writeFileSync(path.join(jsRepo, 'calc.js'), 'export function add(a, b) { return a + b + 1; }\n');
+    execFileSync('git', ['add', '.'], { cwd: jsRepo });
+    execFileSync('git', ['commit', '-m', 'buggy calc'], { cwd: jsRepo });
+    core.captureCheckpoint(jsRepo, 'Initial checkpoint');
+
+    core.updateProjectSettings(jsRepo, { testCommand: 'node --test' });
+    const inc = await core.collectIncidentBundle(jsRepo, 'Case Bypass Incident', 'AssertionError');
+
+    fs.writeFileSync(
+      path.join(jsRepo, 'test_repro.js'),
+      'import test from "node:test";\nimport assert from "node:assert";\nimport { add } from "./calc.js";\n\ntest("repro", () => {\n  assert.strictEqual(add(1, 2), 3);\n});\n'
+    );
+    const reproRes = await core.runReproduction(jsRepo, inc.id, 'test_repro.js');
+    assert.strictEqual(reproRes.status, 'REPRODUCED');
+    assert.strictEqual(reproRes.lockStatus, 'LOCKED');
+
+    const caseVariants = ['TEST_REPRO.js', 'Test_Repro.JS', './TEST_REPRO.JS'];
+    for (const variant of caseVariants) {
+      await assert.rejects(
+        async () => {
+          await core.proposeAndVerifyRepair(jsRepo, inc.id, `대소문자 우회 시도 (${variant})`, [
+            { filePath: variant, replacements: [{ search: 'add(1, 2), 3', replace: 'add(1, 2), 4' }] },
+          ]);
+        },
+        (err: any) => {
+          assert.strictEqual(err.code, 'REPAIR_MODIFIES_LOCKED_TEST');
+          return true;
+        }
+      );
+    }
+  });
+
+  test('123. B-2 Step 4-2: Pre-flip test file path variants (./, .\\) are also rejected when modified in repair proposal', async () => {
+    const jsRepo = path.join(testRoot, 'b2_s42_t123_preflip_bypass');
+    fs.mkdirSync(jsRepo, { recursive: true });
+    execFileSync('git', ['init', '-b', 'main'], { cwd: jsRepo });
+    execFileSync('git', ['config', 'user.name', 'Tester'], { cwd: jsRepo });
+    execFileSync('git', ['config', 'user.email', 'test@local'], { cwd: jsRepo });
+
+    fs.writeFileSync(path.join(jsRepo, 'package.json'), JSON.stringify({ type: 'module' }));
+    fs.writeFileSync(path.join(jsRepo, 'calc.js'), 'export function add(a, b) { return a + b + 1; }\n');
+    execFileSync('git', ['add', '.'], { cwd: jsRepo });
+    execFileSync('git', ['commit', '-m', 'buggy calc'], { cwd: jsRepo });
+    core.captureCheckpoint(jsRepo, 'Initial checkpoint');
+
+    core.updateProjectSettings(jsRepo, { testCommand: 'node --test' });
+    const inc = await core.collectIncidentBundle(jsRepo, 'PreFlip Bypass Incident', 'AssertionError');
+
+    // Pre-flip passes on current buggy calc (1+2+1 = 4)
+    fs.writeFileSync(
+      path.join(jsRepo, 'test_pre.js'),
+      'import test from "node:test";\nimport assert from "node:assert";\nimport { add } from "./calc.js";\n\ntest("pre", () => {\n  assert.strictEqual(add(1, 2), 4);\n});\n'
+    );
+    // Flipped fails on current buggy calc (expects 3)
+    fs.writeFileSync(
+      path.join(jsRepo, 'test_flipped.js'),
+      'import test from "node:test";\nimport assert from "node:assert";\nimport { add } from "./calc.js";\n\ntest("flipped", () => {\n  assert.strictEqual(add(1, 2), 3);\n});\n'
+    );
+
+    const reproRes = await core.runReproduction(jsRepo, inc.id, 'test_flipped.js', {
+      preFlipTestFilePath: 'test_pre.js',
+    });
+    assert.strictEqual(reproRes.status, 'REPRODUCED');
+    assert.strictEqual(reproRes.lockStatus, 'LOCKED');
+    assert.strictEqual(reproRes.reproductionLock?.preFlipFilePath, 'test_pre.js');
+
+    const preFlipVariants = ['./test_pre.js', '.\\test_pre.js', 'sub/../test_pre.js'];
+    for (const variant of preFlipVariants) {
+      await assert.rejects(
+        async () => {
+          await core.proposeAndVerifyRepair(jsRepo, inc.id, `PreFlip 변조 시도 (${variant})`, [
+            { filePath: variant, replacements: [{ search: 'add(1, 2), 4', replace: 'add(1, 2), 5' }] },
+          ]);
+        },
+        (err: any) => {
+          assert.strictEqual(err.code, 'REPAIR_MODIFIES_LOCKED_TEST');
+          return true;
+        }
+      );
+    }
+  });
+
+  test('124. B-2 Step 4-2: External process deleting reproduction_lock_json in DB is detected as LOCK_REMOVED', async () => {
+    const jsRepo = path.join(testRoot, 'b2_s42_t124_lock_removed');
+    fs.mkdirSync(jsRepo, { recursive: true });
+    execFileSync('git', ['init', '-b', 'main'], { cwd: jsRepo });
+    execFileSync('git', ['config', 'user.name', 'Tester'], { cwd: jsRepo });
+    execFileSync('git', ['config', 'user.email', 'test@local'], { cwd: jsRepo });
+
+    fs.writeFileSync(path.join(jsRepo, 'package.json'), JSON.stringify({ type: 'module' }));
+    fs.writeFileSync(path.join(jsRepo, 'calc.js'), 'export function add(a, b) { return a + b + 1; }\n');
+    execFileSync('git', ['add', '.'], { cwd: jsRepo });
+    execFileSync('git', ['commit', '-m', 'buggy calc'], { cwd: jsRepo });
+    core.captureCheckpoint(jsRepo, 'Initial checkpoint');
+
+    core.updateProjectSettings(jsRepo, { testCommand: 'node --test' });
+    const inc = await core.collectIncidentBundle(jsRepo, 'Lock Removed Incident', 'AssertionError');
+
+    fs.writeFileSync(
+      path.join(jsRepo, 'test_repro.js'),
+      'import test from "node:test";\nimport assert from "node:assert";\nimport { add } from "./calc.js";\n\ntest("repro", () => {\n  assert.strictEqual(add(1, 2), 3);\n});\n'
+    );
+    const reproRes = await core.runReproduction(jsRepo, inc.id, 'test_repro.js');
+    assert.strictEqual(reproRes.status, 'REPRODUCED');
+    assert.strictEqual(reproRes.lockStatus, 'LOCKED');
+
+    // Separate external process deletes reproduction_lock_json in DB (setting it to NULL)
+    const deleteScript = `
+      const { DatabaseSync } = require('node:sqlite');
+      const db = new DatabaseSync(${JSON.stringify(dbPath)});
+      db.prepare('UPDATE incidents SET reproduction_lock_json = NULL WHERE id = ?').run(${JSON.stringify(inc.id)});
+      db.close();
+    `;
+    execFileSync(process.execPath, ['-e', deleteScript], {
+      env: {
+        ...process.env,
+        AUTOPSY_DATA_DIR: process.env.AUTOPSY_DATA_DIR,
+        AUTOPSY_CACHE_DIR: process.env.AUTOPSY_CACHE_DIR,
+      },
+    });
+
+    // Proposing repair must be rejected with LOCK_REMOVED because audit_log records previous lock
+    await assert.rejects(
+      async () => {
+        await core.proposeAndVerifyRepair(jsRepo, inc.id, '잠금 삭제 후 수정안 시도', [
+          { filePath: 'test_repro.js', replacements: [{ search: 'add(1, 2), 3', replace: 'add(1, 2), 4' }] },
+        ]);
+      },
+      (err: any) => {
+        assert.strictEqual(err.code, 'LOCK_REMOVED');
+        assert.strictEqual(err.next_action?.action, 'REPRODUCE_FIRST');
+        return true;
+      }
+    );
+
+    // Audit log must record REPAIR_REJECTED
+    const auditLogs = core.getAuditLogs();
+    const rejectLog = auditLogs.find((l) => l.kind === 'REPAIR_REJECTED' && l.entityId === inc.id);
+    assert.ok(rejectLog, 'Audit log must record REPAIR_REJECTED for LOCK_REMOVED');
+
+    // runReproduction on the incident should report LOCK_REMOVED if test does not reproduce
+    fs.writeFileSync(
+      path.join(jsRepo, 'test_repro.js'),
+      'import test from "node:test";\nimport assert from "node:assert";\nimport { add } from "./calc.js";\ntest("passing", () => { assert.strictEqual(add(1, 2), 4); });\n'
+    );
+    const rerunRes = await core.runReproduction(jsRepo, inc.id, 'test_repro.js');
+    assert.strictEqual(rerunRes.status, 'NOT_REPRODUCED');
+    assert.strictEqual(rerunRes.lockStatus, 'LOCK_REMOVED');
+    assert.ok(rerunRes.lockWarning?.includes('삭제되었습니다'));
+  });
+
+  test('125. B-2 Step 4-2: External process tampering with history in reproduction_lock_json is detected as LOCK_SIGNATURE_INVALID', async () => {
+    const jsRepo = path.join(testRoot, 'b2_s42_t125_history_tamper');
+    fs.mkdirSync(jsRepo, { recursive: true });
+    execFileSync('git', ['init', '-b', 'main'], { cwd: jsRepo });
+    execFileSync('git', ['config', 'user.name', 'Tester'], { cwd: jsRepo });
+    execFileSync('git', ['config', 'user.email', 'test@local'], { cwd: jsRepo });
+
+    fs.writeFileSync(path.join(jsRepo, 'package.json'), JSON.stringify({ type: 'module' }));
+    fs.writeFileSync(path.join(jsRepo, 'calc.js'), 'export function add(a, b) { return a + b + 1; }\n');
+    execFileSync('git', ['add', '.'], { cwd: jsRepo });
+    execFileSync('git', ['commit', '-m', 'buggy calc'], { cwd: jsRepo });
+    core.captureCheckpoint(jsRepo, 'Initial checkpoint');
+
+    core.updateProjectSettings(jsRepo, { testCommand: 'node --test' });
+    const inc = await core.collectIncidentBundle(jsRepo, 'History Tamper Incident', 'AssertionError');
+
+    fs.writeFileSync(
+      path.join(jsRepo, 'test_repro1.js'),
+      'import test from "node:test";\nimport assert from "node:assert";\nimport { add } from "./calc.js";\n\ntest("r1", () => {\n  assert.strictEqual(add(1, 2), 3);\n});\n'
+    );
+    await core.runReproduction(jsRepo, inc.id, 'test_repro1.js');
+
+    fs.writeFileSync(
+      path.join(jsRepo, 'test_repro2.js'),
+      'import test from "node:test";\nimport assert from "node:assert";\nimport { add } from "./calc.js";\n\ntest("r2", () => {\n  assert.strictEqual(add(2, 2), 4);\n});\n'
+    );
+    const replaceRes = await core.runReproduction(jsRepo, inc.id, 'test_repro2.js', {
+      replace_lock: true,
+      replace_reason: '더 정확한 테스트로 교체',
+    });
+    assert.strictEqual(replaceRes.status, 'REPRODUCED');
+    assert.strictEqual(replaceRes.lockStatus, 'LOCK_REPLACED');
+    assert.strictEqual(replaceRes.reproductionLock?.history?.length, 1);
+
+    // Separate external process tampers only with history inside reproduction_lock_json
+    const tamperScript = `
+      const { DatabaseSync } = require('node:sqlite');
+      const db = new DatabaseSync(${JSON.stringify(dbPath)});
+      const row = db.prepare('SELECT reproduction_lock_json FROM incidents WHERE id = ?').get(${JSON.stringify(inc.id)});
+      const lock = JSON.parse(row.reproduction_lock_json);
+      lock.history[0].testFilePath = 'tampered_history.js';
+      db.prepare('UPDATE incidents SET reproduction_lock_json = ? WHERE id = ?').run(JSON.stringify(lock), ${JSON.stringify(inc.id)});
+      db.close();
+    `;
+    execFileSync(process.execPath, ['-e', tamperScript], {
+      env: {
+        ...process.env,
+        AUTOPSY_DATA_DIR: process.env.AUTOPSY_DATA_DIR,
+        AUTOPSY_CACHE_DIR: process.env.AUTOPSY_CACHE_DIR,
+      },
+    });
+
+    // Proposing repair must fail with LOCK_SIGNATURE_INVALID
+    await assert.rejects(
+      async () => {
+        await core.proposeAndVerifyRepair(jsRepo, inc.id, '이력 변조 후 수정안', [
+          { filePath: 'calc.js', replacements: [{ search: 'a + b + 1', replace: 'a + b' }] },
+        ]);
+      },
+      (err: any) => {
+        assert.strictEqual(err.code, 'LOCK_SIGNATURE_INVALID');
+        return true;
+      }
+    );
+  });
+
+  test('126. B-2 Step 4-2: Normal repair modifying only source files passes without false positive rejection', async () => {
+    const jsRepo = path.join(testRoot, 'b2_s42_t126_normal_pass');
+    fs.mkdirSync(jsRepo, { recursive: true });
+    execFileSync('git', ['init', '-b', 'main'], { cwd: jsRepo });
+    execFileSync('git', ['config', 'user.name', 'Tester'], { cwd: jsRepo });
+    execFileSync('git', ['config', 'user.email', 'test@local'], { cwd: jsRepo });
+
+    fs.writeFileSync(path.join(jsRepo, 'package.json'), JSON.stringify({ type: 'module' }));
+    fs.writeFileSync(path.join(jsRepo, 'calc.js'), 'export function add(a, b) { return a + b + 1; }\n');
+    execFileSync('git', ['add', '.'], { cwd: jsRepo });
+    execFileSync('git', ['commit', '-m', 'buggy calc'], { cwd: jsRepo });
+    core.captureCheckpoint(jsRepo, 'Initial checkpoint');
+
+    core.updateProjectSettings(jsRepo, { testCommand: 'node --test' });
+    const inc = await core.collectIncidentBundle(jsRepo, 'Normal Pass Incident', 'AssertionError');
+
+    fs.writeFileSync(
+      path.join(jsRepo, 'test_repro.js'),
+      'import test from "node:test";\nimport assert from "node:assert";\nimport { add } from "./calc.js";\n\ntest("repro", () => {\n  assert.strictEqual(add(1, 2), 3);\n});\n'
+    );
+    const reproRes = await core.runReproduction(jsRepo, inc.id, 'test_repro.js');
+    assert.strictEqual(reproRes.status, 'REPRODUCED');
+    assert.strictEqual(reproRes.lockStatus, 'LOCKED');
+
+    // Normal repair modifying calc.js passes 3-stage validation
+    const { proposal, executionResult } = await core.proposeAndVerifyRepair(jsRepo, inc.id, 'calc.js 버그 수정', [
+      { filePath: 'calc.js', replacements: [{ search: 'a + b + 1', replace: 'a + b' }] },
+    ]);
+    assert.strictEqual(proposal.verificationStatus, 'VERIFIED_PASS');
+    assert.strictEqual(executionResult.success, true);
+  });
 });

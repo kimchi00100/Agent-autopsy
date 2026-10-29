@@ -274,7 +274,7 @@ export function computeNormalizedContentHash(content: string): string {
 
 /**
  * Computes deterministic HMAC-SHA256 signature for a reproduction test lock.
- * Payload: testFilePath::contentHash::lockedAt::baselineVerdict::assertFlipVerdict::preFlipFilePath::preFlipContentHash
+ * Payload: testFilePath::contentHash::lockedAt::baselineVerdict::assertFlipVerdict::preFlipFilePath::preFlipContentHash::historyHash
  */
 export function computeReproductionLockSignature(
   secretKey: string,
@@ -286,8 +286,14 @@ export function computeReproductionLockSignature(
     assertFlipVerdict?: string;
     preFlipFilePath?: string;
     preFlipContentHash?: string;
+    history?: any[];
   }
 ): string {
+  const historyHash =
+    lock.history && lock.history.length > 0
+      ? crypto.createHash('sha256').update(JSON.stringify(lock.history)).digest('hex')
+      : '';
+
   const payload = [
     lock.testFilePath.replace(/\\/g, '/'),
     lock.contentHash,
@@ -296,6 +302,7 @@ export function computeReproductionLockSignature(
     lock.assertFlipVerdict || '',
     lock.preFlipFilePath ? lock.preFlipFilePath.replace(/\\/g, '/') : '',
     lock.preFlipContentHash || '',
+    historyHash,
   ].join('::');
   return crypto.createHmac('sha256', secretKey).update(payload).digest('hex');
 }

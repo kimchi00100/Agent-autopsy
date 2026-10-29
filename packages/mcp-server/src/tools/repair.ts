@@ -111,6 +111,7 @@ server.tool(
         'REPAIR_MODIFIES_LOCKED_TEST',
         'LOCKED_TEST_MODIFIED',
         'LOCK_SIGNATURE_INVALID',
+        'LOCK_REMOVED',
       ];
       const matchedCode = knownRejectionCodes.find(
         (c) => error.code === c || (error.message && error.message.includes(c))

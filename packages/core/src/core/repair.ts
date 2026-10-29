@@ -3,6 +3,7 @@ import * as fs from 'node:fs';
 import * as crypto from 'node:crypto';
 import { CoreContext } from './context.js';
 import { sendWindowsToast } from '../notifications/toast.js';
+import { isSamePathUnderRepo } from '../utils/paths.js';
 import {
   signApprovalPayload,
   verifyApprovalSignature,
@@ -38,10 +39,8 @@ import {
       throw new Error(`Incident with ID "${incidentId}" not found.`);
     }
 
-    // 1. Prepare patch in memory
-    const prepared = ctx.patchEngine.preparePatch(project.rootPath, fileChanges);
-
-    // Check reproduction test lock: (c) signature validity, (a) proposal modification, (b) disk modification
+    // Check reproduction test lock before preparing patch:
+    // (c) signature validity, (a) proposal modification, (b) disk modification, and lock deletion detection
     if (incident.reproductionLock) {
       const lock = incident.reproductionLock;
       const secret = getInstallationSecretKey();
@@ -65,20 +64,23 @@ import {
         throw err;
       }
 
-      // (a) Check if proposal modifies locked test file (or preFlip file)
-      const lockedTestRel = lock.testFilePath.replace(/\\/g, '/').toLowerCase();
-      const lockedPreFlipRel = lock.preFlipFilePath ? lock.preFlipFilePath.replace(/\\/g, '/').toLowerCase() : null;
-      const modifiesLocked = prepared.touchedFiles.some((f) => {
-        const norm = f.replace(/\\/g, '/').toLowerCase();
-        return norm === lockedTestRel || (lockedPreFlipRel !== null && norm === lockedPreFlipRel);
-      });
+      // (a) Check if proposal modifies locked test file (or preFlip file) using unified path helper
+      const isModifyingLockedTest = (candidatePath: string): boolean => {
+        if (isSamePathUnderRepo(project.rootPath, candidatePath, lock.testFilePath)) {
+          return true;
+        }
+        if (lock.preFlipFilePath && isSamePathUnderRepo(project.rootPath, candidatePath, lock.preFlipFilePath)) {
+          return true;
+        }
+        return false;
+      };
 
-      if (modifiesLocked) {
+      if (fileChanges.some((c) => isModifyingLockedTest(c.filePath))) {
         ctx.db.appendAuditLog({
           kind: 'REPAIR_REJECTED',
           entityType: 'INCIDENT',
           entityId: incidentId,
-          payloadHash: hashAuditPayload({ error: 'REPAIR_MODIFIES_LOCKED_TEST', lock, touched: prepared.touchedFiles }),
+          payloadHash: hashAuditPayload({ error: 'REPAIR_MODIFIES_LOCKED_TEST', lock, touched: fileChanges.map((c) => c.filePath) }),
         });
         const err: any = new Error('[REPAIR_MODIFIES_LOCKED_TEST]: 수정안에 잠금된 재현 테스트 파일이 포함되어 있습니다. 수정안은 실제 소스 코드만 변경해야 합니다.');
         err.code = 'REPAIR_MODIFIES_LOCKED_TEST';
@@ -110,6 +112,57 @@ import {
           actor: 'AGENT',
           action: 'RESTORE_OR_REPLACE_LOCK',
           agent_should: '잠금된 테스트 파일을 원래대로 복원하거나, 의도된 변경인 경우 run_reproduction(replace_lock=true)으로 잠금을 갱신하세요.',
+          forbidden: ['원본 파일 직접 수정', 'DB 직접 수정'],
+        };
+        throw err;
+      }
+    } else if (ctx.db.hasIncidentReproductionLockAudit(incidentId)) {
+      // P5: DB reproduction_lock_json is NULL/empty, but audit_log has REPRODUCTION_LOCKED or REPRODUCTION_LOCK_REPLACED
+      ctx.db.appendAuditLog({
+        kind: 'REPAIR_REJECTED',
+        entityType: 'INCIDENT',
+        entityId: incidentId,
+        payloadHash: hashAuditPayload({ error: 'LOCK_REMOVED' }),
+      });
+      const err: any = new Error('[LOCK_REMOVED]: 과거에 생성된 재현 테스트 잠금이 외부에서 삭제되었습니다 (잠금 삭제 변조 의심). 재현 테스트를 다시 실행하세요.');
+      err.code = 'LOCK_REMOVED';
+      err.next_action = {
+        actor: 'AGENT',
+        action: 'REPRODUCE_FIRST',
+        agent_should: '잠금된 재현 테스트 기록이 임의로 삭제되었습니다. run_reproduction으로 재현 테스트를 다시 실행하여 잠금을 새로 생성하세요.',
+        forbidden: ['원본 파일 직접 수정', 'DB 직접 수정'],
+      };
+      throw err;
+    }
+
+    // 1. Prepare patch in memory
+    const prepared = ctx.patchEngine.preparePatch(project.rootPath, fileChanges);
+
+    // Defense-in-depth: Also verify prepared.touchedFiles against locked test if lock exists
+    if (incident.reproductionLock) {
+      const lock = incident.reproductionLock;
+      const isModifyingLockedTest = (candidatePath: string): boolean => {
+        if (isSamePathUnderRepo(project.rootPath, candidatePath, lock.testFilePath)) {
+          return true;
+        }
+        if (lock.preFlipFilePath && isSamePathUnderRepo(project.rootPath, candidatePath, lock.preFlipFilePath)) {
+          return true;
+        }
+        return false;
+      };
+      if (prepared.touchedFiles.some((f) => isModifyingLockedTest(f))) {
+        ctx.db.appendAuditLog({
+          kind: 'REPAIR_REJECTED',
+          entityType: 'INCIDENT',
+          entityId: incidentId,
+          payloadHash: hashAuditPayload({ error: 'REPAIR_MODIFIES_LOCKED_TEST', lock, touched: prepared.touchedFiles }),
+        });
+        const err: any = new Error('[REPAIR_MODIFIES_LOCKED_TEST]: 수정안에 잠금된 재현 테스트 파일이 포함되어 있습니다. 수정안은 실제 소스 코드만 변경해야 합니다.');
+        err.code = 'REPAIR_MODIFIES_LOCKED_TEST';
+        err.next_action = {
+          actor: 'AGENT',
+          action: 'REMOVE_TEST_CHANGES_FROM_REPAIR',
+          agent_should: '수정안에서 재현 테스트 파일 수정을 제거하고, 실제 대상 소스 코드만 수정하도록 패치를 변경하세요.',
           forbidden: ['원본 파일 직접 수정', 'DB 직접 수정'],
         };
         throw err;

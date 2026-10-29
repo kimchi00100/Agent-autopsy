@@ -30,6 +30,7 @@ import {
 } from '../utils/security.js';
 import { locateChangeScope } from '../localization/change-localizer.js';
 import { SnapshotResult } from '../git/git-engine.js';
+import { isSamePathUnderRepo } from '../utils/paths.js';
 import type Parser from 'web-tree-sitter';
 import { parseWithTreeSitterForRunner } from '../localization/function-extractor.js';
 
@@ -574,6 +575,15 @@ export async function runReproduction(
         };
       }
     }
+  } else if (ctx.db.hasIncidentReproductionLockAudit(incidentId)) {
+    initialLockStatus = 'LOCK_REMOVED';
+    initialLockWarning = '과거에 생성된 재현 테스트 잠금이 외부에서 삭제되었습니다 (잠금 삭제 변조 의심).';
+    initialLockNextAction = {
+      actor: 'AGENT',
+      action: 'REPRODUCE_FIRST',
+      agent_should: '과거 잠금 기록이 삭제된 상태입니다. run_reproduction으로 재현 테스트를 다시 실행하여 잠금을 새로 생성하세요.',
+      forbidden: ['원본 파일 직접 수정', 'DB 직접 수정'],
+    };
   }
 
   // 1. Validate that input is strictly a file path and contains no shell metacharacters
@@ -1018,10 +1028,14 @@ export async function runReproduction(
         lockNextAction = undefined;
       } else {
         // 2. Existing lock present
-        const isSameFile = existingLock.testFilePath.replace(/\\/g, '/').toLowerCase() === relTestPath.toLowerCase();
+        const isSameFile = isSamePathUnderRepo(targetPath, existingLock.testFilePath, relTestPath);
         const isSameHash = existingLock.contentHash === curContentHash;
 
-        if (isSameFile && isSameHash) {
+        if (initialLockStatus === 'LOCK_SIGNATURE_INVALID' && !options.replace_lock) {
+          lockStatus = 'LOCK_SIGNATURE_INVALID';
+          lockWarning = '재현 테스트 잠금의 서명이 올바르지 않습니다 (잠금 변조 의심).';
+          reproductionLock = existingLock;
+        } else if (isSameFile && isSameHash) {
           lockStatus = 'LOCKED';
           reproductionLock = existingLock;
           lockWarning = undefined;
@@ -1057,9 +1071,10 @@ export async function runReproduction(
               assertFlipVerdict: assertFlip?.verdict,
               preFlipFilePath: relPreFlipPath,
               preFlipContentHash: curPreFlipContentHash,
+              history,
             };
             const signature = computeReproductionLockSignature(secret, lockData);
-            const newLock: ReproductionLock = { ...lockData, history, signature };
+            const newLock: ReproductionLock = { ...lockData, signature };
             ctx.db.updateIncidentReproductionLock(incidentId, newLock);
             ctx.db.appendAuditLog({
               kind: 'REPRODUCTION_LOCK_REPLACED',

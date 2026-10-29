@@ -34,6 +34,24 @@ export function normalizeRepoPath(targetPath: string): string {
 }
 
 /**
+ * Normalizes a file path relative to a repository root.
+ * Resolves relative segments (./, ../), unifies separators to '/',
+ * and lowercases on Windows so path variants match deterministically.
+ */
+export function normalizePathUnderRepo(repoPath: string, targetPath: string): string {
+  const resolved = path.resolve(repoPath, targetPath).replace(/\\/g, '/');
+  return process.platform === 'win32' ? resolved.toLowerCase() : resolved;
+}
+
+/**
+ * Checks whether two file paths under a repository resolve to the exact same file.
+ * Handles './file', '.\file', 'sub/../file', full repo paths, and case variants on Windows.
+ */
+export function isSamePathUnderRepo(repoPath: string, pathA: string, pathB: string): boolean {
+  return normalizePathUnderRepo(repoPath, pathA) === normalizePathUnderRepo(repoPath, pathB);
+}
+
+/**
  * Generates a deterministic project ID based on the SHA-256 hash of the normalized root path.
  * Guarantees that the exact same repository path always yields the identical Project ID
  * across different processes, working directories, or DB instances.

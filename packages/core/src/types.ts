@@ -189,6 +189,7 @@ export type ReproductionLockStatus =
   | 'LOCK_REPLACED'
   | 'LOCKED_TEST_MODIFIED'
   | 'LOCK_SIGNATURE_INVALID'
+  | 'LOCK_REMOVED'
   | 'UNLOCKED';
 
 export interface RunReproductionOptions {

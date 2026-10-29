@@ -178,37 +178,50 @@ export function validateRepoRelativeFilePath(baseDirectory: string, filePath: st
     throw err;
   }
 
-  // Rule g: Folder link escape (symlink / junction)
+  // Canonical path calculation:
+  // Resolves the deepest existing ancestor (or file itself if it exists) via fs.realpathSync.native
+  // to expand Windows 8.3 short names (e.g. GIT~1 -> .git, TEST_R~1.JS -> test_repro.js) and symlinks/junctions.
   let realBase: string;
   try {
-    realBase = fs.realpathSync(baseDirectory);
+    realBase = fs.realpathSync.native(baseDirectory);
   } catch {
+    // Fall back to path.resolve if native realpath fails (e.g. non-existent directory or platform limitation)
     realBase = path.resolve(baseDirectory);
   }
 
   const fullTarget = path.resolve(baseDirectory, normalized);
   let checkPath = fullTarget;
+  const missingSegments: string[] = [];
   while (!fs.existsSync(checkPath)) {
     const parent = path.dirname(checkPath);
+    const basename = path.basename(checkPath);
     if (parent === checkPath) break;
+    missingSegments.unshift(basename);
     checkPath = parent;
   }
 
   let realCheck: string;
   try {
-    realCheck = fs.realpathSync(checkPath);
+    realCheck = fs.realpathSync.native(checkPath);
   } catch {
+    // Fall back to path.resolve if native realpath fails
     realCheck = path.resolve(checkPath);
   }
 
-  const isWin = process.platform === 'win32';
-  const normBase = isWin ? path.resolve(realBase).toLowerCase() : path.resolve(realBase);
-  const normCheck = isWin ? path.resolve(realCheck).toLowerCase() : path.resolve(realCheck);
-  const rel = path.relative(normBase, normCheck);
+  let canonicalFullPath = realCheck;
+  for (const seg of missingSegments) {
+    canonicalFullPath = path.join(canonicalFullPath, seg);
+  }
 
-  if (rel.startsWith('..') || path.isAbsolute(rel)) {
+  const isWin = process.platform === 'win32';
+  const normBase = isWin ? realBase.toLowerCase() : realBase;
+  const normFull = isWin ? canonicalFullPath.toLowerCase() : canonicalFullPath;
+  const relCheck = path.relative(normBase, normFull);
+
+  // Check a: Base directory escape (symlink / junction)
+  if (relCheck.startsWith('..') || path.isAbsolute(relCheck)) {
     const err: any = new Error(
-      `[INVALID_FILE_PATH]: 심볼릭 링크 또는 폴더 연결(정션)을 통해 저장소 외부("${realCheck}")를 가리키는 경로는 허용되지 않습니다. 저장소 루트 기준 상대 경로(예: src/calc.js)로 다시 제출하세요.`
+      `[INVALID_FILE_PATH]: 심볼릭 링크 또는 폴더 연결(정션)을 통해 저장소 외부("${canonicalFullPath}")를 가리키는 경로는 허용되지 않습니다. 저장소 루트 기준 상대 경로(예: src/calc.js)로 다시 제출하세요.`
     );
     err.code = 'INVALID_FILE_PATH';
     err.next_action = {
@@ -220,5 +233,26 @@ export function validateRepoRelativeFilePath(baseDirectory: string, filePath: st
     throw err;
   }
 
-  return normalized;
+  // Canonical relative path with '/' separator
+  const canonicalRel = path.relative(realBase, canonicalFullPath).replace(/\\/g, '/');
+
+  // Check b: .git component at any depth (including 8.3 short names like GIT~1 and submodule .git)
+  const canonicalSegments = canonicalRel.split('/');
+  for (const seg of canonicalSegments) {
+    if (seg.toLowerCase() === '.git') {
+      const err: any = new Error(
+        '[INVALID_FILE_PATH]: .git 디렉터리 내부 파일은 수정할 수 없습니다 (Windows 짧은 이름 우회 및 서브모듈 .git 포함). 저장소 루트 기준 상대 경로(예: src/calc.js)로 다시 제출하세요.'
+      );
+      err.code = 'INVALID_FILE_PATH';
+      err.next_action = {
+        actor: 'AGENT',
+        action: 'FIX_REPAIR',
+        agent_should: '저장소 소스 코드 파일의 상대 경로(예: src/calc.js)로 다시 제출해 주세요 (.git 디렉터리 수정 금지).',
+        forbidden: ['원본 파일 직접 수정', 'DB 직접 수정'],
+      };
+      throw err;
+    }
+  }
+
+  return canonicalRel;
 }

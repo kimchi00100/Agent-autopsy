@@ -39,9 +39,12 @@ import {
       throw new Error(`Incident with ID "${incidentId}" not found.`);
     }
 
-    // Validate all proposal file paths against project root before any disk operation or lock check
+    // Validate all proposal file paths against project root before any disk operation or lock check,
+    // and map each fileChange to its canonical relative path (resolves 8.3 short names e.g. TEST_R~1.JS -> test_repro.js).
+    const canonicalPaths = new Map<FileChange, string>();
     for (const change of fileChanges) {
-      validateRepoRelativeFilePath(project.rootPath, change.filePath);
+      const canonical = validateRepoRelativeFilePath(project.rootPath, change.filePath);
+      canonicalPaths.set(change, canonical);
     }
 
     // Check reproduction test lock before preparing patch:
@@ -69,18 +72,46 @@ import {
         throw err;
       }
 
-      // (a) Check if proposal modifies locked test file (or preFlip file) using unified path helper
+      // Normalize lock paths as well to ensure consistent canonical comparison
+      let normLockTestPath = lock.testFilePath;
+      try {
+        normLockTestPath = validateRepoRelativeFilePath(project.rootPath, lock.testFilePath);
+      } catch {
+        normLockTestPath = lock.testFilePath;
+      }
+
+      let normLockPreFlipPath = lock.preFlipFilePath;
+      if (lock.preFlipFilePath) {
+        try {
+          normLockPreFlipPath = validateRepoRelativeFilePath(project.rootPath, lock.preFlipFilePath);
+        } catch {
+          normLockPreFlipPath = lock.preFlipFilePath;
+        }
+      }
+
+      // (a) Check if proposal modifies locked test file (or preFlip file) using canonical paths
       const isModifyingLockedTest = (candidatePath: string): boolean => {
-        if (isSamePathUnderRepo(project.rootPath, candidatePath, lock.testFilePath)) {
+        if (
+          isSamePathUnderRepo(project.rootPath, candidatePath, lock.testFilePath) ||
+          isSamePathUnderRepo(project.rootPath, candidatePath, normLockTestPath)
+        ) {
           return true;
         }
-        if (lock.preFlipFilePath && isSamePathUnderRepo(project.rootPath, candidatePath, lock.preFlipFilePath)) {
+        if (
+          lock.preFlipFilePath &&
+          (isSamePathUnderRepo(project.rootPath, candidatePath, lock.preFlipFilePath) ||
+            isSamePathUnderRepo(project.rootPath, candidatePath, normLockPreFlipPath!))
+        ) {
           return true;
         }
         return false;
       };
 
-      if (fileChanges.some((c) => isModifyingLockedTest(c.filePath))) {
+      if (
+        fileChanges.some(
+          (c) => isModifyingLockedTest(c.filePath) || isModifyingLockedTest(canonicalPaths.get(c) || c.filePath)
+        )
+      ) {
         ctx.db.appendAuditLog({
           kind: 'REPAIR_REJECTED',
           entityType: 'INCIDENT',
@@ -146,11 +177,34 @@ import {
     // Defense-in-depth: Also verify prepared.touchedFiles against locked test if lock exists
     if (incident.reproductionLock) {
       const lock = incident.reproductionLock;
+      let normLockTestPath = lock.testFilePath;
+      try {
+        normLockTestPath = validateRepoRelativeFilePath(project.rootPath, lock.testFilePath);
+      } catch {
+        normLockTestPath = lock.testFilePath;
+      }
+
+      let normLockPreFlipPath = lock.preFlipFilePath;
+      if (lock.preFlipFilePath) {
+        try {
+          normLockPreFlipPath = validateRepoRelativeFilePath(project.rootPath, lock.preFlipFilePath);
+        } catch {
+          normLockPreFlipPath = lock.preFlipFilePath;
+        }
+      }
+
       const isModifyingLockedTest = (candidatePath: string): boolean => {
-        if (isSamePathUnderRepo(project.rootPath, candidatePath, lock.testFilePath)) {
+        if (
+          isSamePathUnderRepo(project.rootPath, candidatePath, lock.testFilePath) ||
+          isSamePathUnderRepo(project.rootPath, candidatePath, normLockTestPath)
+        ) {
           return true;
         }
-        if (lock.preFlipFilePath && isSamePathUnderRepo(project.rootPath, candidatePath, lock.preFlipFilePath)) {
+        if (
+          lock.preFlipFilePath &&
+          (isSamePathUnderRepo(project.rootPath, candidatePath, lock.preFlipFilePath) ||
+            isSamePathUnderRepo(project.rootPath, candidatePath, normLockPreFlipPath!))
+        ) {
           return true;
         }
         return false;

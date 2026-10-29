@@ -6440,4 +6440,267 @@ def test_slow():
       }
     }
   });
+
+  function getWindowsShortName(parentDir: string, targetName: string): string | null {
+    if (process.platform !== 'win32') return null;
+    try {
+      const dirOut = execSync(`cmd /c dir /x /a "${parentDir}"`, { encoding: 'utf8' });
+      for (const line of dirOut.split('\n')) {
+        if (line.includes(targetName)) {
+          const parts = line.trim().split(/\s+/);
+          if (parts.length >= 5) {
+            const shortCandidate = parts[parts.length - 2];
+            const longCandidate = parts[parts.length - 1];
+            if (longCandidate.toLowerCase() === targetName.toLowerCase() && shortCandidate.includes('~')) {
+              return shortCandidate;
+            }
+          }
+        }
+      }
+    } catch {
+      return null;
+    }
+    return null;
+  }
+
+  test('132. B-2 Step 4-2c: proposeAndVerifyRepair rejects .git 8.3 short name paths with INVALID_FILE_PATH', async () => {
+    const jsRepo = path.join(testRoot, 'b2_s42c_t132_rejection');
+    fs.mkdirSync(jsRepo, { recursive: true });
+    execFileSync('git', ['init', '-b', 'main'], { cwd: jsRepo });
+    execFileSync('git', ['config', 'user.name', 'Tester'], { cwd: jsRepo });
+    execFileSync('git', ['config', 'user.email', 'test@local'], { cwd: jsRepo });
+
+    fs.writeFileSync(path.join(jsRepo, 'package.json'), JSON.stringify({ type: 'module' }));
+    fs.writeFileSync(path.join(jsRepo, 'calc.js'), 'export function add(a, b) { return a + b + 1; }\n');
+    execFileSync('git', ['add', '.'], { cwd: jsRepo });
+    execFileSync('git', ['commit', '-m', 'initial'], { cwd: jsRepo });
+    core.captureCheckpoint(jsRepo, 'Initial checkpoint');
+
+    core.updateProjectSettings(jsRepo, { testCommand: 'node --test' });
+    const inc = await core.collectIncidentBundle(jsRepo, 'Short name rejection', 'AssertionError');
+
+    const gitShort = getWindowsShortName(jsRepo, '.git');
+    if (!gitShort) {
+      console.log('SKIPPED(Windows short names not available or non-Windows)');
+      return;
+    }
+
+    const configFile = path.join(jsRepo, '.git', 'config');
+    const initialConfigContent = fs.readFileSync(configFile, 'utf8');
+    const hookFile = path.join(jsRepo, '.git', 'hooks', 'pre-commit');
+
+    // 1. .git short name + /hooks/pre-commit
+    await assert.rejects(
+      async () => {
+        await core.proposeAndVerifyRepair(jsRepo, inc.id, 'Short name hooks escape', [
+          { filePath: `${gitShort}/hooks/pre-commit`, newContent: '#!/bin/sh\necho hacked\n' },
+        ]);
+      },
+      (err: any) => {
+        assert.strictEqual(err.code, 'INVALID_FILE_PATH');
+        return true;
+      }
+    );
+
+    // 2. .git short name + /config
+    await assert.rejects(
+      async () => {
+        await core.proposeAndVerifyRepair(jsRepo, inc.id, 'Short name config overwrite', [
+          { filePath: `${gitShort}/config`, newContent: '[core]\ncorrupted = true\n' },
+        ]);
+      },
+      (err: any) => {
+        assert.strictEqual(err.code, 'INVALID_FILE_PATH');
+        return true;
+      }
+    );
+
+    // Verify files in .git untouched
+    assert.strictEqual(fs.existsSync(hookFile), false, '.git/hooks/pre-commit must not be created');
+    assert.strictEqual(fs.readFileSync(configFile, 'utf8'), initialConfigContent, '.git/config must remain intact');
+  });
+
+  test('133. B-2 Step 4-2c: applyApprovedRepair rejects .git 8.3 short name paths with INVALID_FILE_PATH and records APPLY_REJECTED', async () => {
+    const jsRepo = path.join(testRoot, 'b2_s42c_t133_apply');
+    fs.mkdirSync(jsRepo, { recursive: true });
+    execFileSync('git', ['init', '-b', 'main'], { cwd: jsRepo });
+    execFileSync('git', ['config', 'user.name', 'Tester'], { cwd: jsRepo });
+    execFileSync('git', ['config', 'user.email', 'test@local'], { cwd: jsRepo });
+
+    fs.writeFileSync(path.join(jsRepo, 'package.json'), JSON.stringify({ type: 'module' }));
+    fs.writeFileSync(path.join(jsRepo, 'calc.js'), 'export function add(a, b) { return a + b + 1; }\n');
+    execFileSync('git', ['add', '.'], { cwd: jsRepo });
+    execFileSync('git', ['commit', '-m', 'initial'], { cwd: jsRepo });
+    core.captureCheckpoint(jsRepo, 'Initial checkpoint');
+
+    core.updateProjectSettings(jsRepo, { testCommand: 'node --test' });
+    const project = core.ensureProject(jsRepo);
+    const inc = await core.collectIncidentBundle(jsRepo, 'Apply Short Name Incident', 'AssertionError');
+
+    const gitShort = getWindowsShortName(jsRepo, '.git');
+    if (!gitShort) {
+      console.log('SKIPPED(Windows short names not available or non-Windows)');
+      return;
+    }
+
+    const configFile = path.join(jsRepo, '.git', 'config');
+    const initialConfigContent = fs.readFileSync(configFile, 'utf8');
+    const hookFile = path.join(jsRepo, '.git', 'hooks', 'pre-commit');
+
+    const testTargets = [
+      { path: `${gitShort}/hooks/pre-commit`, content: '#!/bin/sh\necho hacked\n' },
+      { path: `${gitShort}/config`, content: '[core]\ncorrupted = true\n' },
+    ];
+
+    for (let i = 0; i < testTargets.length; i++) {
+      const target = testTargets[i];
+      const proposalId = `prp_short_apply_${i}_` + Date.now();
+      const fileChangesJson = JSON.stringify([{ filePath: target.path, newContent: target.content }]);
+      const createdAt = new Date().toISOString();
+      const secret = getInstallationSecretKey();
+      const rowSig = computeProposalRowSignature(secret, {
+        id: proposalId,
+        incident_id: inc.id,
+        project_id: project.id,
+        file_changes_json: fileChangesJson,
+        verification_status: 'VERIFIED_PASS',
+        created_at: createdAt,
+      });
+
+      core.getDatabase().insertRepairProposal({
+        id: proposalId,
+        incidentId: inc.id,
+        rootCauseAnalysis: `Short name target ${target.path}`,
+        fileChangesJson,
+        patchDiff: `diff --git a/${target.path} b/${target.path}\n`,
+        touchedFiles: [target.path],
+        verificationStatus: 'VERIFIED_PASS',
+        verificationLog: 'tests pass',
+        riskLevel: 'LOW',
+        approvalStatus: 'AWAITING_USER',
+        approvalReadiness: 'READY_FOR_APPROVAL',
+        stages: [],
+        threeLevelHealth: { code: 'PASS', functional: 'PASS', requirement: 'PASS' },
+        verifiedWithCommand: 'node --test',
+        approvalFingerprintJson: null,
+        approvedAt: null,
+        appliedAt: null,
+        rowSignature: rowSig,
+        createdAt,
+      });
+
+      core.approveProposal(proposalId);
+
+      assert.throws(
+        () => {
+          core.applyApprovedRepair(jsRepo, proposalId);
+        },
+        (err: any) => {
+          assert.strictEqual(err.code, 'INVALID_FILE_PATH');
+          return true;
+        }
+      );
+
+      // Verify files in .git untouched
+      assert.strictEqual(fs.existsSync(hookFile), false, '.git/hooks/pre-commit must not be created');
+      assert.strictEqual(fs.readFileSync(configFile, 'utf8'), initialConfigContent, '.git/config must remain intact');
+
+      // Verify audit log recorded APPLY_REJECTED
+      const auditLogs = core.getDatabase().getAuditLogs();
+      const rejectAudit = auditLogs.find((l: any) => l.kind === 'APPLY_REJECTED' && l.entityId === proposalId);
+      assert.ok(rejectAudit, `Audit log must record APPLY_REJECTED for proposal ${proposalId}`);
+    }
+  });
+
+  test('134. B-2 Step 4-2c: proposeAndVerifyRepair with locked test 8.3 short name is rejected with REPAIR_MODIFIES_LOCKED_TEST', async () => {
+    const jsRepo = path.join(testRoot, 'b2_s42c_t134_lock');
+    fs.mkdirSync(jsRepo, { recursive: true });
+    execFileSync('git', ['init', '-b', 'main'], { cwd: jsRepo });
+    execFileSync('git', ['config', 'user.name', 'Tester'], { cwd: jsRepo });
+    execFileSync('git', ['config', 'user.email', 'test@local'], { cwd: jsRepo });
+
+    fs.writeFileSync(path.join(jsRepo, 'package.json'), JSON.stringify({ type: 'module' }));
+    fs.writeFileSync(path.join(jsRepo, 'calc.js'), 'export function add(a, b) { return a + b + 1; }\n');
+    execFileSync('git', ['add', '.'], { cwd: jsRepo });
+    execFileSync('git', ['commit', '-m', 'buggy calc'], { cwd: jsRepo });
+    core.captureCheckpoint(jsRepo, 'Initial checkpoint');
+
+    core.updateProjectSettings(jsRepo, { testCommand: 'node --test' });
+    const inc = await core.collectIncidentBundle(jsRepo, 'Short name lock incident', 'AssertionError');
+
+    fs.writeFileSync(
+      path.join(jsRepo, 'test_repro.js'),
+      'import test from "node:test";\nimport assert from "node:assert";\nimport { add } from "./calc.js";\n\ntest("repro", () => {\n  assert.strictEqual(add(1, 2), 3);\n});\n'
+    );
+    const reproRes = await core.runReproduction(jsRepo, inc.id, 'test_repro.js');
+    assert.strictEqual(reproRes.status, 'REPRODUCED');
+    assert.strictEqual(reproRes.lockStatus, 'LOCKED');
+
+    const testShort = getWindowsShortName(jsRepo, 'test_repro.js');
+    if (!testShort) {
+      console.log('SKIPPED(Windows short names not available or non-Windows)');
+      return;
+    }
+
+    // Attempting to modify locked test using its 8.3 short name must be rejected with REPAIR_MODIFIES_LOCKED_TEST
+    await assert.rejects(
+      async () => {
+        await core.proposeAndVerifyRepair(jsRepo, inc.id, 'Short name test modification', [
+          { filePath: testShort, replacements: [{ search: 'add(1, 2), 3', replace: 'add(1, 2), 4' }] },
+        ]);
+      },
+      (err: any) => {
+        assert.strictEqual(err.code, 'REPAIR_MODIFIES_LOCKED_TEST');
+        return true;
+      }
+    );
+
+    // Normal repair modifying only calc.js in same repo still passes with VERIFIED_PASS
+    const { proposal, executionResult } = await core.proposeAndVerifyRepair(jsRepo, inc.id, 'calc.js 버그 정상 수정', [
+      { filePath: 'calc.js', replacements: [{ search: 'a + b + 1', replace: 'a + b' }] },
+    ]);
+    assert.strictEqual(proposal.verificationStatus, 'VERIFIED_PASS');
+    assert.strictEqual(executionResult.success, true);
+  });
+
+  test('135. B-2 Step 4-2c: validateRepoRelativeFilePath unit test for sub .git rejection, dotfile passing, and short name resolution', () => {
+    // 1. Rejection cases for .git at any depth
+    const rejectCases = ['sub/.git/config', 'a/.GIT/x', '.git/config', 'deep/nested/.git/hooks/pre-commit'];
+    for (const tc of rejectCases) {
+      assert.throws(
+        () => {
+          validateRepoRelativeFilePath(testRoot, tc);
+        },
+        (err: any) => {
+          assert.strictEqual(err.code, 'INVALID_FILE_PATH', `Expected INVALID_FILE_PATH for ${tc}`);
+          return true;
+        }
+      );
+    }
+
+    // 2. Normal dotfiles and normal paths must pass
+    const passCases = [
+      '.gitignore',
+      '.gitattributes',
+      '.github/workflows/ci.yml',
+      'src/.gitkeep',
+      'sub/.gitignore',
+      'calc.js',
+    ];
+    for (const tc of passCases) {
+      const res = validateRepoRelativeFilePath(testRoot, tc);
+      assert.strictEqual(res, tc.replace(/\\/g, '/'), `Expected pass for ${tc}`);
+    }
+
+    // 3. Short name resolution check
+    const dirForShort = path.join(testRoot, 'b2_s42c_t135_short_unit');
+    fs.mkdirSync(dirForShort, { recursive: true });
+    fs.writeFileSync(path.join(dirForShort, 'test_repro.js'), 'content');
+
+    const testShort = getWindowsShortName(dirForShort, 'test_repro.js');
+    if (testShort) {
+      const resolved = validateRepoRelativeFilePath(dirForShort, testShort);
+      assert.strictEqual(resolved, 'test_repro.js', 'validateRepoRelativeFilePath must return canonical long name');
+    }
+  });
 });

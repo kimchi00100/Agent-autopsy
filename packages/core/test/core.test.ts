@@ -5204,4 +5204,257 @@ def test_slow():
     assert.ok(repro.assertFlip, 'assertFlip must be defined');
     assert.strictEqual(repro.assertFlip.verdict, 'FLIP_CONFIRMED');
   });
+
+  test('107. B-2 Step 4-1: node:test for, if, try, while blocks enclosing assertion -> all FLIP_CONFIRMED', async () => {
+    const jsRepo = path.join(testRoot, 'b2_s41_t107_node_blocks_assert');
+    fs.mkdirSync(jsRepo, { recursive: true });
+    execFileSync('git', ['init', '-b', 'main'], { cwd: jsRepo });
+    execFileSync('git', ['config', 'user.name', 'Tester'], { cwd: jsRepo });
+    execFileSync('git', ['config', 'user.email', 'test@local'], { cwd: jsRepo });
+
+    fs.writeFileSync(path.join(jsRepo, 'package.json'), JSON.stringify({ type: 'module' }));
+    fs.writeFileSync(path.join(jsRepo, 'calc.js'), 'export function add(a, b) { return a + b + 1; }\n');
+    execFileSync('git', ['add', '.'], { cwd: jsRepo });
+    execFileSync('git', ['commit', '-m', 'buggy calc'], { cwd: jsRepo });
+    core.captureCheckpoint(jsRepo, 'Bug state');
+
+    const inc = await core.collectIncidentBundle(jsRepo, 'node blocks bug', 'AssertionError');
+    core.updateProjectSettings(jsRepo, { testCommand: 'node --test' });
+
+    // 1) for block
+    fs.writeFileSync(
+      path.join(jsRepo, 'pre_for.js'),
+      'import test from "node:test";\nimport assert from "node:assert";\nimport { add } from "./calc.js";\n\ntest("for test", () => {\n  for (const c of [1]) {\n    assert.strictEqual(add(c, 2), 4);\n  }\n});\n'
+    );
+    fs.writeFileSync(
+      path.join(jsRepo, 'repro_for.js'),
+      'import test from "node:test";\nimport assert from "node:assert";\nimport { add } from "./calc.js";\n\ntest("for test", () => {\n  for (const c of [1]) {\n    assert.strictEqual(add(c, 2), 3);\n  }\n});\n'
+    );
+    const reproFor = await core.runReproduction(jsRepo, inc.id, 'repro_for.js', { preFlipTestFilePath: 'pre_for.js' });
+    assert.strictEqual(reproFor.status, 'REPRODUCED');
+    assert.strictEqual(reproFor.assertFlip?.verdict, 'FLIP_CONFIRMED');
+
+    // 2) if block
+    fs.writeFileSync(
+      path.join(jsRepo, 'pre_if.js'),
+      'import test from "node:test";\nimport assert from "node:assert";\nimport { add } from "./calc.js";\n\ntest("if test", () => {\n  if (true) {\n    assert.strictEqual(add(1, 2), 4);\n  }\n});\n'
+    );
+    fs.writeFileSync(
+      path.join(jsRepo, 'repro_if.js'),
+      'import test from "node:test";\nimport assert from "node:assert";\nimport { add } from "./calc.js";\n\ntest("if test", () => {\n  if (true) {\n    assert.strictEqual(add(1, 2), 3);\n  }\n});\n'
+    );
+    const reproIf = await core.runReproduction(jsRepo, inc.id, 'repro_if.js', { preFlipTestFilePath: 'pre_if.js' });
+    assert.strictEqual(reproIf.status, 'REPRODUCED');
+    assert.strictEqual(reproIf.assertFlip?.verdict, 'FLIP_CONFIRMED');
+
+    // 3) try block
+    fs.writeFileSync(
+      path.join(jsRepo, 'pre_try.js'),
+      'import test from "node:test";\nimport assert from "node:assert";\nimport { add } from "./calc.js";\n\ntest("try test", () => {\n  try {\n    assert.strictEqual(add(1, 2), 4);\n  } finally {}\n});\n'
+    );
+    fs.writeFileSync(
+      path.join(jsRepo, 'repro_try.js'),
+      'import test from "node:test";\nimport assert from "node:assert";\nimport { add } from "./calc.js";\n\ntest("try test", () => {\n  try {\n    assert.strictEqual(add(1, 2), 3);\n  } finally {}\n});\n'
+    );
+    const reproTry = await core.runReproduction(jsRepo, inc.id, 'repro_try.js', { preFlipTestFilePath: 'pre_try.js' });
+    assert.strictEqual(reproTry.status, 'REPRODUCED');
+    assert.strictEqual(reproTry.assertFlip?.verdict, 'FLIP_CONFIRMED');
+
+    // 4) while block
+    fs.writeFileSync(
+      path.join(jsRepo, 'pre_while.js'),
+      'import test from "node:test";\nimport assert from "node:assert";\nimport { add } from "./calc.js";\n\ntest("while test", () => {\n  while (true) {\n    assert.strictEqual(add(1, 2), 4);\n    break;\n  }\n});\n'
+    );
+    fs.writeFileSync(
+      path.join(jsRepo, 'repro_while.js'),
+      'import test from "node:test";\nimport assert from "node:assert";\nimport { add } from "./calc.js";\n\ntest("while test", () => {\n  while (true) {\n    assert.strictEqual(add(1, 2), 3);\n    break;\n  }\n});\n'
+    );
+    const reproWhile = await core.runReproduction(jsRepo, inc.id, 'repro_while.js', { preFlipTestFilePath: 'pre_while.js' });
+    assert.strictEqual(reproWhile.status, 'REPRODUCED');
+    assert.strictEqual(reproWhile.assertFlip?.verdict, 'FLIP_CONFIRMED');
+  });
+
+  test('108. B-2 Step 4-1: node:test regex literal /\\(/ and template string `(${1}` preceding assert -> FLIP_CONFIRMED', async () => {
+    const jsRepo = path.join(testRoot, 'b2_s41_t108_node_regex_template');
+    fs.mkdirSync(jsRepo, { recursive: true });
+    execFileSync('git', ['init', '-b', 'main'], { cwd: jsRepo });
+    execFileSync('git', ['config', 'user.name', 'Tester'], { cwd: jsRepo });
+    execFileSync('git', ['config', 'user.email', 'test@local'], { cwd: jsRepo });
+
+    fs.writeFileSync(path.join(jsRepo, 'package.json'), JSON.stringify({ type: 'module' }));
+    fs.writeFileSync(path.join(jsRepo, 'calc.js'), 'export function add(a, b) { return a + b + 1; }\n');
+    execFileSync('git', ['add', '.'], { cwd: jsRepo });
+    execFileSync('git', ['commit', '-m', 'buggy calc'], { cwd: jsRepo });
+    core.captureCheckpoint(jsRepo, 'Bug state');
+
+    const inc = await core.collectIncidentBundle(jsRepo, 'regex template bug', 'AssertionError');
+    core.updateProjectSettings(jsRepo, { testCommand: 'node --test' });
+
+    // 1) Regex literal with paren /\(/
+    fs.writeFileSync(
+      path.join(jsRepo, 'pre_regex.js'),
+      'import test from "node:test";\nimport assert from "node:assert";\nimport { add } from "./calc.js";\n\ntest("regex test", () => {\n  const re = /\\(/;\n  assert.strictEqual(add(1, 2), 4);\n});\n'
+    );
+    fs.writeFileSync(
+      path.join(jsRepo, 'repro_regex.js'),
+      'import test from "node:test";\nimport assert from "node:assert";\nimport { add } from "./calc.js";\n\ntest("regex test", () => {\n  const re = /\\(/;\n  assert.strictEqual(add(1, 2), 3);\n});\n'
+    );
+    const reproRegex = await core.runReproduction(jsRepo, inc.id, 'repro_regex.js', { preFlipTestFilePath: 'pre_regex.js' });
+    assert.strictEqual(reproRegex.status, 'REPRODUCED');
+    assert.strictEqual(reproRegex.assertFlip?.verdict, 'FLIP_CONFIRMED');
+
+    // 2) Template string with paren and interpolation
+    fs.writeFileSync(
+      path.join(jsRepo, 'pre_tpl.js'),
+      'import test from "node:test";\nimport assert from "node:assert";\nimport { add } from "./calc.js";\n\ntest("template test", () => {\n  const s = `(${1}`;\n  assert.strictEqual(add(1, 2), 4);\n});\n'
+    );
+    fs.writeFileSync(
+      path.join(jsRepo, 'repro_tpl.js'),
+      'import test from "node:test";\nimport assert from "node:assert";\nimport { add } from "./calc.js";\n\ntest("template test", () => {\n  const s = `(${1}`;\n  assert.strictEqual(add(1, 2), 3);\n});\n'
+    );
+    const reproTpl = await core.runReproduction(jsRepo, inc.id, 'repro_tpl.js', { preFlipTestFilePath: 'pre_tpl.js' });
+    assert.strictEqual(reproTpl.status, 'REPRODUCED');
+    assert.strictEqual(reproTpl.assertFlip?.verdict, 'FLIP_CONFIRMED');
+  });
+
+  test('109. B-2 Step 4-1: node:test describe/it with async arrow and multiline assert -> FLIP_CONFIRMED', async () => {
+    const jsRepo = path.join(testRoot, 'b2_s41_t109_node_describe_async');
+    fs.mkdirSync(jsRepo, { recursive: true });
+    execFileSync('git', ['init', '-b', 'main'], { cwd: jsRepo });
+    execFileSync('git', ['config', 'user.name', 'Tester'], { cwd: jsRepo });
+    execFileSync('git', ['config', 'user.email', 'test@local'], { cwd: jsRepo });
+
+    fs.writeFileSync(path.join(jsRepo, 'package.json'), JSON.stringify({ type: 'module' }));
+    fs.writeFileSync(path.join(jsRepo, 'calc.js'), 'export function add(a, b) { return a + b + 1; }\n');
+    execFileSync('git', ['add', '.'], { cwd: jsRepo });
+    execFileSync('git', ['commit', '-m', 'buggy calc'], { cwd: jsRepo });
+    core.captureCheckpoint(jsRepo, 'Bug state');
+
+    const inc = await core.collectIncidentBundle(jsRepo, 'describe async bug', 'AssertionError');
+    core.updateProjectSettings(jsRepo, { testCommand: 'node --test' });
+
+    fs.writeFileSync(
+      path.join(jsRepo, 'pre_desc.js'),
+      'import { describe, it } from "node:test";\nimport assert from "node:assert";\nimport { add } from "./calc.js";\n\ndescribe("suite", () => {\n  it("nested test", async () => {\n    assert.strictEqual(\n      add(1, 2),\n      4\n    );\n  });\n});\n'
+    );
+    fs.writeFileSync(
+      path.join(jsRepo, 'repro_desc.js'),
+      'import { describe, it } from "node:test";\nimport assert from "node:assert";\nimport { add } from "./calc.js";\n\ndescribe("suite", () => {\n  it("nested test", async () => {\n    assert.strictEqual(\n      add(1, 2),\n      3\n    );\n  });\n});\n'
+    );
+
+    const repro = await core.runReproduction(jsRepo, inc.id, 'repro_desc.js', { preFlipTestFilePath: 'pre_desc.js' });
+    assert.strictEqual(repro.status, 'REPRODUCED');
+    assert.ok(repro.assertFlip);
+    assert.strictEqual(repro.assertFlip.verdict, 'FLIP_CONFIRMED');
+  });
+
+  test('110. B-2 Step 4-1: node:test multiline assert.deepStrictEqual with object literal expected value -> FLIP_CONFIRMED', async () => {
+    const jsRepo = path.join(testRoot, 'b2_s41_t110_node_obj_literal');
+    fs.mkdirSync(jsRepo, { recursive: true });
+    execFileSync('git', ['init', '-b', 'main'], { cwd: jsRepo });
+    execFileSync('git', ['config', 'user.name', 'Tester'], { cwd: jsRepo });
+    execFileSync('git', ['config', 'user.email', 'test@local'], { cwd: jsRepo });
+
+    fs.writeFileSync(path.join(jsRepo, 'package.json'), JSON.stringify({ type: 'module' }));
+    // Function returning { a: 2 } (buggy, expected { a: 1 })
+    fs.writeFileSync(path.join(jsRepo, 'calc.js'), 'export function getObj() { return { a: 2 }; }\n');
+    execFileSync('git', ['add', '.'], { cwd: jsRepo });
+    execFileSync('git', ['commit', '-m', 'buggy calc'], { cwd: jsRepo });
+    core.captureCheckpoint(jsRepo, 'Bug state');
+
+    const inc = await core.collectIncidentBundle(jsRepo, 'object literal bug', 'AssertionError');
+    core.updateProjectSettings(jsRepo, { testCommand: 'node --test' });
+
+    // pre-flip confirms buggy behavior { a: 2 }
+    fs.writeFileSync(
+      path.join(jsRepo, 'pre_obj.js'),
+      'import test from "node:test";\nimport assert from "node:assert";\nimport { getObj } from "./calc.js";\n\ntest("obj test", () => {\n  assert.deepStrictEqual(\n    getObj(),\n    { a: 2 }\n  );\n});\n'
+    );
+    // flipped asserts expected behavior { a: 1 } -> fails with AssertionError
+    fs.writeFileSync(
+      path.join(jsRepo, 'repro_obj.js'),
+      'import test from "node:test";\nimport assert from "node:assert";\nimport { getObj } from "./calc.js";\n\ntest("obj test", () => {\n  assert.deepStrictEqual(\n    getObj(),\n    { a: 1 }\n  );\n});\n'
+    );
+
+    const repro = await core.runReproduction(jsRepo, inc.id, 'repro_obj.js', { preFlipTestFilePath: 'pre_obj.js' });
+    assert.strictEqual(repro.status, 'REPRODUCED');
+    assert.ok(repro.assertFlip);
+    assert.strictEqual(repro.assertFlip.verdict, 'FLIP_CONFIRMED');
+  });
+
+  test('111. B-2 Step 4-1: node:test for loop input array line changed -> FLIP_CHANGED_NON_ASSERTION', async () => {
+    const jsRepo = path.join(testRoot, 'b2_s41_t111_node_for_input_change');
+    fs.mkdirSync(jsRepo, { recursive: true });
+    execFileSync('git', ['init', '-b', 'main'], { cwd: jsRepo });
+    execFileSync('git', ['config', 'user.name', 'Tester'], { cwd: jsRepo });
+    execFileSync('git', ['config', 'user.email', 'test@local'], { cwd: jsRepo });
+
+    fs.writeFileSync(path.join(jsRepo, 'package.json'), JSON.stringify({ type: 'module' }));
+    fs.writeFileSync(path.join(jsRepo, 'calc.js'), 'export function add(a, b) { return a + b + 1; }\n');
+    execFileSync('git', ['add', '.'], { cwd: jsRepo });
+    execFileSync('git', ['commit', '-m', 'buggy calc'], { cwd: jsRepo });
+    core.captureCheckpoint(jsRepo, 'Bug state');
+
+    const inc = await core.collectIncidentBundle(jsRepo, 'for input change bug', 'AssertionError');
+    core.updateProjectSettings(jsRepo, { testCommand: 'node --test' });
+
+    // In pre_test, [1] -> add(1, 2) is 4 == 4 (passes)
+    fs.writeFileSync(
+      path.join(jsRepo, 'pre_test.js'),
+      'import test from "node:test";\nimport assert from "node:assert";\nimport { add } from "./calc.js";\n\ntest("for input", () => {\n  for (const c of [\n    1\n  ]) {\n    assert.strictEqual(add(c, 2), 4);\n  }\n});\n'
+    );
+    // In test_repro, [0] -> add(0, 2) is 3 != 4 (fails with AssertionError)
+    fs.writeFileSync(
+      path.join(jsRepo, 'test_repro.js'),
+      'import test from "node:test";\nimport assert from "node:assert";\nimport { add } from "./calc.js";\n\ntest("for input", () => {\n  for (const c of [\n    0\n  ]) {\n    assert.strictEqual(add(c, 2), 4);\n  }\n});\n'
+    );
+
+    const repro = await core.runReproduction(jsRepo, inc.id, 'test_repro.js', { preFlipTestFilePath: 'pre_test.js' });
+    assert.strictEqual(repro.status, 'REPRODUCED');
+    assert.ok(repro.assertFlip);
+    assert.strictEqual(repro.assertFlip.verdict, 'FLIP_CHANGED_NON_ASSERTION');
+    assert.ok(repro.assertFlip.nonAssertionChangedLines && repro.assertFlip.nonAssertionChangedLines.length > 0);
+  });
+
+  test('112. B-2 Step 4-1: pytest for/with/if blocks and multiline paren assert expected value -> all FLIP_CONFIRMED', async () => {
+    const pyRepo = path.join(testRoot, 'b2_s41_t112_pytest_blocks_and_paren');
+    fs.mkdirSync(pyRepo, { recursive: true });
+    execFileSync('git', ['init', '-b', 'main'], { cwd: pyRepo });
+    execFileSync('git', ['config', 'user.name', 'Tester'], { cwd: pyRepo });
+    execFileSync('git', ['config', 'user.email', 'test@local'], { cwd: pyRepo });
+
+    fs.writeFileSync(path.join(pyRepo, 'calc.py'), 'def add(a, b):\n    return a + b + 1\n');
+    execFileSync('git', ['add', '.'], { cwd: pyRepo });
+    execFileSync('git', ['commit', '-m', 'buggy calc'], { cwd: pyRepo });
+    core.captureCheckpoint(pyRepo, 'Bug state');
+
+    const inc = await core.collectIncidentBundle(pyRepo, 'pytest blocks bug', 'AssertionError');
+    core.updateProjectSettings(pyRepo, { testCommand: 'python -m pytest' });
+
+    // 1) for / if block
+    fs.writeFileSync(
+      path.join(pyRepo, 'pre_blocks.py'),
+      'from calc import add\n\ndef test_nested():\n    for i in [1]:\n        if True:\n            assert add(i, 2) == 4\n'
+    );
+    fs.writeFileSync(
+      path.join(pyRepo, 'repro_blocks.py'),
+      'from calc import add\n\ndef test_nested():\n    for i in [1]:\n        if True:\n            assert add(i, 2) == 3\n'
+    );
+    const reproBlocks = await core.runReproduction(pyRepo, inc.id, 'repro_blocks.py', { preFlipTestFilePath: 'pre_blocks.py' });
+    assert.strictEqual(reproBlocks.status, 'REPRODUCED');
+    assert.strictEqual(reproBlocks.assertFlip?.verdict, 'FLIP_CONFIRMED');
+
+    // 2) multiline assert with parentheses
+    fs.writeFileSync(
+      path.join(pyRepo, 'pre_paren.py'),
+      'from calc import add\n\ndef test_paren():\n    assert (\n        add(1, 2) == 4\n    )\n'
+    );
+    fs.writeFileSync(
+      path.join(pyRepo, 'repro_paren.py'),
+      'from calc import add\n\ndef test_paren():\n    assert (\n        add(1, 2) == 3\n    )\n'
+    );
+    const reproParen = await core.runReproduction(pyRepo, inc.id, 'repro_paren.py', { preFlipTestFilePath: 'pre_paren.py' });
+    assert.strictEqual(reproParen.status, 'REPRODUCED');
+    assert.strictEqual(reproParen.assertFlip?.verdict, 'FLIP_CONFIRMED');
+  });
 });

@@ -247,6 +247,27 @@ function unwrapCppDeclarator(node: Parser.SyntaxNode | null): { name: string } |
   return null;
 }
 
+export async function parseWithTreeSitterForRunner(
+  runnerType: string,
+  content: string
+): Promise<Parser.Tree | null> {
+  try {
+    let spec: LanguageSpec | null = null;
+    if (runnerType === 'pytest' || runnerType === 'unittest') {
+      spec = EXTENSION_MAP['.py'];
+    } else if (runnerType === 'node:test') {
+      spec = EXTENSION_MAP['.js'];
+    }
+    if (!spec) return null;
+    const lang = await getLanguage(spec);
+    const parser = new Parser();
+    parser.setLanguage(lang);
+    return parser.parse(content);
+  } catch {
+    return null;
+  }
+}
+
 export async function extractFunctions(filePath: string, content: string): Promise<FunctionExtractionResult> {
   const ext = path.extname(filePath).toLowerCase();
   const spec = EXTENSION_MAP[ext];

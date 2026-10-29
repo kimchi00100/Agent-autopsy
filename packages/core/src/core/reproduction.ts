@@ -19,6 +19,8 @@ import { parseStackFrames, analyzeIncident } from '../analysis/analyzer.js';
 import { verifyTestCommandSignature } from '../utils/security.js';
 import { locateChangeScope } from '../localization/change-localizer.js';
 import { SnapshotResult } from '../git/git-engine.js';
+import type Parser from 'web-tree-sitter';
+import { parseWithTreeSitterForRunner } from '../localization/function-extractor.js';
 
 type SupportedRunnerType = 'pytest' | 'unittest' | 'node:test' | 'unsupported';
 
@@ -158,205 +160,102 @@ function isInvertedComparisonPair(preRaw: string, flippedRaw: string, runnerType
   return false;
 }
 
-interface StatementScopeFrame {
-  parenDepth: number;
-  bracketDepth: number;
-  braceDepth: number;
-  currentStatementStart: number;
-  startParenDepth: number;
-  startBracketDepth: number;
-  startBraceDepth: number;
-  lineContinuation: boolean;
-}
+const PYTHON_STATEMENT_TYPES = new Set([
+  'assert_statement',
+  'expression_statement',
+  'return_statement',
+  'raise_statement',
+  'pass_statement',
+  'break_statement',
+  'continue_statement',
+  'import_statement',
+  'import_from_statement',
+  'for_statement',
+  'while_statement',
+  'if_statement',
+  'with_statement',
+  'try_statement',
+  'function_definition',
+  'class_definition',
+]);
 
-// 괄호 균형(( ) [ ] { })과 줄 이어짐으로 각 줄이 어느 문장의 시작에 속하는지 추적
-function buildStatementMap(lines: string[], runnerType: SupportedRunnerType): number[] {
-  const map = new Array(lines.length).fill(0);
-  let stringQuote: string | null = null;
-  let inBlockComment = false;
+const JS_STATEMENT_TYPES = new Set([
+  'expression_statement',
+  'lexical_declaration',
+  'variable_declaration',
+  'return_statement',
+  'throw_statement',
+  'break_statement',
+  'continue_statement',
+  'import_statement',
+  'export_statement',
+  'if_statement',
+  'for_statement',
+  'for_in_statement',
+  'for_of_statement',
+  'while_statement',
+  'do_statement',
+  'try_statement',
+  'switch_statement',
+  'function_declaration',
+  'class_declaration',
+]);
 
-  const stack: StatementScopeFrame[] = [
-    {
-      parenDepth: 0,
-      bracketDepth: 0,
-      braceDepth: 0,
-      currentStatementStart: -1,
-      startParenDepth: 0,
-      startBracketDepth: 0,
-      startBraceDepth: 0,
-      lineContinuation: false,
-    },
-  ];
+function findEnclosingStatement(
+  rootNode: Parser.SyntaxNode,
+  line0Indexed: number,
+  runnerType: SupportedRunnerType
+): Parser.SyntaxNode | null {
+  const statementTypes =
+    runnerType === 'pytest' || runnerType === 'unittest'
+      ? PYTHON_STATEMENT_TYPES
+      : JS_STATEMENT_TYPES;
 
-  for (let lineIdx = 0; lineIdx < lines.length; lineIdx++) {
-    const rawLine = lines[lineIdx];
-    let col = 0;
-    const len = rawLine.length;
-    let frame = stack[stack.length - 1];
-    frame.lineContinuation = false;
+  let bestNode: Parser.SyntaxNode | null = null;
 
-    while (col < len) {
-      if (stringQuote !== null) {
-        if (rawLine[col] === '\\') {
-          col += 2;
-          continue;
-        }
-        if (stringQuote === '"""' || stringQuote === "'''") {
-          if (rawLine.slice(col, col + 3) === stringQuote) {
-            stringQuote = null;
-            col += 3;
-            continue;
-          }
-        } else if (rawLine[col] === stringQuote) {
-          stringQuote = null;
-          col++;
-          continue;
-        }
-        col++;
-        continue;
-      }
+  function visit(node: Parser.SyntaxNode) {
+    const startRow = node.startPosition.row;
+    const endRow = node.endPosition.row;
 
-      if (inBlockComment) {
-        if (rawLine.slice(col, col + 2) === '*/') {
-          inBlockComment = false;
-          col += 2;
-          continue;
-        }
-        col++;
-        continue;
-      }
-
-      if (runnerType === 'pytest' || runnerType === 'unittest') {
-        if (rawLine[col] === '#') break;
-      } else if (runnerType === 'node:test') {
-        if (rawLine.slice(col, col + 2) === '//') break;
-        if (rawLine.slice(col, col + 2) === '/*') {
-          inBlockComment = true;
-          col += 2;
-          continue;
-        }
-      }
-
-      const ch = rawLine[col];
-      if (ch === ' ' || ch === '\t' || ch === '\r' || ch === '\n') {
-        col++;
-        continue;
-      }
-
-      // JS 함수 본문 블록: { 가 => 나 function 또는 test/it/describe 뒤에 올 때 새 스코프 시작
-      if (runnerType === 'node:test' && ch === '{') {
-        const prefix = rawLine.slice(0, col).trimEnd();
-        if (
-          /=>\s*$/.test(prefix) ||
-          /function\s*\w*\s*\([^)]*\)\s*$/.test(prefix) ||
-          /^(?:it|test|describe)\s*\(/.test(prefix)
-        ) {
-          stack.push({
-            parenDepth: 0,
-            bracketDepth: 0,
-            braceDepth: 1,
-            currentStatementStart: -1,
-            startParenDepth: 0,
-            startBracketDepth: 0,
-            startBraceDepth: 1,
-            lineContinuation: false,
-          });
-          frame = stack[stack.length - 1];
-          col++;
-          continue;
-        }
-      }
-
-      // JS 함수 본문 블록 닫힘
-      if (runnerType === 'node:test' && ch === '}' && stack.length > 1 && frame.braceDepth === 1) {
-        stack.pop();
-        frame = stack[stack.length - 1];
-        col++;
-        continue;
-      }
-
-      if (frame.currentStatementStart === -1) {
-        frame.currentStatementStart = lineIdx;
-        frame.startParenDepth = frame.parenDepth;
-        frame.startBracketDepth = frame.bracketDepth;
-        frame.startBraceDepth = frame.braceDepth;
-      }
-
-      // 문자열 시작 검사
-      if (runnerType === 'pytest' || runnerType === 'unittest') {
-        if (rawLine.slice(col, col + 3) === '"""') {
-          stringQuote = '"""';
-          col += 3;
-          continue;
-        }
-        if (rawLine.slice(col, col + 3) === "'''") {
-          stringQuote = "'''";
-          col += 3;
-          continue;
-        }
-        if (ch === '"' || ch === "'") {
-          stringQuote = ch;
-          col++;
-          continue;
-        }
-      } else {
-        if (ch === '"' || ch === "'" || ch === '`') {
-          stringQuote = ch;
-          col++;
-          continue;
-        }
-      }
-
-      // 괄호 깊이 갱신
-      if (ch === '(') frame.parenDepth++;
-      else if (ch === ')') frame.parenDepth = Math.max(0, frame.parenDepth - 1);
-      else if (ch === '[') frame.bracketDepth++;
-      else if (ch === ']') frame.bracketDepth = Math.max(0, frame.bracketDepth - 1);
-      else if (ch === '{') frame.braceDepth++;
-      else if (ch === '}') frame.braceDepth = Math.max(0, frame.braceDepth - 1);
-
-      col++;
+    if (line0Indexed < startRow || line0Indexed > endRow) {
+      return;
     }
 
-    if (stringQuote === null && !inBlockComment) {
-      const codePart = rawLine.slice(0, col).trimEnd();
-      if (codePart.endsWith('\\')) {
-        frame.lineContinuation = true;
-      }
+    if (statementTypes.has(node.type)) {
+      bestNode = node;
     }
 
-    map[lineIdx] = frame.currentStatementStart !== -1 ? frame.currentStatementStart : lineIdx;
-
-    const hasUnclosedParens = frame.parenDepth > frame.startParenDepth;
-    const hasUnclosedBrackets = frame.bracketDepth > frame.startBracketDepth;
-    const hasUnclosedBraces = frame.braceDepth > frame.startBraceDepth;
-    const inString = stringQuote !== null;
-
-    if (
-      !hasUnclosedParens &&
-      !hasUnclosedBrackets &&
-      !hasUnclosedBraces &&
-      !inString &&
-      !inBlockComment &&
-      !frame.lineContinuation
-    ) {
-      frame.currentStatementStart = -1;
+    for (let i = 0; i < node.childCount; i++) {
+      const child = node.child(i);
+      if (child) visit(child);
     }
   }
 
-  return map;
+  visit(rootNode);
+  return bestNode;
+}
+
+function isNodeAssertion(
+  node: Parser.SyntaxNode | null,
+  lines: string[],
+  runnerType: SupportedRunnerType
+): boolean {
+  if (!node) return false;
+  if (node.type === 'assert_statement') return true;
+  const firstLine = lines[node.startPosition.row] ?? '';
+  return isAssertionLine(firstLine, runnerType);
 }
 
 // 간단한 줄 패턴 검사: 변경 덩어리(hunk) 안에서 1:1 짝을 맞춰 값 또는 비교 뒤집기 검사
-function diffAssertionLines(
+async function diffAssertionLines(
   preFlipContent: string,
   flippedContent: string,
   runnerType: SupportedRunnerType
-): {
+): Promise<{
   changedLineCount: number;
   nonAssertionChangedLines: AssertFlipNonAssertionLine[];
   note?: string;
-} {
+}> {
   const lines1 = preFlipContent.replace(/\r\n/g, '\n').split('\n').map((l) => l.trimEnd());
   const lines2 = flippedContent.replace(/\r\n/g, '\n').split('\n').map((l) => l.trimEnd());
   if (lines1.length > 0 && lines1[lines1.length - 1] === '') lines1.pop();
@@ -453,9 +352,19 @@ function diffAssertionLines(
     }
   }
 
-  // 3. For each pair within each hunk, check rules
-  const preStatementMap = buildStatementMap(lines1, runnerType);
-  const flippedStatementMap = buildStatementMap(lines2, runnerType);
+  // 3. For each pair within each hunk, check rules using tree-sitter statement boundaries
+  let preTree: Parser.Tree | null = null;
+  let flippedTree: Parser.Tree | null = null;
+  let usedFallback = false;
+
+  try {
+    preTree = await parseWithTreeSitterForRunner(runnerType, preFlipContent);
+    flippedTree = await parseWithTreeSitterForRunner(runnerType, flippedContent);
+  } catch {
+    preTree = null;
+    flippedTree = null;
+  }
+
   const nonAssertionChangedLines: AssertFlipNonAssertionLine[] = [];
   let note: string | undefined;
 
@@ -478,19 +387,28 @@ function diffAssertionLines(
         continue;
       }
 
-      // 괄호 균형과 줄 이어짐으로 바뀐 줄이 속한 문장의 첫 줄이 단언인지 확인
-      const preStmtStart = preStatementMap[pre.line - 1];
-      const flippedStmtStart = flippedStatementMap[flipped.line - 1];
-      const isPreAssertion = preStmtStart !== undefined && isAssertionLine(lines1[preStmtStart], runnerType);
-      const isFlippedAssertion = flippedStmtStart !== undefined && isAssertionLine(lines2[flippedStmtStart], runnerType);
+      // 구문 분석기(tree-sitter)로 바뀐 줄을 감싸는 가장 작은 문장 노드를 찾아 단언인지 판정
+      let isPreAssertion = false;
+      let isFlippedAssertion = false;
+
+      if (preTree && flippedTree) {
+        const preStmt = findEnclosingStatement(preTree.rootNode, pre.line - 1, runnerType);
+        const flippedStmt = findEnclosingStatement(flippedTree.rootNode, flipped.line - 1, runnerType);
+        isPreAssertion = isNodeAssertion(preStmt, lines1, runnerType);
+        isFlippedAssertion = isNodeAssertion(flippedStmt, lines2, runnerType);
+      } else {
+        // 구문 분석 실패/미지원 시 줄 첫머리 판정(isAssertionLine)으로 폴백
+        usedFallback = true;
+        isPreAssertion = isAssertionLine(pre.content, runnerType);
+        isFlippedAssertion = isAssertionLine(flipped.content, runnerType);
+      }
 
       // Check value-only difference (가)
-      // Must belong to an assertion statement and must not be a setup/assignment statement line
+      // Must belong to an assertion statement and (in fallback mode) must not be a setup/assignment statement line
       if (
         isPreAssertion &&
         isFlippedAssertion &&
-        !isSetupOrAssignmentLine(pre.content) &&
-        !isSetupOrAssignmentLine(flipped.content)
+        (!usedFallback || (!isSetupOrAssignmentLine(pre.content) && !isSetupOrAssignmentLine(flipped.content)))
       ) {
         const normPre = normalizeValueTokens(pre.content);
         const normFlipped = normalizeValueTokens(flipped.content);
@@ -505,6 +423,10 @@ function diffAssertionLines(
         note = '단언 줄에서 값·비교 말고 다른 부분이 바뀜';
       }
     }
+  }
+
+  if (usedFallback && !note) {
+    note = '구문 분석(tree-sitter) 미지원 또는 구문 오류로 줄 첫머리 판정으로 대체됨';
   }
 
   return {
@@ -969,7 +891,7 @@ export async function runReproduction(
       // Line diff check between pre-flip and flipped test files ("간단한 줄 패턴 검사")
       const preFlipContent = fs.readFileSync(hostPreFlipFile, 'utf8');
       const flippedContent = fs.readFileSync(hostFile, 'utf8');
-      const diffResult = diffAssertionLines(preFlipContent, flippedContent, runnerType);
+      const diffResult = await diffAssertionLines(preFlipContent, flippedContent, runnerType);
 
       const preFlipRuns = preFlipExec.runs;
       const allPreFlipPassed = preFlipRuns.length > 0 && preFlipRuns.every((r) => r.status === 'NOT_REPRODUCED');

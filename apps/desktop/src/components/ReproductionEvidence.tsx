@@ -69,6 +69,17 @@ export const GATE_STATE_TEXTS: Record<ReproductionGateState, string> = {
   NOT_ATTEMPTED: '재현 시도 전 (NOT_ATTEMPTED)',
 };
 
+/** 제목 줄 요약용 한국어 단독 명칭 (코드 값 제외) */
+export const GATE_STATE_KOREAN: Record<ReproductionGateState, string> = {
+  IN_PROGRESS: '재현 시도 진행 중',
+  ABANDONED: '재현 기권',
+  NEEDS_USER_DECISION: '사용자 결정 필요',
+  AUDIT_BROKEN: '감사 기록 손상',
+  WAIVED: '재현 없이 진행',
+  REPRODUCED: '재현 성공',
+  NOT_ATTEMPTED: '재현 시도 전',
+};
+
 export function ReproductionEvidenceBadge({ level }: { level: ReproductionEvidenceLevel }) {
   switch (level) {
     case 'STRONG':

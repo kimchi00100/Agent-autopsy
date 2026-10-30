@@ -32,9 +32,9 @@ const tones: Record<Tone, string> = {
   violet: 'bg-violet-50 text-violet-700 border-violet-200',
 };
 
-export function Badge({ tone = 'gray', children }: { tone?: Tone; children: React.ReactNode }) {
+export function Badge({ tone = 'gray', children, title }: { tone?: Tone; children: React.ReactNode; title?: string }) {
   return (
-    <span className={`inline-flex items-center gap-1 rounded-md px-2 py-0.5 text-xs font-medium border ${tones[tone]}`}>
+    <span title={title} className={`inline-flex items-center gap-1 rounded-md px-2 py-0.5 text-xs font-medium border ${tones[tone]}`}>
       {children}
     </span>
   );

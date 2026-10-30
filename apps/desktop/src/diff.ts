@@ -105,12 +105,23 @@ export function formatKoreanDateTime(iso: string): string {
 
 /**
  * 근거 문장 안의 긴 절대 경로(예: C:\Users\...\points_repro.js:5)를 파일 이름과 줄 번호(points_repro.js:5)로 축약한다.
+ * 절대 경로만 축약하며, 상대 경로, 분수(+1/-1), URL, 한국어 문장 속 슬래시는 보존한다.
  */
 export function shortenPathInEvidence(text: string): string {
   if (!text) return text;
-  return text.replace(
-    /(?:[a-zA-Z]:[\\/][^\s:,;'")\]]*[\\/]|(?:\/[^\s:,;'")\]/]+)*\/)([^\s\\/:,;'")\]]+(?::\d+(?::\d+)?)?)/g,
+
+  // 1. Windows 드라이브 경로(C:\... 또는 C:/...) 및 UNC 경로(\\server\share\...)
+  let result = text.replace(
+    /(?:[a-zA-Z]:[\\/]|\\\\)(?:[^\s\\/:*?"<>|,;'")\]]+[\\/])+([^\s\\/:*?"<>|,;'")\]]+(?::\d+(?::\d+)?)?)/g,
     '$1'
   );
+
+  // 2. POSIX 절대 경로(/로 시작하며 앞이 문자열 시작 또는 공백/괄호/따옴표인 경우)
+  result = result.replace(
+    /(^|[\s("'\[])\/(?:[^\s\\/:*?"<>|,;'")\]]+[\\/])+([^\s\\/:*?"<>|,;'")\]]+(?::\d+(?::\d+)?)?)/g,
+    '$1$2'
+  );
+
+  return result;
 }
 

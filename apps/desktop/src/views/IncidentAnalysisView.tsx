@@ -5,6 +5,7 @@ import {
   ReproductionProgressCard,
   ReproductionEvidenceBadge,
   GATE_STATE_TEXTS,
+  GATE_STATE_KOREAN,
 } from '../components/ReproductionEvidence';
 import CollapsibleSection from '../components/CollapsibleSection';
 import IncidentFlowGraph from './IncidentFlowGraph';
@@ -714,13 +715,13 @@ export default function IncidentAnalysisView({
                 warning={reproWarningBadge}
                 summary={
                   reproStatus?.gate ? (
-                    <Badge tone={
+                    <Badge title={reproStatus.gate.state} tone={
                       reproStatus.gate.state === 'REPRODUCED' ? 'green' :
                       reproStatus.gate.state === 'WAIVED' ? 'blue' :
                       reproStatus.gate.state === 'ABANDONED' || reproStatus.gate.state === 'AUDIT_BROKEN' ? 'red' :
                       reproStatus.gate.state === 'NEEDS_USER_DECISION' ? 'amber' : 'gray'
                     }>
-                      {GATE_STATE_TEXTS[reproStatus.gate.state] || reproStatus.gate.state}
+                      {GATE_STATE_KOREAN[reproStatus.gate.state] || reproStatus.gate.state}
                     </Badge>
                   ) : null
                 }

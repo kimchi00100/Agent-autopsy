@@ -341,7 +341,7 @@ export interface DecisionRecord {
   kind: string;
   decidedAt: string;
   reason: string | null;
-  recordStatus: 'OK' | 'MISMATCH' | 'NO_RECORD';
+  recordStatus: 'OK' | 'MISMATCH' | 'NO_RECORD' | 'UNVERIFIED';
 }
 
 export interface IncidentReproductionStatusResponse {

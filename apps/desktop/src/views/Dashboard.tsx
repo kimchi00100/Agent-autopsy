@@ -224,12 +224,22 @@ export default function Dashboard({
                           <span>
                             {auditChain.acknowledgementRecord.recordStatus === 'OK' && auditChain.acknowledgementRecord.reason
                               ? auditChain.acknowledgementRecord.reason
+                              : auditChain.acknowledgementRecord.recordStatus === 'UNVERIFIED' && auditChain.acknowledgementRecord.reason
+                              ? `(검증 안 됨) ${auditChain.acknowledgementRecord.reason}`
                               : '이유를 확인할 수 없습니다'}
                           </span>
                         </div>
                         <div className="shrink-0">
                           {auditChain.acknowledgementRecord.recordStatus === 'OK' && (
                             <Badge tone="green">기록 정상</Badge>
+                          )}
+                          {auditChain.acknowledgementRecord.recordStatus === 'UNVERIFIED' && (
+                            <Badge
+                              tone="amber"
+                              title="감사 기록이 깨졌거나 깨짐 확인 이전의 기록이라 이유를 검증할 수 없습니다."
+                            >
+                              검증 안 된 기록
+                            </Badge>
                           )}
                           {auditChain.acknowledgementRecord.recordStatus === 'MISMATCH' && (
                             <Badge tone="amber">이유 기록 불일치</Badge>
@@ -255,7 +265,10 @@ export default function Dashboard({
                     <div className="pt-1">
                       <Button
                         variant="default"
-                        onClick={() => setShowAcknowledgeModal(true)}
+                        onClick={async () => {
+                          if (checkAuditChain) await checkAuditChain();
+                          setShowAcknowledgeModal(true);
+                        }}
                       >
                         감사 기록 깨짐 확인
                       </Button>

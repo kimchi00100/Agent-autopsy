@@ -41,15 +41,20 @@ export function useAppData({ view, notify }: UseAppDataOptions) {
   const [onboarding, setOnboarding] = useState(false);
   const [testCommandInput, setTestCommandInput] = useState('');
   const [auditChain, setAuditChain] = useState<AuditChainVerificationResult | null>(null);
+  const isCheckingAuditChainRef = useRef(false);
 
   const checkAuditChain = useCallback(async () => {
+    if (isCheckingAuditChainRef.current) return null;
+    isCheckingAuditChainRef.current = true;
     try {
       const res = await api.auditChainStatus();
       if (res && res.result) {
         setAuditChain(res.result);
         return res.result;
       }
-    } catch {}
+    } catch {} finally {
+      isCheckingAuditChainRef.current = false;
+    }
     return null;
   }, []);
 
@@ -207,8 +212,11 @@ export function useAppData({ view, notify }: UseAppDataOptions) {
   // Real-time SSE stream listener + periodic fallback polling (every 20s as fallback)
   useEffect(() => {
     load();
-    const unsub = api.subscribeStream(() => {
+    const unsub = api.subscribeStream((event) => {
       load();
+      if (event?.type === 'db_sync') {
+        checkAuditChain();
+      }
     });
     const pollInterval = setInterval(() => {
       load();
@@ -217,7 +225,7 @@ export function useAppData({ view, notify }: UseAppDataOptions) {
       unsub();
       clearInterval(pollInterval);
     };
-  }, [load]);
+  }, [load, checkAuditChain]);
 
   useEffect(() => {
     if (!incidentId) {

@@ -2137,7 +2137,7 @@ export function getIncidentReproductionStatus(
     lock,
     evidence,
     otherBlockedIncidents,
-    decisions: ctx.db.getDecisionRecordsForIncident(incidentId),
+    decisions: ctx.db.getDecisionRecordsForIncident(incidentId, chainCheck),
   };
 }
 

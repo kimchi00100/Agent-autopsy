@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
+import { createPortal } from 'react-dom';
 import { X, AlertCircle } from 'lucide-react';
 import { Button } from '../ui';
 import { api } from '../api';
@@ -145,17 +146,9 @@ export function DecisionModal({
     }
   };
 
-  return (
-    <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/40 p-4 backdrop-blur-xs"
-      onClick={() => {
-        if (!submitting) onClose();
-      }}
-    >
-      <div
-        onClick={(e) => e.stopPropagation()}
-        className="w-[500px] shrink-0 rounded-2xl border border-slate-200 bg-white p-6 shadow-2xl space-y-4"
-      >
+  return createPortal(
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/40 p-4 backdrop-blur-xs">
+      <div className="w-[500px] shrink-0 rounded-2xl border border-slate-200 bg-white p-6 shadow-2xl space-y-4">
         <div className="flex items-start justify-between border-b border-slate-100 pb-3">
           <div className="text-base font-bold text-slate-900">{title}</div>
           <button
@@ -230,6 +223,7 @@ export function DecisionModal({
           </Button>
         </div>
       </div>
-    </div>
+    </div>,
+    document.body
   );
 }

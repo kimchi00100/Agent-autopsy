@@ -1974,7 +1974,7 @@ export class AutopsyDatabase {
    */
   public verifyAuditChain(overrideSecret?: string): AuditChainVerificationResult {
     const res = this.verifyAuditChainInternal(overrideSecret);
-    res.acknowledgementRecord = this.getLatestAuditChainAcknowledgementRecord();
+    res.acknowledgementRecord = this.getLatestAuditChainAcknowledgementRecord(res);
     return res;
   }
 
@@ -2429,7 +2429,7 @@ export class AutopsyDatabase {
    * Retrieves decision records for an incident from audit_log cross-checked with user_decisions.
    * Target kinds: REPRODUCTION_WAIVED, REPRODUCTION_ATTEMPTS_GRANTED in seq ASC order.
    */
-  public getDecisionRecordsForIncident(incidentId: string): DecisionRecord[] {
+  public getDecisionRecordsForIncident(incidentId: string, chainCheck?: AuditChainVerificationResult): DecisionRecord[] {
     const rows = this.db
       .prepare(`
         SELECT seq, created_at, kind, entity_type, entity_id, payload_hash
@@ -2441,13 +2441,13 @@ export class AutopsyDatabase {
       `)
       .all(incidentId) as any[];
 
-    return rows.map((r) => this.crossCheckDecisionRecord(r));
+    return rows.map((r) => this.crossCheckDecisionRecord(r, chainCheck));
   }
 
   /**
    * Retrieves the most recent AUDIT_CHAIN_ACKNOWLEDGED decision record cross-checked with user_decisions.
    */
-  public getLatestAuditChainAcknowledgementRecord(): DecisionRecord | null {
+  public getLatestAuditChainAcknowledgementRecord(chainCheck?: AuditChainVerificationResult): DecisionRecord | null {
     const row = this.db
       .prepare(`
         SELECT seq, created_at, kind, entity_type, entity_id, payload_hash
@@ -2459,13 +2459,13 @@ export class AutopsyDatabase {
       .get() as any | undefined;
 
     if (!row) return null;
-    return this.crossCheckDecisionRecord(row);
+    return this.crossCheckDecisionRecord(row, chainCheck);
   }
 
   /**
    * Cross-checks an audit_log decision row with user_decisions.
    */
-  private crossCheckDecisionRecord(auditRow: any): DecisionRecord {
+  private crossCheckDecisionRecord(auditRow: any, chainCheck?: AuditChainVerificationResult): DecisionRecord {
     const auditSeq = Number(auditRow.seq);
     const kind = String(auditRow.kind);
     const decidedAt = String(auditRow.created_at);
@@ -2514,6 +2514,20 @@ export class AutopsyDatabase {
     } catch {}
 
     if (hashMatches && kindMatches && targetMatches && jsonValid) {
+      const check = chainCheck || this.verifyAuditChainInternal();
+      const isChainValid = check.valid;
+      const trustedFromSeq = check.acknowledgedBreak?.trustedFromSeq ?? 1;
+
+      if (!isChainValid || (check.acknowledgedBreak && auditSeq < trustedFromSeq)) {
+        return {
+          auditSeq,
+          kind,
+          decidedAt,
+          reason: parsedReason,
+          recordStatus: 'UNVERIFIED',
+        };
+      }
+
       return {
         auditSeq,
         kind,

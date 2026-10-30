@@ -424,7 +424,12 @@ export function ReproductionProgressCard({
         <div className="flex items-center gap-2 pt-1">
           <Button
             variant="default"
-            onClick={() => setModalType('AUDIT_CHAIN_ACKNOWLEDGE')}
+            onClick={async () => {
+              if (checkAuditChain) {
+                await checkAuditChain();
+              }
+              setModalType('AUDIT_CHAIN_ACKNOWLEDGE');
+            }}
           >
             감사 기록 깨짐 확인
           </Button>
@@ -446,6 +451,8 @@ export function ReproductionProgressCard({
               const displayReason =
                 dec.recordStatus === 'OK' && dec.reason
                   ? dec.reason
+                  : dec.recordStatus === 'UNVERIFIED' && dec.reason
+                  ? `(검증 안 됨) ${dec.reason}`
                   : '이유를 확인할 수 없습니다';
               return (
                 <div
@@ -464,6 +471,14 @@ export function ReproductionProgressCard({
                   </div>
                   <div className="shrink-0">
                     {dec.recordStatus === 'OK' && <Badge tone="green">기록 정상</Badge>}
+                    {dec.recordStatus === 'UNVERIFIED' && (
+                      <Badge
+                        tone="amber"
+                        title="감사 기록이 깨졌거나 깨짐 확인 이전의 기록이라 이유를 검증할 수 없습니다."
+                      >
+                        검증 안 된 기록
+                      </Badge>
+                    )}
                     {dec.recordStatus === 'MISMATCH' && <Badge tone="amber">이유 기록 불일치</Badge>}
                     {dec.recordStatus === 'NO_RECORD' && <Badge tone="gray">이유 기록 없음</Badge>}
                   </div>

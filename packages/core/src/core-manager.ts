@@ -629,6 +629,10 @@ export class CoreManager {
     return this.db.verifyAuditChain(overrideSecret);
   }
 
+  public acknowledgeAuditChain(reason: string, overrideSecret?: string): AuditChainVerificationResult {
+    return this.db.acknowledgeAuditChain(reason, overrideSecret);
+  }
+
   public getAuditLogs(limit?: number): AuditLogEntry[] {
     return this.db.getAuditLogs(limit);
   }

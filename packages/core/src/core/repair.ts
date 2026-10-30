@@ -62,6 +62,24 @@ import {
       throw err;
     }
 
+    if (gate.state === 'NEEDS_USER_DECISION') {
+      ctx.db.appendAuditLog({
+        kind: 'REPAIR_REJECTED',
+        entityType: 'INCIDENT',
+        entityId: incidentId,
+        payloadHash: hashAuditPayload({ error: 'REPRODUCTION_DECISION_REQUIRED', gate }),
+      });
+      const err: any = new Error('[REPRODUCTION_DECISION_REQUIRED]: 감사 체인이 복구된 후 등록 시점이 확인 이전인 사건입니다. 사용자가 앱에서 결정을 내릴 때까지 재현 또는 수정안 제출이 거부됩니다.');
+      err.code = 'REPRODUCTION_DECISION_REQUIRED';
+      err.next_action = {
+        actor: 'USER',
+        action: 'ASK_USER_DECISION',
+        agent_should: '감사 기록 복구 이전에 등록된 사건이므로, Agent Autopsy 앱(대시보드)에서 사용자가 직접 재현 여부를 결정해 줄 것을 요청한다.',
+        forbidden: ['재현 강제 실행', '수정안 제출', 'DB 직접 수정', '감사 기록 수정'],
+      };
+      throw err;
+    }
+
     if (gate.state === 'ABANDONED') {
       ctx.db.appendAuditLog({
         kind: 'REPAIR_REJECTED',
@@ -185,23 +203,27 @@ import {
         };
         throw err;
       }
-    } else if (ctx.db.hasIncidentReproductionLockAudit(incidentId)) {
-      // P5: DB reproduction_lock_json is NULL/empty, but audit_log has REPRODUCTION_LOCKED or REPRODUCTION_LOCK_REPLACED
-      ctx.db.appendAuditLog({
-        kind: 'REPAIR_REJECTED',
-        entityType: 'INCIDENT',
-        entityId: incidentId,
-        payloadHash: hashAuditPayload({ error: 'LOCK_REMOVED' }),
-      });
-      const err: any = new Error('[LOCK_REMOVED]: 과거에 생성된 재현 테스트 잠금이 외부에서 삭제되었습니다 (잠금 삭제 변조 의심). 재현 테스트를 다시 실행하세요.');
-      err.code = 'LOCK_REMOVED';
-      err.next_action = {
-        actor: 'AGENT',
-        action: 'REPRODUCE_FIRST',
-        agent_should: '잠금된 재현 테스트 기록이 임의로 삭제되었습니다. run_reproduction으로 재현 테스트를 다시 실행하여 잠금을 새로 생성하세요.',
-        forbidden: ['원본 파일 직접 수정', 'DB 직접 수정'],
-      };
-      throw err;
+    } else {
+      const chainCheck = ctx.db.verifyAuditChain();
+      const trustedFromSeq = chainCheck.acknowledgedBreak?.trustedFromSeq ?? 1;
+      if (ctx.db.hasIncidentReproductionLockAudit(incidentId, trustedFromSeq)) {
+        // P5: DB reproduction_lock_json is NULL/empty, but audit_log in trusted range has REPRODUCTION_LOCKED or REPRODUCTION_LOCK_REPLACED
+        ctx.db.appendAuditLog({
+          kind: 'REPAIR_REJECTED',
+          entityType: 'INCIDENT',
+          entityId: incidentId,
+          payloadHash: hashAuditPayload({ error: 'LOCK_REMOVED' }),
+        });
+        const err: any = new Error('[LOCK_REMOVED]: 과거에 생성된 재현 테스트 잠금이 외부에서 삭제되었습니다 (잠금 삭제 변조 의심). 재현 테스트를 다시 실행하세요.');
+        err.code = 'LOCK_REMOVED';
+        err.next_action = {
+          actor: 'AGENT',
+          action: 'REPRODUCE_FIRST',
+          agent_should: '잠금된 재현 테스트 기록이 임의로 삭제되었습니다. run_reproduction으로 재현 테스트를 다시 실행하여 잠금을 새로 생성하세요.',
+          forbidden: ['원본 파일 직접 수정', 'DB 직접 수정'],
+        };
+        throw err;
+      }
     }
 
     // 1. Prepare patch in memory

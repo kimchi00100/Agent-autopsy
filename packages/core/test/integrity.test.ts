@@ -117,37 +117,41 @@ console.log("ALL TESTS PASSED");
     const check = core.verifyAuditChain();
     assert.strictEqual(check.valid, true, 'Audit chain must be valid');
     assert.strictEqual(check.status, 'OK');
-    assert.strictEqual(check.totalCount, 6, 'Exactly 6 audit events must be logged');
+    assert.strictEqual(check.totalCount, 7, 'Exactly 7 audit events must be logged');
 
     // Verify all entries in detail
     const logs = core.getAuditLogs(10);
-    assert.strictEqual(logs.length, 6);
+    assert.strictEqual(logs.length, 7);
 
     // Order is descending in getAuditLogs
-    const ordered = [...logs].reverse(); // seq 1..6
+    const ordered = [...logs].reverse(); // seq 1..7
     assert.strictEqual(ordered[0].seq, 1);
     assert.strictEqual(ordered[0].kind, 'TEST_COMMAND_CONFIRMED');
     assert.strictEqual(ordered[0].prevHash, GENESIS_PREV_HASH);
 
     assert.strictEqual(ordered[1].seq, 2);
-    assert.strictEqual(ordered[1].kind, 'INCIDENT_REGISTERED');
+    assert.strictEqual(ordered[1].kind, 'HEAD_ANCHOR_INITIALIZED');
     assert.strictEqual(ordered[1].prevHash, ordered[0].entryHash);
 
     assert.strictEqual(ordered[2].seq, 3);
-    assert.strictEqual(ordered[2].kind, 'PROPOSAL_CREATED');
+    assert.strictEqual(ordered[2].kind, 'INCIDENT_REGISTERED');
     assert.strictEqual(ordered[2].prevHash, ordered[1].entryHash);
 
     assert.strictEqual(ordered[3].seq, 4);
-    assert.strictEqual(ordered[3].kind, 'PROPOSAL_APPROVED');
+    assert.strictEqual(ordered[3].kind, 'PROPOSAL_CREATED');
     assert.strictEqual(ordered[3].prevHash, ordered[2].entryHash);
 
     assert.strictEqual(ordered[4].seq, 5);
-    assert.strictEqual(ordered[4].kind, 'REPAIR_APPLIED');
+    assert.strictEqual(ordered[4].kind, 'PROPOSAL_APPROVED');
     assert.strictEqual(ordered[4].prevHash, ordered[3].entryHash);
 
     assert.strictEqual(ordered[5].seq, 6);
-    assert.strictEqual(ordered[5].kind, 'ROLLBACK_EXECUTED');
+    assert.strictEqual(ordered[5].kind, 'REPAIR_APPLIED');
     assert.strictEqual(ordered[5].prevHash, ordered[4].entryHash);
+
+    assert.strictEqual(ordered[6].seq, 7);
+    assert.strictEqual(ordered[6].kind, 'ROLLBACK_EXECUTED');
+    assert.strictEqual(ordered[6].prevHash, ordered[5].entryHash);
   });
 
   test('2. Direct SQLite tampering - Test ④: audit_log middle entry value modification detects VALUE_MODIFIED at exact seq', () => {
@@ -212,7 +216,7 @@ console.log("ALL TESTS PASSED");
     // Verify with correct key -> OK
     const okCheck = separateDb.verifyAuditChain();
     assert.strictEqual(okCheck.valid, true);
-    assert.strictEqual(okCheck.totalCount, 2);
+    assert.strictEqual(okCheck.totalCount, 3);
 
     // Verify with WRONG key -> KEY_MISMATCH
     const wrongKey = '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef';
@@ -251,13 +255,13 @@ console.log("ALL TESTS PASSED");
     const verifyResult = sharedDb.verifyAuditChain();
     assert.strictEqual(verifyResult.valid, true, 'Chain must be valid under sequential writes');
     assert.strictEqual(verifyResult.status, 'OK');
-    assert.strictEqual(verifyResult.totalCount, taskCount, `All ${taskCount} entries must be present`);
+    assert.strictEqual(verifyResult.totalCount, taskCount + 1, `All ${taskCount + 1} entries must be present`);
 
     const allLogs = sharedDb.getAuditLogs(taskCount + 5);
-    assert.strictEqual(allLogs.length, taskCount);
-    // Sequences must be strictly 1..taskCount
+    assert.strictEqual(allLogs.length, taskCount + 1);
+    // Sequences must be strictly 1..taskCount + 1
     const seqs = allLogs.map((l) => l.seq).sort((a, b) => a - b);
-    for (let i = 0; i < taskCount; i++) {
+    for (let i = 0; i < taskCount + 1; i++) {
       assert.strictEqual(seqs[i], i + 1, `Sequence must be contiguous at index ${i}`);
     }
 
@@ -380,13 +384,19 @@ console.log(JSON.stringify({
     const verifyResult = finalDb.verifyAuditChain();
     assert.strictEqual(verifyResult.valid, true, 'Audit chain must be valid after multi-process concurrent writes');
     assert.strictEqual(verifyResult.status, 'OK');
-    assert.strictEqual(verifyResult.totalCount, totalWrites, `All ${totalWrites} entries must be present`);
+    assert.strictEqual(verifyResult.totalCount, totalWrites + 1, `All ${totalWrites + 1} entries must be present`);
 
-    // Verify sequence numbers are strictly 1..100
+    // Verify HEAD_ANCHOR_INITIALIZED is recorded exactly once
+    const headInitCount = (finalDb as any).db
+      .prepare("SELECT COUNT(*) as c FROM audit_log WHERE kind = 'HEAD_ANCHOR_INITIALIZED'")
+      .get().c;
+    assert.strictEqual(Number(headInitCount), 1, 'HEAD_ANCHOR_INITIALIZED must be exactly 1 under concurrent writes');
+
+    // Verify sequence numbers are strictly 1..101
     const allLogs = finalDb.getAuditLogs(totalWrites + 10);
-    assert.strictEqual(allLogs.length, totalWrites);
+    assert.strictEqual(allLogs.length, totalWrites + 1);
     const seqs = allLogs.map((l) => l.seq).sort((a, b) => a - b);
-    for (let i = 0; i < totalWrites; i++) {
+    for (let i = 0; i < totalWrites + 1; i++) {
       assert.strictEqual(seqs[i], i + 1, `Sequence must be exactly ${i + 1} without gaps or duplicates`);
     }
 

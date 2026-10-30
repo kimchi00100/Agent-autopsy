@@ -325,6 +325,37 @@ server.tool(
           ],
         };
       }
+      if (error.code === 'REPRODUCTION_DECISION_REQUIRED') {
+        const gate = coreManager.getReproductionGateState(incidentId);
+        return {
+          isError: true,
+          content: [
+            {
+              type: 'text',
+              text: JSON.stringify(
+                {
+                  success: false,
+                  error: error.message,
+                  code: error.code,
+                  gate: {
+                    state: gate.state,
+                    attempts_used: gate.attemptsUsed,
+                    attempts_allowed: gate.attemptsAllowed,
+                  },
+                  next_action: error.next_action || {
+                    actor: 'USER',
+                    action: 'ASK_USER_DECISION',
+                    agent_should: '감사 기록 복구 이전에 등록된 사건이므로, Agent Autopsy 앱(대시보드)에서 사용자가 직접 재현 여부를 결정해 줄 것을 요청한다.',
+                    forbidden: ['재현 강제 실행', '수정안 제출', 'DB 직접 수정', '감사 기록 수정'],
+                  },
+                },
+                null,
+                2
+              ),
+            },
+          ],
+        };
+      }
       if (error.code === 'REPRODUCTION_ABANDONED') {
         const gate = coreManager.getReproductionGateState(incidentId);
         return {

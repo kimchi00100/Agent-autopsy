@@ -115,6 +115,8 @@ server.tool(
         'INVALID_FILE_PATH',
         'REPRODUCTION_ABANDONED',
         'AUDIT_CHAIN_BROKEN',
+        'REPRODUCTION_DECISION_REQUIRED',
+        'ACKNOWLEDGE_CHAIN_FIRST',
       ];
       const matchedCode = knownRejectionCodes.find(
         (c) => error.code === c || (error.message && error.message.includes(c))
@@ -135,6 +137,16 @@ server.tool(
                     action: 'STOP_AND_REPORT',
                     agent_should: '감사 기록이 바깥에서 변경되었다. 더 진행하지 말고 사용자에게 알린다.',
                     forbidden: ['DB 직접 수정', '감사 기록 수정', 'audit_head.json 수정'],
+                  } : matchedCode === 'REPRODUCTION_DECISION_REQUIRED' ? {
+                    actor: 'USER',
+                    action: 'ASK_USER_DECISION',
+                    agent_should: '감사 기록 복구 이전에 등록된 사건이므로, Agent Autopsy 앱(대시보드)에서 사용자가 직접 재현 여부를 결정해 줄 것을 요청한다.',
+                    forbidden: ['재현 강제 실행', '수정안 제출', 'DB 직접 수정', '감사 기록 수정'],
+                  } : matchedCode === 'ACKNOWLEDGE_CHAIN_FIRST' ? {
+                    actor: 'USER',
+                    action: 'STOP_AND_REPORT',
+                    agent_should: '감사 체인이 깨져 있어 먼저 사용자 확인(acknowledge)이 필요합니다.',
+                    forbidden: ['DB 직접 수정', '감사 기록 수정'],
                   } : matchedCode === 'REPRODUCTION_ABANDONED' ? {
                     actor: 'USER',
                     action: 'ABSTAIN_REPRODUCTION',

@@ -328,12 +328,14 @@ export function verifyReproductionLockSignature(
 
 /**
  * Computes an HMAC-SHA256 signature for the audit head anchor (audit_head.json).
+ * Includes trustedFromSeq in the HMAC payload (defaults to 1).
  */
 export function computeAuditHeadSignature(
   secretKey: string,
-  payload: { seq: number; entryHash: string; updatedAt: string }
+  payload: { seq: number; entryHash: string; updatedAt: string; trustedFromSeq?: number }
 ): string {
-  const data = `audit_head:${payload.seq}:${payload.entryHash}:${payload.updatedAt}`;
+  const trusted = payload.trustedFromSeq !== undefined ? payload.trustedFromSeq : 1;
+  const data = `audit_head:${payload.seq}:${payload.entryHash}:${payload.updatedAt}:${trusted}`;
   return crypto.createHmac('sha256', secretKey).update(data).digest('hex');
 }
 
@@ -342,22 +344,40 @@ export function computeAuditHeadSignature(
  */
 export function verifyAuditHeadSignature(
   secretKey: string,
-  anchor: AuditHeadAnchor | { seq: number; entryHash: string; updatedAt: string; signature?: string }
+  anchor: AuditHeadAnchor | { seq: number; entryHash: string; updatedAt: string; trustedFromSeq?: number; signature?: string }
 ): boolean {
   if (!anchor || !anchor.signature || typeof anchor.signature !== 'string') return false;
-  const expected = computeAuditHeadSignature(secretKey, {
+  const payload = {
     seq: Number(anchor.seq),
     entryHash: String(anchor.entryHash),
     updatedAt: String(anchor.updatedAt),
-  });
+    trustedFromSeq: anchor.trustedFromSeq !== undefined ? Number(anchor.trustedFromSeq) : 1,
+  };
+  const expected = computeAuditHeadSignature(secretKey, payload);
   try {
     const a = Buffer.from(anchor.signature, 'hex');
     const b = Buffer.from(expected, 'hex');
-    if (a.length !== b.length) return false;
-    return crypto.timingSafeEqual(a, b);
-  } catch {
-    return false;
+    if (a.length === b.length && crypto.timingSafeEqual(a, b)) {
+      return true;
+    }
+  } catch {}
+
+  // Backward compatibility for legacy anchors without trustedFromSeq in HMAC
+  if (anchor.trustedFromSeq === undefined) {
+    try {
+      const legacyExpected = crypto
+        .createHmac('sha256', secretKey)
+        .update(`audit_head:${payload.seq}:${payload.entryHash}:${payload.updatedAt}`)
+        .digest('hex');
+      const a = Buffer.from(anchor.signature, 'hex');
+      const b = Buffer.from(legacyExpected, 'hex');
+      if (a.length === b.length && crypto.timingSafeEqual(a, b)) {
+        return true;
+      }
+    } catch {}
   }
+
+  return false;
 }
 
 

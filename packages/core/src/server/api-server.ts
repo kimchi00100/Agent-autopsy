@@ -539,6 +539,26 @@ export class ApiServer {
       return;
     }
 
+    // POST /api/audit-chain/acknowledge
+    if (req.method === 'POST' && pathname === '/api/audit-chain/acknowledge') {
+      if (!this.verifySessionToken(req)) {
+        res.writeHead(401, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Unauthorized: Valid X-Autopsy-Token is required.' }));
+        return;
+      }
+      const body = await this.parseJsonBody(req);
+      try {
+        const result = this.coreManager.acknowledgeAuditChain(body.reason || '');
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: true, result }));
+      } catch (err: any) {
+        const statusCode = err.statusCode || (err.code === 'CHAIN_NOT_BROKEN' ? 409 : 400);
+        res.writeHead(statusCode, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ success: false, error: err.message, code: err.code }));
+      }
+      return;
+    }
+
     // GET / POST /api/proposals/:proposalId/integrity
     const propIntegrityMatch = pathname.match(/^\/api\/proposals\/([^\/]+)\/integrity$/);
     if ((req.method === 'GET' || req.method === 'POST') && propIntegrityMatch) {
@@ -741,7 +761,13 @@ export class ApiServer {
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ success: true, result }));
       } catch (err: any) {
-        const statusCode = err.statusCode || (err.code === 'PROJECT_MISMATCH' ? 403 : err.code === 'NOT_ABANDONED' ? 409 : 400);
+        const statusCode =
+          err.statusCode ||
+          (err.code === 'PROJECT_MISMATCH'
+            ? 403
+            : err.code === 'NOT_ABANDONED' || err.code === 'ACKNOWLEDGE_CHAIN_FIRST'
+            ? 409
+            : 400);
         res.writeHead(statusCode, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ success: false, error: err.message, code: err.code }));
       }

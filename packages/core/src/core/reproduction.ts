@@ -537,79 +537,6 @@ export function getReproductionGateState(ctx: CoreContext, incidentId: string): 
   // 1. Verify audit chain first
   const chainCheck = ctx.db.verifyAuditChain();
   if (!chainCheck.valid) {
-    let verifiedWaived = false;
-    try {
-      const anchorPath = ctx.db.getAnchorPath();
-      if (fs.existsSync(anchorPath)) {
-        const secret = getInstallationSecretKey();
-        const raw = fs.readFileSync(anchorPath, 'utf8');
-        const anchor: AuditHeadAnchor = JSON.parse(raw);
-        if (verifyAuditHeadSignature(secret, anchor)) {
-          // Check if this incident has a REPRODUCTION_WAIVED entry verified up to anchor.seq
-          const waivedRow = (ctx.db as any).db
-            .prepare(
-              "SELECT * FROM audit_log WHERE entity_type = 'INCIDENT' AND entity_id = ? AND kind = 'REPRODUCTION_WAIVED' ORDER BY seq DESC LIMIT 1"
-            )
-            .get(incidentId) as any;
-
-          if (waivedRow && Number(waivedRow.seq) <= Number(anchor.seq)) {
-            const waivedSeq = Number(waivedRow.seq);
-            const anchorSeq = Number(anchor.seq);
-            const subRows = (ctx.db as any).db
-              .prepare('SELECT * FROM audit_log WHERE seq >= ? AND seq <= ? ORDER BY seq ASC')
-              .all(waivedSeq, anchorSeq) as any[];
-
-            if (subRows.length === anchorSeq - waivedSeq + 1) {
-              let subChainValid = true;
-              for (let i = 0; i < subRows.length; i++) {
-                const r = subRows[i];
-                const expectedSeq = waivedSeq + i;
-                if (Number(r.seq) !== expectedSeq) {
-                  subChainValid = false;
-                  break;
-                }
-                const expectedHash = computeAuditEntryHash(secret, {
-                  prev_hash: String(r.prev_hash),
-                  seq: expectedSeq,
-                  created_at: String(r.created_at),
-                  kind: String(r.kind),
-                  entity_type: String(r.entity_type),
-                  entity_id: String(r.entity_id),
-                  payload_hash: String(r.payload_hash),
-                });
-                if (String(r.entry_hash) !== expectedHash) {
-                  subChainValid = false;
-                  break;
-                }
-                if (i > 0 && String(r.prev_hash) !== String(subRows[i - 1].entry_hash)) {
-                  subChainValid = false;
-                  break;
-                }
-              }
-              if (
-                subChainValid &&
-                String(subRows[subRows.length - 1].entry_hash) === String(anchor.entryHash)
-              ) {
-                verifiedWaived = true;
-              }
-            }
-          }
-        }
-      }
-    } catch {
-      verifiedWaived = false;
-    }
-
-    if (verifiedWaived) {
-      return {
-        state: 'WAIVED',
-        attemptsUsed: 0,
-        attemptsAllowed: MAX_REPRODUCTION_ATTEMPTS,
-        history: incident?.reproductionGate?.history,
-        discrepancyWarning: `Audit log hash chain is broken (${chainCheck.reasonCode}), but user WAIVED decision is verified by HMAC-signed audit_head anchor.`,
-      };
-    }
-
     return {
       state: 'AUDIT_BROKEN',
       attemptsUsed: 0,
@@ -619,8 +546,10 @@ export function getReproductionGateState(ctx: CoreContext, incidentId: string): 
     };
   }
 
-  // 2. Normal gate calculation
-  const auditLogs = ctx.db.getIncidentReproductionAuditLogs(incidentId);
+  const trustedFromSeq = chainCheck.acknowledgedBreak?.trustedFromSeq ?? 1;
+
+  // 2. Fetch reproduction audit logs with seq >= trustedFromSeq
+  const auditLogs = ctx.db.getIncidentReproductionAuditLogs(incidentId, trustedFromSeq);
 
   let hasReproduced = false;
   let hasWaived = false;
@@ -642,6 +571,61 @@ export function getReproductionGateState(ctx: CoreContext, incidentId: string): 
     }
   }
 
+  // Check if INCIDENT_REGISTERED exists in trusted range (seq >= trustedFromSeq)
+  const regRow = (ctx.db as any).db
+    .prepare(
+      "SELECT seq FROM audit_log WHERE entity_type = 'INCIDENT' AND entity_id = ? AND kind = 'INCIDENT_REGISTERED' AND seq >= ? LIMIT 1"
+    )
+    .get(incidentId, trustedFromSeq);
+  const isRegisteredInTrustedRange = !!regRow;
+
+  if (!isRegisteredInTrustedRange) {
+    // Incident registered before trustedFromSeq
+    if (hasReproduced) {
+      return {
+        state: 'REPRODUCED',
+        attemptsUsed: failedAttempts,
+        attemptsAllowed: MAX_REPRODUCTION_ATTEMPTS + ADDITIONAL_ATTEMPTS_PER_GRANT * grantsCount,
+        history: incident?.reproductionGate?.history,
+      };
+    }
+    if (hasWaived) {
+      return {
+        state: 'WAIVED',
+        attemptsUsed: failedAttempts,
+        attemptsAllowed: MAX_REPRODUCTION_ATTEMPTS + ADDITIONAL_ATTEMPTS_PER_GRANT * grantsCount,
+        history: incident?.reproductionGate?.history,
+      };
+    }
+    if (grantsCount > 0) {
+      // User explicitly allowed more attempts via reproduction decision API
+      const allowedAttempts = ADDITIONAL_ATTEMPTS_PER_GRANT * grantsCount;
+      const attemptsUsed = failedAttempts;
+      let state: ReproductionGateState;
+      if (failedAttempts >= allowedAttempts) {
+        state = 'ABANDONED';
+      } else {
+        state = 'IN_PROGRESS';
+      }
+      return {
+        state,
+        attemptsUsed,
+        attemptsAllowed: allowedAttempts,
+        history: incident?.reproductionGate?.history,
+      };
+    }
+
+    // Otherwise, needs user decision before reproduction or repair
+    return {
+      state: 'NEEDS_USER_DECISION',
+      attemptsUsed: failedAttempts,
+      attemptsAllowed: 0,
+      history: incident?.reproductionGate?.history,
+      discrepancyWarning: `사건 등록 시점(seq < ${trustedFromSeq})이 감사 체인 복구 기준점 이전입니다. 사용자의 재현 결정이 필요합니다.`,
+    };
+  }
+
+  // Normal calculation for incidents registered in trusted range
   const allowedAttempts = MAX_REPRODUCTION_ATTEMPTS + ADDITIONAL_ATTEMPTS_PER_GRANT * grantsCount;
   const attemptsUsed = failedAttempts;
 
@@ -717,17 +701,17 @@ export function decideReproduction(
     throw err;
   }
 
+  const chainCheck = ctx.db.verifyAuditChain();
+  if (!chainCheck.valid) {
+    const err: any = new Error('[ACKNOWLEDGE_CHAIN_FIRST]: 감사 체인이 깨져 있습니다. 먼저 사용자 확인(acknowledge)을 수행해야 합니다.');
+    err.code = 'ACKNOWLEDGE_CHAIN_FIRST';
+    err.statusCode = 409;
+    throw err;
+  }
+
   const currentState = getReproductionGateState(ctx, incidentId);
-  if (currentState.state === 'AUDIT_BROKEN') {
-    if (decision === 'ALLOW_MORE_ATTEMPTS') {
-      const err: any = new Error('[NOT_ABANDONED]: Incident reproduction gate is currently "AUDIT_BROKEN". ALLOW_MORE_ATTEMPTS is rejected when audit chain is broken.');
-      err.code = 'NOT_ABANDONED';
-      err.statusCode = 409;
-      throw err;
-    }
-    // PROCEED_WITHOUT_REPRODUCTION is permitted
-  } else if (currentState.state !== 'ABANDONED') {
-    const err: any = new Error(`[NOT_ABANDONED]: Incident reproduction gate is currently "${currentState.state}", not "ABANDONED". Decision can only be made on abandoned incidents.`);
+  if (currentState.state !== 'ABANDONED' && currentState.state !== 'NEEDS_USER_DECISION') {
+    const err: any = new Error(`[NOT_ABANDONED]: Incident reproduction gate is currently "${currentState.state}", not "ABANDONED" or "NEEDS_USER_DECISION". Decision can only be made on abandoned or decision-required incidents.`);
     err.code = 'NOT_ABANDONED';
     err.statusCode = 409;
     throw err;
@@ -735,17 +719,12 @@ export function decideReproduction(
 
   const decidedAt = new Date().toISOString();
   if (decision === 'PROCEED_WITHOUT_REPRODUCTION') {
-    const chainCheck = ctx.db.verifyAuditChain();
     const payload: any = {
       incidentId,
       decision,
       reason: reason || null,
       decidedAt,
     };
-    if (!chainCheck.valid) {
-      payload.chainStatus = 'BROKEN';
-      payload.brokenReason = chainCheck.reasonCode;
-    }
     ctx.db.appendAuditLog({
       kind: 'REPRODUCTION_WAIVED',
       entityType: 'INCIDENT',
@@ -817,6 +796,17 @@ export async function runReproduction(
       action: 'STOP_AND_REPORT',
       agent_should: '감사 기록이 바깥에서 변경되었다. 더 진행하지 말고 사용자에게 알린다.',
       forbidden: ['DB 직접 수정', '감사 기록 수정', 'audit_head.json 수정'],
+    };
+    throw err;
+  }
+  if (currentGate.state === 'NEEDS_USER_DECISION') {
+    const err: any = new Error('[REPRODUCTION_DECISION_REQUIRED]: 감사 체인이 복구된 후 등록 시점이 확인 이전인 사건입니다. 사용자가 앱에서 결정을 내릴 때까지 재현 또는 수정안 제출이 거부됩니다.');
+    err.code = 'REPRODUCTION_DECISION_REQUIRED';
+    err.next_action = {
+      actor: 'USER',
+      action: 'ASK_USER_DECISION',
+      agent_should: '감사 기록 복구 이전에 등록된 사건이므로, Agent Autopsy 앱(대시보드)에서 사용자가 직접 재현 여부를 결정해 줄 것을 요청한다.',
+      forbidden: ['재현 강제 실행', '수정안 제출', 'DB 직접 수정', '감사 기록 수정'],
     };
     throw err;
   }

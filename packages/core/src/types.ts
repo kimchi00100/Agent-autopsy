@@ -103,7 +103,8 @@ export type ReproductionGateState =
   | 'REPRODUCED'
   | 'ABANDONED'
   | 'WAIVED'
-  | 'AUDIT_BROKEN';
+  | 'AUDIT_BROKEN'
+  | 'NEEDS_USER_DECISION';
 
 export interface ReproductionGateAttempt {
   attemptedAt: string;
@@ -791,7 +792,8 @@ export type AuditLogKind =
   | 'REPRODUCTION_ABANDONED'
   | 'REPRODUCTION_WAIVED'
   | 'REPRODUCTION_ATTEMPTS_GRANTED'
-  | 'HEAD_ANCHOR_INITIALIZED';
+  | 'HEAD_ANCHOR_INITIALIZED'
+  | 'AUDIT_CHAIN_ACKNOWLEDGED';
 
 export type AuditEntityType = 'INCIDENT' | 'PROPOSAL' | 'PROJECT' | 'CHECKPOINT';
 
@@ -818,12 +820,16 @@ export type AuditChainBrokenReasonCode =
 
 export interface AuditChainVerificationResult {
   valid: boolean;
-  status: 'OK' | 'BROKEN';
+  status: 'OK' | 'BROKEN' | 'OK_AFTER_ACKNOWLEDGED_BREAK';
   totalCount: number;
   brokenSeq?: number;
   reason?: '값 변조' | '항목 삭제/순서 변경' | '키 불일치' | '끝부분 절단' | '기준점 해시 불일치' | '기준점 서명 불일치' | '기준점 누락' | '기준점 손상' | string;
   reasonCode?: AuditChainBrokenReasonCode;
   message: string;
+  acknowledgedBreak?: {
+    trustedFromSeq: number;
+    acknowledgedAt: string;
+  };
 }
 
 export interface AuditHeadAnchor {
@@ -831,5 +837,6 @@ export interface AuditHeadAnchor {
   entryHash: string;
   updatedAt: string;
   signature: string;
+  trustedFromSeq?: number;
 }
 

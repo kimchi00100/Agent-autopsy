@@ -50,6 +50,7 @@ import {
 export class AutopsyDatabase {
   private db: DatabaseSync;
   private inTransaction: boolean = false;
+  private isInitializingAnchor: boolean = false;
   public status: 'READY' | 'MIGRATED' | 'ERROR' = 'READY';
   public initError?: string;
   public recoveryGuide?: string;
@@ -1720,6 +1721,7 @@ export class AutopsyDatabase {
     payloadHash: string;
     createdAt?: string;
   }): AuditLogEntry {
+    let initializedAnchorEntry: AuditLogEntry | undefined;
     const result = this.runInImmediateTransaction(() => {
       const createdAt = entry.createdAt || new Date().toISOString();
       const lastRow = this.db
@@ -1746,7 +1748,7 @@ export class AutopsyDatabase {
         `)
         .run(seq, createdAt, entry.kind, entry.entityType, entry.entityId, entry.payloadHash, prevHash, entryHash);
 
-      return {
+      const loggedEntry: AuditLogEntry = {
         seq,
         createdAt,
         kind: entry.kind,
@@ -1756,10 +1758,33 @@ export class AutopsyDatabase {
         prevHash,
         entryHash,
       };
+
+      // Atomic anchor initialization: on first audit entry in a new DB, immediately append HEAD_ANCHOR_INITIALIZED
+      // within the same transaction to prevent concurrent processes from racing.
+      if (!this.isInitializingAnchor && entry.kind !== 'HEAD_ANCHOR_INITIALIZED' && !this.hasHeadAnchorInitializedAudit()) {
+        this.isInitializingAnchor = true;
+        try {
+          initializedAnchorEntry = this.appendAuditLog({
+            kind: 'HEAD_ANCHOR_INITIALIZED',
+            entityType: 'SYSTEM',
+            entityId: 'audit_anchor',
+            payloadHash: hashAuditPayload({ initializedAt: new Date().toISOString() }),
+          });
+        } catch (err) {
+          console.error('[Autopsy] Failed to append HEAD_ANCHOR_INITIALIZED audit:', err);
+        } finally {
+          this.isInitializingAnchor = false;
+        }
+      }
+
+      return loggedEntry;
     });
 
     try {
       this.updateAuditHeadAnchor(result.seq, result.entryHash);
+      if (initializedAnchorEntry) {
+        this.updateAuditHeadAnchor(initializedAnchorEntry.seq, initializedAnchorEntry.entryHash);
+      }
     } catch (err) {
       console.error('[Autopsy] Failed to update audit head anchor:', err);
     }
@@ -1777,10 +1802,16 @@ export class AutopsyDatabase {
   }
 
   /**
-   * Updates audit_head.json monotonically if new seq is greater than existing anchor seq.
+   * Updates audit_head.json monotonically if new seq is greater than existing anchor seq,
+   * or unconditionally when forceOverwrite is true (used exclusively during acknowledgeAuditChain).
    * Uses atomic write (temp file + rename). Does not throw if writing fails.
    */
-  public updateAuditHeadAnchor(seq: number, entryHash: string): boolean {
+  public updateAuditHeadAnchor(
+    seq: number,
+    entryHash: string,
+    trustedFromSeq?: number,
+    forceOverwrite: boolean = false
+  ): boolean {
     try {
       const anchorPath = this.getAnchorPath();
       const dir = path.dirname(anchorPath);
@@ -1788,11 +1819,15 @@ export class AutopsyDatabase {
         fs.mkdirSync(dir, { recursive: true });
       }
 
+      let existingTrustedFromSeq = 1;
       if (fs.existsSync(anchorPath)) {
         try {
           const existingRaw = fs.readFileSync(anchorPath, 'utf8');
           const existing = JSON.parse(existingRaw);
-          if (existing && typeof existing.seq === 'number' && Number(existing.seq) >= seq) {
+          if (existing && typeof existing.trustedFromSeq === 'number') {
+            existingTrustedFromSeq = Number(existing.trustedFromSeq);
+          }
+          if (!forceOverwrite && existing && typeof existing.seq === 'number' && Number(existing.seq) >= seq) {
             return false;
           }
         } catch {
@@ -1800,14 +1835,21 @@ export class AutopsyDatabase {
         }
       }
 
+      const effectiveTrustedFromSeq = trustedFromSeq !== undefined ? trustedFromSeq : existingTrustedFromSeq;
       const updatedAt = new Date().toISOString();
       const secret = getInstallationSecretKey();
-      const signature = computeAuditHeadSignature(secret, { seq, entryHash, updatedAt });
+      const signature = computeAuditHeadSignature(secret, {
+        seq,
+        entryHash,
+        updatedAt,
+        trustedFromSeq: effectiveTrustedFromSeq,
+      });
       const anchor: AuditHeadAnchor = {
         seq,
         entryHash,
         updatedAt,
         signature,
+        trustedFromSeq: effectiveTrustedFromSeq,
       };
 
       const tmpPath = `${anchorPath}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2, 8)}.tmp`;
@@ -1851,26 +1893,28 @@ export class AutopsyDatabase {
   /**
    * Checks whether the audit log contains any reproduction lock creation or replacement events for an incident.
    * Used to detect unauthorized external deletion of reproduction_lock_json in the incidents table.
+   * Only rows with seq >= minSeq are considered.
    */
-  public hasIncidentReproductionLockAudit(incidentId: string): boolean {
+  public hasIncidentReproductionLockAudit(incidentId: string, minSeq: number = 1): boolean {
     const row = this.db
       .prepare(
-        "SELECT seq FROM audit_log WHERE entity_id = ? AND kind IN ('REPRODUCTION_LOCKED', 'REPRODUCTION_LOCK_REPLACED') LIMIT 1"
+        "SELECT seq FROM audit_log WHERE entity_id = ? AND kind IN ('REPRODUCTION_LOCKED', 'REPRODUCTION_LOCK_REPLACED') AND seq >= ? LIMIT 1"
       )
-      .get(incidentId);
+      .get(incidentId, minSeq);
     return !!row;
   }
 
   /**
    * Retrieves reproduction-related audit log entries for an incident in sequence order.
    * Used by getReproductionGateState to compute attempts and gate state tamper-resistantly.
+   * Only rows with seq >= minSeq are considered.
    */
-  public getIncidentReproductionAuditLogs(incidentId: string): Array<{ seq: number; createdAt: string; kind: string; payloadHash: string }> {
+  public getIncidentReproductionAuditLogs(incidentId: string, minSeq: number = 1): Array<{ seq: number; createdAt: string; kind: string; payloadHash: string }> {
     const rows = this.db
       .prepare(
-        "SELECT seq, created_at, kind, payload_hash FROM audit_log WHERE entity_type = 'INCIDENT' AND entity_id = ? AND kind IN ('REPRODUCTION_ATTEMPTED', 'REPRODUCTION_SUCCEEDED', 'REPRODUCTION_ABANDONED', 'REPRODUCTION_WAIVED', 'REPRODUCTION_ATTEMPTS_GRANTED') ORDER BY seq ASC"
+        "SELECT seq, created_at, kind, payload_hash FROM audit_log WHERE entity_type = 'INCIDENT' AND entity_id = ? AND kind IN ('REPRODUCTION_ATTEMPTED', 'REPRODUCTION_SUCCEEDED', 'REPRODUCTION_ABANDONED', 'REPRODUCTION_WAIVED', 'REPRODUCTION_ATTEMPTS_GRANTED') AND seq >= ? ORDER BY seq ASC"
       )
-      .all(incidentId) as any[];
+      .all(incidentId, minSeq) as any[];
     return rows.map((r) => ({
       seq: Number(r.seq),
       createdAt: String(r.created_at),
@@ -1880,44 +1924,188 @@ export class AutopsyDatabase {
   }
 
   /**
-   * Verifies the cryptographic integrity of the entire audit log chain.
-   * Recalculates HMAC for every row from sequence 1 to N.
-   * Returns OK and item count if valid, or the first broken seq and reason ('값 변경' | '항목 삭제/순서 변경' | '키 불일치').
+   * Verifies the cryptographic integrity of the audit log chain.
+   * If an acknowledged break anchor exists (trustedFromSeq > 1), verifies from trustedFromSeq onwards.
+   * Otherwise verifies every row from sequence 1 to N.
    */
   public verifyAuditChain(overrideSecret?: string): AuditChainVerificationResult {
     const rows = this.db.prepare('SELECT * FROM audit_log ORDER BY seq ASC').all() as any[];
     const secret = overrideSecret || getInstallationSecretKey();
     const anchorPath = this.getAnchorPath();
 
-    if (rows.length === 0) {
-      if (fs.existsSync(anchorPath)) {
-        try {
-          const raw = fs.readFileSync(anchorPath, 'utf8');
-          const anchor: AuditHeadAnchor = JSON.parse(raw);
-          if (verifyAuditHeadSignature(secret, anchor) && Number(anchor.seq) > 0) {
-            return {
-              valid: false,
-              status: 'BROKEN',
-              totalCount: 0,
-              brokenSeq: Number(anchor.seq),
-              reason: '끝부분 절단',
-              reasonCode: 'TRUNCATED',
-              message: `감사 기록 끝부분 절단 감지 (DB 최대 seq 0 < 기준점 seq ${anchor.seq}). 외부에서 모든 감사 기록이 삭제되었습니다.`,
-            };
-          }
-        } catch {
+    if (!fs.existsSync(anchorPath)) {
+      if (this.hasHeadAnchorInitializedAudit()) {
+        return {
+          valid: false,
+          status: 'BROKEN',
+          totalCount: rows.length,
+          brokenSeq: rows.length,
+          reason: '기준점 누락',
+          reasonCode: 'HEAD_ANCHOR_MISSING',
+          message: '감사 기록 기준점 파일(audit_head.json)이 누락되었습니다. 외부 삭제가 감지되었습니다.',
+        };
+      }
+
+      if (rows.length === 0) {
+        return {
+          valid: true,
+          status: 'OK',
+          totalCount: 0,
+          message: '감사 기록이 비어 있습니다 (0개 항목).',
+        };
+      }
+
+      // Pre-feature legacy DB with existing rows: check row validity first
+      for (let i = 0; i < rows.length; i++) {
+        const row = rows[i];
+        const seq = Number(row.seq);
+        const expectedSeq = i + 1;
+        if (seq !== expectedSeq) {
           return {
             valid: false,
             status: 'BROKEN',
-            totalCount: 0,
-            brokenSeq: 1,
-            reason: '기준점 손상',
-            reasonCode: 'HEAD_ANCHOR_INVALID',
-            message: '감사 기록 기준점 파일(audit_head.json)을 파싱할 수 없습니다.',
+            totalCount: rows.length,
+            brokenSeq: expectedSeq,
+            reason: '항목 삭제/순서 변경',
+            reasonCode: 'ORDER_OR_DELETION',
+            message: `감사 기록의 일련번호 불일치 (기대: seq ${expectedSeq}, 실제: seq ${seq}).`,
+          };
+        }
+        const expectedPrevHash = i === 0 ? GENESIS_PREV_HASH : String(rows[i - 1].entry_hash);
+        if (String(row.prev_hash) !== expectedPrevHash) {
+          return {
+            valid: false,
+            status: 'BROKEN',
+            totalCount: rows.length,
+            brokenSeq: seq,
+            reason: '항목 삭제/순서 변경',
+            reasonCode: 'ORDER_OR_DELETION',
+            message: `감사 기록 해시 체인 단절 (seq ${seq}).`,
+          };
+        }
+        const expectedEntryHash = computeAuditEntryHash(secret, {
+          prev_hash: String(row.prev_hash),
+          seq,
+          created_at: String(row.created_at),
+          kind: String(row.kind),
+          entity_type: String(row.entity_type),
+          entity_id: String(row.entity_id),
+          payload_hash: String(row.payload_hash),
+        });
+        if (String(row.entry_hash) !== expectedEntryHash) {
+          return {
+            valid: false,
+            status: 'BROKEN',
+            totalCount: rows.length,
+            brokenSeq: seq,
+            reason: '값 변경',
+            reasonCode: 'VALUE_MODIFIED',
+            message: `감사 기록 값 변조 감지 (seq ${seq}).`,
           };
         }
       }
 
+      // Initialize anchor and append HEAD_ANCHOR_INITIALIZED
+      const lastRow = rows[rows.length - 1];
+      this.updateAuditHeadAnchor(Number(lastRow.seq), String(lastRow.entry_hash));
+      this.appendAuditLog({
+        kind: 'HEAD_ANCHOR_INITIALIZED',
+        entityType: 'SYSTEM',
+        entityId: 'audit_anchor',
+        payloadHash: hashAuditPayload({ initializedAt: new Date().toISOString() }),
+      });
+
+      return {
+        valid: true,
+        status: 'OK',
+        totalCount: rows.length + 1,
+        message: `감사 기록 해시 체인 검증 통과 (기준점 초기화 완료, 총 ${rows.length + 1}개 항목).`,
+      };
+    }
+
+    let anchor: AuditHeadAnchor;
+    try {
+      const raw = fs.readFileSync(anchorPath, 'utf8');
+      anchor = JSON.parse(raw);
+    } catch {
+      return {
+        valid: false,
+        status: 'BROKEN',
+        totalCount: rows.length,
+        brokenSeq: rows.length || 1,
+        reason: '기준점 손상',
+        reasonCode: 'HEAD_ANCHOR_INVALID',
+        message: '감사 기록 기준점 파일(audit_head.json)을 파싱할 수 없습니다.',
+      };
+    }
+
+    if (!verifyAuditHeadSignature(secret, anchor)) {
+      // If none of the rows match HMAC with secret, this is a whole-database key mismatch
+      const anyMatches = rows.some((r) => {
+        const h = computeAuditEntryHash(secret, {
+          prev_hash: String(r.prev_hash),
+          seq: Number(r.seq),
+          created_at: String(r.created_at),
+          kind: String(r.kind),
+          entity_type: String(r.entity_type),
+          entity_id: String(r.entity_id),
+          payload_hash: String(r.payload_hash),
+        });
+        return h === String(r.entry_hash);
+      });
+
+      if (rows.length > 0 && !anyMatches) {
+        return {
+          valid: false,
+          status: 'BROKEN',
+          totalCount: rows.length,
+          brokenSeq: 1,
+          reason: '키 불일치',
+          reasonCode: 'KEY_MISMATCH',
+          message: `감사 기록 서명 키 불일치 (seq 1). 다른 설치 환경의 데이터이거나 서명 키(.auth_secret)가 일치하지 않습니다.`,
+        };
+      }
+
+      return {
+        valid: false,
+        status: 'BROKEN',
+        totalCount: rows.length,
+        brokenSeq: Number(anchor.seq) || rows.length,
+        reason: '기준점 서명 불일치',
+        reasonCode: 'HEAD_ANCHOR_INVALID',
+        message: '감사 기록 기준점 파일(audit_head.json)의 HMAC 서명이 일치하지 않습니다. 위변조가 감지되었습니다.',
+      };
+    }
+
+    const maxSeq = rows.length > 0 ? Number(rows[rows.length - 1].seq) : 0;
+    if (maxSeq < Number(anchor.seq)) {
+      return {
+        valid: false,
+        status: 'BROKEN',
+        totalCount: rows.length,
+        brokenSeq: Number(anchor.seq),
+        reason: '끝부분 절단',
+        reasonCode: 'TRUNCATED',
+        message: `감사 기록 끝부분 절단 감지 (DB 최대 seq ${maxSeq} < 기준점 seq ${anchor.seq}). 외부에서 최근 감사 기록이 삭제되었습니다.`,
+      };
+    }
+
+    if (Number(anchor.seq) > 0) {
+      const anchorRow = rows.find((r) => Number(r.seq) === Number(anchor.seq));
+      if (!anchorRow || String(anchorRow.entry_hash) !== String(anchor.entryHash)) {
+        return {
+          valid: false,
+          status: 'BROKEN',
+          totalCount: rows.length,
+          brokenSeq: Number(anchor.seq),
+          reason: '기준점 해시 불일치',
+          reasonCode: 'HEAD_MISMATCH',
+          message: `감사 기록 기준점 해시 불일치 (seq ${anchor.seq}의 실제 해시와 기준점 해시가 일치하지 않습니다).`,
+        };
+      }
+    }
+
+    if (rows.length === 0) {
       return {
         valid: true,
         status: 'OK',
@@ -1926,6 +2114,113 @@ export class AutopsyDatabase {
       };
     }
 
+    const trustedFromSeq = anchor.trustedFromSeq !== undefined ? Number(anchor.trustedFromSeq) : 1;
+
+    if (trustedFromSeq > 1) {
+      const startIdx = rows.findIndex((r) => Number(r.seq) === trustedFromSeq);
+      if (startIdx === -1) {
+        return {
+          valid: false,
+          status: 'BROKEN',
+          totalCount: rows.length,
+          brokenSeq: trustedFromSeq,
+          reason: '항목 삭제/순서 변경',
+          reasonCode: 'ORDER_OR_DELETION',
+          message: `감사 기록 확인 기준점(seq ${trustedFromSeq}) 항목이 누락되었습니다.`,
+        };
+      }
+
+      // 1. Verify start row itself (HMAC entry_hash only; prev_hash continuity to pre-break history is skipped)
+      const startRow = rows[startIdx];
+      const expectedStartHash = computeAuditEntryHash(secret, {
+        prev_hash: String(startRow.prev_hash),
+        seq: Number(startRow.seq),
+        created_at: String(startRow.created_at),
+        kind: String(startRow.kind),
+        entity_type: String(startRow.entity_type),
+        entity_id: String(startRow.entity_id),
+        payload_hash: String(startRow.payload_hash),
+      });
+
+      if (String(startRow.entry_hash) !== expectedStartHash) {
+        return {
+          valid: false,
+          status: 'BROKEN',
+          totalCount: rows.length,
+          brokenSeq: Number(startRow.seq),
+          reason: '값 변경',
+          reasonCode: 'VALUE_MODIFIED',
+          message: `감사 기록 값 변조 감지 (seq ${startRow.seq}). 데이터 필드 또는 해시값이 수정되었습니다.`,
+        };
+      }
+
+      // 2. Verify subsequent rows from startIdx + 1 to end
+      for (let i = startIdx + 1; i < rows.length; i++) {
+        const row = rows[i];
+        const prevRow = rows[i - 1];
+        const seq = Number(row.seq);
+        const expectedSeq = Number(prevRow.seq) + 1;
+
+        if (seq !== expectedSeq) {
+          return {
+            valid: false,
+            status: 'BROKEN',
+            totalCount: rows.length,
+            brokenSeq: expectedSeq,
+            reason: '항목 삭제/순서 변경',
+            reasonCode: 'ORDER_OR_DELETION',
+            message: `감사 기록의 일련번호 불일치 (기대: seq ${expectedSeq}, 실제: seq ${seq}). 항목 삭제 또는 순서 변경이 감지되었습니다.`,
+          };
+        }
+
+        if (String(row.prev_hash) !== String(prevRow.entry_hash)) {
+          return {
+            valid: false,
+            status: 'BROKEN',
+            totalCount: rows.length,
+            brokenSeq: seq,
+            reason: '항목 삭제/순서 변경',
+            reasonCode: 'ORDER_OR_DELETION',
+            message: `감사 기록 해시 체인 단절 (seq ${seq}). 이전 항목의 해시값과 일치하지 않아 항목 삭제 또는 변조가 감지되었습니다.`,
+          };
+        }
+
+        const expectedEntryHash = computeAuditEntryHash(secret, {
+          prev_hash: String(row.prev_hash),
+          seq,
+          created_at: String(row.created_at),
+          kind: String(row.kind),
+          entity_type: String(row.entity_type),
+          entity_id: String(row.entity_id),
+          payload_hash: String(row.payload_hash),
+        });
+
+        if (String(row.entry_hash) !== expectedEntryHash) {
+          return {
+            valid: false,
+            status: 'BROKEN',
+            totalCount: rows.length,
+            brokenSeq: seq,
+            reason: '값 변경',
+            reasonCode: 'VALUE_MODIFIED',
+            message: `감사 기록 값 변조 감지 (seq ${seq}). 데이터 필드 또는 해시값이 수정되었습니다.`,
+          };
+        }
+      }
+
+      return {
+        valid: true,
+        status: 'OK_AFTER_ACKNOWLEDGED_BREAK',
+        totalCount: rows.length,
+        acknowledgedBreak: {
+          trustedFromSeq,
+          acknowledgedAt: String(startRow.created_at || anchor.updatedAt),
+        },
+        message: `감사 기록 해시 체인 검증 통과 (사용자 확인 기준점 seq ${trustedFromSeq} 이후 무결성 확인, 총 ${rows.length}개 항목).`,
+      };
+    }
+
+    // Default trustedFromSeq === 1: verify all rows from sequence 1 to N
     for (let i = 0; i < rows.length; i++) {
       const row = rows[i];
       const seq = Number(row.seq);
@@ -1970,9 +2265,7 @@ export class AutopsyDatabase {
       });
 
       if (String(row.entry_hash) !== expectedEntryHash) {
-        // Distinguish KEY_MISMATCH vs VALUE_MODIFIED
         if (i === 0) {
-          // If first row fails, check if ANY row in the chain matches this secret
           const anyMatches = rows.some((r) => {
             const h = computeAuditEntryHash(secret, {
               prev_hash: String(r.prev_hash),
@@ -2011,98 +2304,58 @@ export class AutopsyDatabase {
       }
     }
 
-    // 4. Anchor check (audit_head.json)
-    if (!fs.existsSync(anchorPath)) {
-      if (this.hasHeadAnchorInitializedAudit()) {
-        return {
-          valid: false,
-          status: 'BROKEN',
-          totalCount: rows.length,
-          brokenSeq: rows.length,
-          reason: '기준점 누락',
-          reasonCode: 'HEAD_ANCHOR_MISSING',
-          message: '감사 기록 기준점 파일(audit_head.json)이 누락되었습니다. 외부 삭제가 감지되었습니다.',
-        };
-      }
-
-      // Pre-feature legacy DB with existing rows: initialize anchor and append HEAD_ANCHOR_INITIALIZED
-      const lastRow = rows[rows.length - 1];
-      this.updateAuditHeadAnchor(Number(lastRow.seq), String(lastRow.entry_hash));
-      this.appendAuditLog({
-        kind: 'HEAD_ANCHOR_INITIALIZED',
-        entityType: 'SYSTEM',
-        entityId: 'audit_anchor',
-        payloadHash: hashAuditPayload({ initializedAt: new Date().toISOString() }),
-      });
-
-      return {
-        valid: true,
-        status: 'OK',
-        totalCount: rows.length + 1,
-        message: `감사 기록 해시 체인 검증 통과 (기준점 초기화 완료, 총 ${rows.length + 1}개 항목).`,
-      };
-    }
-
-    let anchor: AuditHeadAnchor;
-    try {
-      const raw = fs.readFileSync(anchorPath, 'utf8');
-      anchor = JSON.parse(raw);
-    } catch {
-      return {
-        valid: false,
-        status: 'BROKEN',
-        totalCount: rows.length,
-        brokenSeq: rows.length,
-        reason: '기준점 손상',
-        reasonCode: 'HEAD_ANCHOR_INVALID',
-        message: '감사 기록 기준점 파일(audit_head.json)을 파싱할 수 없습니다.',
-      };
-    }
-
-    if (!verifyAuditHeadSignature(secret, anchor)) {
-      return {
-        valid: false,
-        status: 'BROKEN',
-        totalCount: rows.length,
-        brokenSeq: Number(anchor.seq) || rows.length,
-        reason: '기준점 서명 불일치',
-        reasonCode: 'HEAD_ANCHOR_INVALID',
-        message: '감사 기록 기준점 파일(audit_head.json)의 HMAC 서명이 일치하지 않습니다. 위변조가 감지되었습니다.',
-      };
-    }
-
-    const maxSeq = rows.length;
-    if (maxSeq < Number(anchor.seq)) {
-      return {
-        valid: false,
-        status: 'BROKEN',
-        totalCount: rows.length,
-        brokenSeq: Number(anchor.seq),
-        reason: '끝부분 절단',
-        reasonCode: 'TRUNCATED',
-        message: `감사 기록 끝부분 절단 감지 (DB 최대 seq ${maxSeq} < 기준점 seq ${anchor.seq}). 외부에서 최근 감사 기록이 삭제되었습니다.`,
-      };
-    }
-
-    const anchorRow = rows[Number(anchor.seq) - 1];
-    if (!anchorRow || String(anchorRow.entry_hash) !== String(anchor.entryHash)) {
-      return {
-        valid: false,
-        status: 'BROKEN',
-        totalCount: rows.length,
-        brokenSeq: Number(anchor.seq),
-        reason: '기준점 해시 불일치',
-        reasonCode: 'HEAD_MISMATCH',
-        message: `감사 기록 기준점 해시 불일치 (seq ${anchor.seq}의 실제 해시와 기준점 해시가 일치하지 않습니다).`,
-      };
-    }
-
     return {
       valid: true,
       status: 'OK',
       totalCount: rows.length,
       message: `감사 기록 해시 체인 검증 통과 (총 ${rows.length}개 항목 무결성 확인).`,
     };
+  }
+
+  /**
+   * User acknowledgment of an audit chain break.
+   * Records AUDIT_CHAIN_ACKNOWLEDGED entry and establishes a new trusted anchor starting from that sequence.
+   */
+  public acknowledgeAuditChain(reason: string, overrideSecret?: string): AuditChainVerificationResult {
+    const secret = overrideSecret || getInstallationSecretKey();
+    const currentVerification = this.verifyAuditChain(secret);
+    if (currentVerification.valid) {
+      const err: any = new Error('[CHAIN_NOT_BROKEN]: 감사 체인이 정상 상태입니다. 손상되지 않은 체인은 확인(acknowledge)할 수 없습니다.');
+      err.code = 'CHAIN_NOT_BROKEN';
+      err.statusCode = 409;
+      throw err;
+    }
+
+    let previousAnchorSeq: number | null = null;
+    const anchorPath = this.getAnchorPath();
+    if (fs.existsSync(anchorPath)) {
+      try {
+        const raw = fs.readFileSync(anchorPath, 'utf8');
+        const parsed = JSON.parse(raw);
+        if (parsed && typeof parsed.seq === 'number') {
+          previousAnchorSeq = Number(parsed.seq);
+        }
+      } catch {}
+    }
+
+    const acknowledgedAt = new Date().toISOString();
+    const ackEntry = this.appendAuditLog({
+      kind: 'AUDIT_CHAIN_ACKNOWLEDGED',
+      entityType: 'SYSTEM',
+      entityId: 'audit_anchor',
+      payloadHash: hashAuditPayload({
+        reason: reason || '',
+        reasonCode: currentVerification.reasonCode,
+        brokenSeq: currentVerification.brokenSeq,
+        previousAnchorSeq,
+        acknowledgedAt,
+      }),
+      createdAt: acknowledgedAt,
+    });
+
+    this.updateAuditHeadAnchor(ackEntry.seq, ackEntry.entryHash, ackEntry.seq, true);
+
+    return this.verifyAuditChain(secret);
   }
 
   public close(): void {

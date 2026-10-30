@@ -1,5 +1,5 @@
 import { Overview, AuditChainVerificationResult } from '../api';
-import { relativeTime } from '../diff';
+import { relativeTime, formatKoreanDateTime } from '../diff';
 import { Badge, Card, Empty, PageHeader } from '../ui';
 import { CheckCircle2, XCircle, HelpCircle, GitBranch, AlertTriangle, History, ShieldCheck, ShieldAlert } from 'lucide-react';
 
@@ -210,7 +210,7 @@ export default function Dashboard({
                 ) : auditChain.status === 'OK_AFTER_ACKNOWLEDGED_BREAK' ? (
                   <div className="space-y-1">
                     <div className="text-amber-800 font-medium">
-                      확인 시각: {auditChain.acknowledgedBreak?.acknowledgedAt || '-'} · 이 시점 이후 기록만 검증합니다
+                      확인 시각: {auditChain.acknowledgedBreak?.acknowledgedAt ? formatKoreanDateTime(auditChain.acknowledgedBreak.acknowledgedAt) : '-'} · 이 시점 이후 기록만 검증합니다
                     </div>
                     <div className="text-slate-400">
                       (검증된 기록 {auditChain.totalCount}개)

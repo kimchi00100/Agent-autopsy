@@ -1,9 +1,15 @@
 import { useState, useEffect } from 'react';
 import { api, Incident, IncidentAnalysis, Proposal, TimelineEvent, FlowNode, FlowEdge, IncidentReproductionStatusResponse } from '../api';
-import { ReproductionEvidenceCard, ReproductionProgressCard } from '../components/ReproductionEvidence';
+import {
+  ReproductionEvidenceCard,
+  ReproductionProgressCard,
+  ReproductionEvidenceBadge,
+  GATE_STATE_TEXTS,
+} from '../components/ReproductionEvidence';
+import CollapsibleSection from '../components/CollapsibleSection';
 import IncidentFlowGraph from './IncidentFlowGraph';
 import { Badge, Button, Card, CodeBlock, UnifiedDiff } from '../ui';
-import { parseSideBySide, relativeTime, clock } from '../diff';
+import { parseSideBySide, relativeTime, clock, shortenPathInEvidence } from '../diff';
 import {
   AlertCircle,
   FileCode2,
@@ -18,6 +24,10 @@ import {
   CheckSquare,
   Terminal,
   Activity,
+  Flame,
+  Info,
+  Clock,
+  ShieldCheck,
 } from 'lucide-react';
 
 interface Props {
@@ -74,6 +84,21 @@ export default function IncidentAnalysisView({
   const health = analysis?.threeLevelHealth || incident.threeLevelHealth;
   const causeVerdict = analysis?.causeVerdict || incident.causeVerdict || 'LIKELY';
   const verificationType = analysis?.verificationType || incident.verificationType || 'LOGIC_TEST';
+
+  const hasReproWarning = Boolean(
+    reproStatus && (
+      (reproStatus.lock && ['MODIFIED_ON_DISK', 'SIGNATURE_INVALID', 'REMOVED'].includes(reproStatus.lock.status)) ||
+      (reproStatus.gate && ['ABANDONED', 'NEEDS_USER_DECISION', 'AUDIT_BROKEN'].includes(reproStatus.gate.state)) ||
+      (reproStatus.otherBlockedIncidents && reproStatus.otherBlockedIncidents.length > 0)
+    )
+  );
+
+  const reproWarningBadge = hasReproWarning ? (
+    <span className="flex items-center gap-1 rounded bg-rose-50 px-1.5 py-0.5 text-[10px] font-semibold text-rose-600 border border-rose-200">
+      <AlertTriangle className="h-3 w-3 text-rose-500" />
+      경고 있음
+    </span>
+  ) : null;
 
   const handleApproveAndApply = async (prop: Proposal) => {
     if (!window.confirm(`수정안 "${prop.id}"을 승인하고 적용하시겠습니까?`)) return;
@@ -519,184 +544,262 @@ export default function IncidentAnalysisView({
               </Badge>
             </div>
 
-            {/* Basic Info Table */}
-            <div className="space-y-2 text-xs">
-              <div className="text-[11px] font-semibold text-slate-400">기본 정보</div>
-              <div className="flex justify-between py-0.5">
-                <span className="text-slate-500">사건 ID</span>
-                <span className="font-medium text-slate-800">#{incident.id.slice(-6).toUpperCase()}</span>
-              </div>
-              <div className="flex justify-between py-0.5">
-                <span className="text-slate-500">원인 판정</span>
-                <span className={`font-semibold ${
-                  causeVerdict === 'CONFIRMED' ? 'text-emerald-600' : causeVerdict === 'LIKELY' ? 'text-amber-600' : 'text-slate-600'
-                }`}>
-                  {causeVerdict === 'CONFIRMED' ? '확정 (CONFIRMED)' : causeVerdict === 'LIKELY' ? '유력 (LIKELY)' : '미확정 (UNKNOWN)'}
-                </span>
-              </div>
-              {incident.causeEvidence && incident.causeEvidence.length > 0 && (
-                <div className="py-1 px-2 rounded bg-slate-50 border border-slate-100 text-[10px] text-slate-600 space-y-0.5">
-                  <div className="font-semibold text-slate-500">원인 판정 근거:</div>
-                  {incident.causeEvidence.map((ev, i) => (
-                    <div key={i} className="flex items-start gap-1">
-                      <span>•</span>
-                      <span>{ev}</span>
-                    </div>
-                  ))}
-                </div>
-              )}
-              <div className="flex justify-between py-0.5">
-                <span className="text-slate-500">검증 유형</span>
-                <span className="font-medium text-slate-800">{verificationType}</span>
-              </div>
-              <div className="flex justify-between py-0.5">
-                <span className="text-slate-500">사용자 확인 여부</span>
-                <span className="font-medium text-emerald-600 flex items-center gap-1">
-                  <CheckSquare className="h-3 w-3" />
-                  {incident.userConfirmedIntent ? '확인 완료' : '미확인'}
-                </span>
-              </div>
-              <div className="flex justify-between py-0.5">
-                <span className="text-slate-500">발생 시간</span>
-                <span className="text-slate-800">{clock(incident.createdAt)}</span>
-              </div>
-            </div>
-
-            {/* Reproduction Test Result (Execution Evidence) */}
-            {incident.reproductionResult && (
-              <div className="mt-4 rounded-xl border border-indigo-200 bg-indigo-50/50 p-3 text-xs space-y-1.5">
-                <div className="flex items-center justify-between font-semibold text-indigo-900">
-                  <span className="flex items-center gap-1.5">
-                    <Terminal className="h-3.5 w-3.5 text-indigo-600" />
-                    실행 증거: 재현 테스트
+            <div className="space-y-3">
+              {/* 1. Root Cause Candidates */}
+              <CollapsibleSection
+                id="candidates"
+                title="원인 후보"
+                icon={<Flame className="h-3.5 w-3.5 text-amber-500" />}
+                defaultOpen={true}
+                summary={
+                  <span className="text-[11px] font-medium text-slate-500">
+                    후보 {analysis?.candidates.length || 0}개
                   </span>
-                  <Badge tone={incident.reproductionResult.status === 'REPRODUCED' ? 'red' : incident.reproductionResult.status === 'NOT_REPRODUCED' ? 'green' : 'gray'}>
-                    {incident.reproductionResult.status === 'REPRODUCED' ? '재현됨 (실패 확인)' : incident.reproductionResult.status === 'NOT_REPRODUCED' ? '재현 안 됨 (통과)' : '실행 불가'}
-                  </Badge>
-                </div>
-                <div className="mono text-[11px] text-indigo-800 bg-white/80 p-1.5 rounded border border-indigo-100 truncate">
-                  {incident.reproductionResult.command}
-                </div>
-                {incident.reproductionResult.failedLocation && (
-                  <div className="text-[10px] text-indigo-700">
-                    실패 확인 위치: <code>{incident.reproductionResult.failedLocation.filePath}:{incident.reproductionResult.failedLocation.line}</code>
+                }
+              >
+                <div className="space-y-2">
+                  <div className="text-[10px] text-slate-400">증거 기반 순위</div>
+                  <div className="space-y-2.5">
+                    {analysis?.candidates.slice(0, 2).map((cand, idx) => (
+                      <div key={cand.filePath} className="rounded-xl border border-amber-200/80 bg-amber-50/30 p-3 text-xs">
+                        <div className="flex items-center justify-between">
+                          <div className="flex items-center gap-1.5 font-semibold text-slate-900">
+                            <span className="flex h-4 w-4 items-center justify-center rounded-full bg-amber-500 text-[10px] font-bold text-white">
+                              {idx + 1}
+                            </span>
+                            <span className="mono truncate">{cand.filePath}</span>
+                          </div>
+                          <span className="font-semibold text-slate-700 text-[11px]">
+                            증거 강도: {cand.evidenceStrength === 'HIGH' ? '높음' : cand.evidenceStrength === 'MEDIUM' ? '보통' : cand.evidenceStrength === 'LOW' ? '낮음' : '미확정'}
+                          </span>
+                        </div>
+
+                        <div className="mt-2 space-y-1 text-slate-600 text-[11px]">
+                          {cand.supportingEvidence.map((ev, i) => (
+                            <div key={i} className="flex items-start gap-1" title={ev}>
+                              <span className="text-blue-500">•</span>
+                              <span>{shortenPathInEvidence(ev)}</span>
+                            </div>
+                          ))}
+                          {cand.counterEvidence.map((ev, i) => (
+                            <div key={i} className="flex items-start gap-1 text-slate-400" title={ev}>
+                              <span className="text-slate-400">•</span>
+                              <span>{shortenPathInEvidence(ev)}</span>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    ))}
+                    {(!analysis?.candidates || analysis.candidates.length === 0) && (
+                      <div className="text-slate-400 italic text-[11px]">원인 후보가 없습니다.</div>
+                    )}
                   </div>
-                )}
-              </div>
-            )}
-
-            {/* Reproduction Evidence */}
-            <ReproductionEvidenceCard
-              reproductionResult={incident.reproductionResult}
-              evidenceLevel={reproStatus?.evidence?.level}
-            />
-
-            <ReproductionProgressCard
-              statusResponse={reproStatus}
-              onSelectIncident={onSelectIncident}
-            />
-
-            {/* Coverage Execution Status */}
-            <div className="mt-4 flex items-center justify-between rounded-xl border border-slate-200 bg-slate-50/70 p-2.5 text-xs text-slate-600">
-              <span className="flex items-center gap-1.5 font-medium">
-                <Activity className="h-3.5 w-3.5 text-slate-400" />
-                커버리지 정밀 분석
-              </span>
-              <Badge tone="gray">아직 지원 안 함</Badge>
-            </div>
-
-            {/* Missing Evidence Checklist when UNKNOWN */}
-            {causeVerdict === 'UNKNOWN' && analysis?.missingEvidenceChecklist && analysis.missingEvidenceChecklist.length > 0 && (
-              <div className="mt-4 rounded-xl border border-rose-200 bg-rose-50/50 p-3 text-xs">
-                <div className="font-semibold text-rose-800 mb-1.5 flex items-center gap-1">
-                  <AlertCircle className="h-3.5 w-3.5" />
-                  추측 수정 차단: 추가 필요 증거
                 </div>
-                <ul className="space-y-1 text-[11px] text-rose-700 list-disc list-inside">
-                  {analysis.missingEvidenceChecklist.map((item, idx) => (
-                    <li key={idx}>{item}</li>
-                  ))}
-                </ul>
-              </div>
-            )}
+              </CollapsibleSection>
 
-            {/* Related Files */}
-            <div className="mt-5 pt-3 border-t border-slate-100 space-y-2">
-              <div className="flex items-center justify-between text-xs">
-                <span className="text-[11px] font-semibold text-slate-400">
-                  관련 파일 ({analysis?.changedFiles.length || 0})
-                </span>
-                <button onClick={() => setSubTab('diff')} className="text-[11px] text-blue-600 hover:underline">
-                  모두 보기 &gt;
-                </button>
-              </div>
-
-              <div className="space-y-1.5">
-                {analysis?.changedFiles.map((file) => (
-                  <div
-                    key={file.filePath}
-                    onClick={() => setSubTab('diff')}
-                    className="flex cursor-pointer items-center justify-between rounded-lg border border-slate-100 bg-slate-50/50 p-2 text-xs transition hover:bg-slate-100/60"
-                  >
-                    <div className="flex items-center gap-2 min-w-0">
-                      <FileCode2 className="h-3.5 w-3.5 text-blue-600 shrink-0" />
-                      <span className="mono truncate font-medium text-slate-800">{file.filePath}</span>
-                    </div>
-                    <span className="ml-2 shrink-0 font-medium text-[11px]">
-                      <span className="text-emerald-600">+{file.addedLines}</span>{' '}
-                      <span className="text-rose-600">-{file.removedLines}</span>
+              {/* 2. Basic Info */}
+              <CollapsibleSection
+                id="basicInfo"
+                title="기본 정보"
+                icon={<Info className="h-3.5 w-3.5 text-blue-500" />}
+                defaultOpen={false}
+                summary={
+                  <Badge tone={causeVerdict === 'CONFIRMED' ? 'green' : causeVerdict === 'LIKELY' ? 'amber' : 'gray'}>
+                    {causeVerdict === 'CONFIRMED' ? '확정' : causeVerdict === 'LIKELY' ? '유력' : '미확정'}
+                  </Badge>
+                }
+              >
+                <div className="space-y-2 text-xs">
+                  <div className="flex justify-between py-0.5">
+                    <span className="text-slate-500">사건 ID</span>
+                    <span className="font-medium text-slate-800">#{incident.id.slice(-6).toUpperCase()}</span>
+                  </div>
+                  <div className="flex justify-between py-0.5">
+                    <span className="text-slate-500">원인 판정</span>
+                    <span className={`font-semibold ${
+                      causeVerdict === 'CONFIRMED' ? 'text-emerald-600' : causeVerdict === 'LIKELY' ? 'text-amber-600' : 'text-slate-600'
+                    }`}>
+                      {causeVerdict === 'CONFIRMED' ? '확정 (CONFIRMED)' : causeVerdict === 'LIKELY' ? '유력 (LIKELY)' : '미확정 (UNKNOWN)'}
                     </span>
                   </div>
-                ))}
-              </div>
-            </div>
-
-            {/* Root Cause Candidates with Evidence & Counter-Evidence */}
-            <div className="mt-5 pt-3 border-t border-slate-100 space-y-2">
-              <div className="flex items-center justify-between text-xs">
-                <span className="text-[11px] font-semibold text-slate-400">
-                  원인 후보 ({analysis?.candidates.length || 0})
-                </span>
-                <span className="text-[10px] text-slate-400">증거 기반 순위</span>
-              </div>
-
-              <div className="space-y-2.5">
-                {analysis?.candidates.slice(0, 2).map((cand, idx) => (
-                  <div key={cand.filePath} className="rounded-xl border border-amber-200/80 bg-amber-50/30 p-3 text-xs">
-                    <div className="flex items-center justify-between">
-                      <div className="flex items-center gap-1.5 font-semibold text-slate-900">
-                        <span className="flex h-4 w-4 items-center justify-center rounded-full bg-amber-500 text-[10px] font-bold text-white">
-                          {idx + 1}
-                        </span>
-                        <span className="mono truncate">{cand.filePath}</span>
-                      </div>
-                      <span className="font-semibold text-slate-700 text-[11px]">
-                        증거 강도: {cand.evidenceStrength === 'HIGH' ? '높음' : cand.evidenceStrength === 'MEDIUM' ? '보통' : cand.evidenceStrength === 'LOW' ? '낮음' : '미확정'}
-                      </span>
-                    </div>
-
-                    <div className="mt-2 space-y-1 text-slate-600 text-[11px]">
-                      {cand.supportingEvidence.map((ev, i) => (
-                        <div key={i} className="flex items-start gap-1">
-                          <span className="text-blue-500">•</span>
-                          <span>{ev}</span>
-                        </div>
-                      ))}
-                      {cand.counterEvidence.map((ev, i) => (
-                        <div key={i} className="flex items-start gap-1 text-slate-400">
-                          <span className="text-slate-400">•</span>
-                          <span>{ev}</span>
+                  {incident.causeEvidence && incident.causeEvidence.length > 0 && (
+                    <div className="py-1 px-2 rounded bg-slate-50 border border-slate-100 text-[10px] text-slate-600 space-y-0.5">
+                      <div className="font-semibold text-slate-500">원인 판정 근거:</div>
+                      {incident.causeEvidence.map((ev, i) => (
+                        <div key={i} className="flex items-start gap-1" title={ev}>
+                          <span>•</span>
+                          <span>{shortenPathInEvidence(ev)}</span>
                         </div>
                       ))}
                     </div>
+                  )}
+                  <div className="flex justify-between py-0.5">
+                    <span className="text-slate-500">검증 유형</span>
+                    <span className="font-medium text-slate-800">{verificationType}</span>
                   </div>
-                ))}
-              </div>
-            </div>
+                  <div className="flex justify-between py-0.5">
+                    <span className="text-slate-500">사용자 확인 여부</span>
+                    <span className="font-medium text-emerald-600 flex items-center gap-1">
+                      <CheckSquare className="h-3 w-3" />
+                      {incident.userConfirmedIntent ? '확인 완료' : '미확인'}
+                    </span>
+                  </div>
+                  <div className="flex justify-between py-0.5">
+                    <span className="text-slate-500">발생 시간</span>
+                    <span className="text-slate-800">{clock(incident.createdAt)}</span>
+                  </div>
+                </div>
+              </CollapsibleSection>
 
-            {/* Recovery Proposal Mini Card */}
-            {topProposal && (
-              <div className="mt-5 pt-3 border-t border-slate-100">
+              {/* 3. Execution Evidence: Reproduction Test */}
+              <CollapsibleSection
+                id="execEvidence"
+                title="실행 증거: 재현 테스트"
+                icon={<Terminal className="h-3.5 w-3.5 text-indigo-600" />}
+                defaultOpen={false}
+                summary={
+                  <Badge tone={
+                    !incident.reproductionResult ? 'gray' :
+                    incident.reproductionResult.status === 'REPRODUCED' ? 'red' :
+                    incident.reproductionResult.status === 'NOT_REPRODUCED' ? 'green' : 'gray'
+                  }>
+                    {!incident.reproductionResult ? '미실행' :
+                      incident.reproductionResult.status === 'REPRODUCED' ? '재현됨 (실패 확인)' :
+                      incident.reproductionResult.status === 'NOT_REPRODUCED' ? '재현 안 됨 (통과)' : '실행 불가'}
+                  </Badge>
+                }
+              >
+                {incident.reproductionResult ? (
+                  <div className="space-y-1.5 text-xs">
+                    <div className="mono text-[11px] text-indigo-800 bg-indigo-50/50 p-1.5 rounded border border-indigo-100 truncate" title={incident.reproductionResult.command}>
+                      {incident.reproductionResult.command}
+                    </div>
+                    {incident.reproductionResult.failedLocation && (
+                      <div className="text-[10px] text-indigo-700">
+                        실패 확인 위치: <code>{incident.reproductionResult.failedLocation.filePath}:{incident.reproductionResult.failedLocation.line}</code>
+                      </div>
+                    )}
+                  </div>
+                ) : (
+                  <div className="text-slate-400 italic text-[11px]">재현 테스트 실행 기록이 없습니다.</div>
+                )}
+              </CollapsibleSection>
+
+              {/* 4. Reproduction Evidence */}
+              <CollapsibleSection
+                id="reproEvidence"
+                title="재현 증거"
+                icon={<ShieldCheck className="h-3.5 w-3.5 text-indigo-600" />}
+                defaultOpen={false}
+                summary={
+                  <ReproductionEvidenceBadge
+                    level={reproStatus?.evidence?.level || (incident.reproductionResult ? (incident.reproductionResult.status === 'REPRODUCED' ? 'REPRODUCED_ONLY' : 'NOT_REPRODUCED') : 'NONE')}
+                  />
+                }
+              >
+                <ReproductionEvidenceCard
+                  reproductionResult={incident.reproductionResult}
+                  evidenceLevel={reproStatus?.evidence?.level}
+                  hideHeader={true}
+                />
+              </CollapsibleSection>
+
+              {/* 5. Reproduction Progress */}
+              <CollapsibleSection
+                id="reproProgress"
+                title="재현 진행 상태"
+                icon={<Clock className="h-3.5 w-3.5 text-slate-600" />}
+                defaultOpen={false}
+                hasWarning={hasReproWarning}
+                warning={reproWarningBadge}
+                summary={
+                  reproStatus?.gate ? (
+                    <Badge tone={
+                      reproStatus.gate.state === 'REPRODUCED' ? 'green' :
+                      reproStatus.gate.state === 'WAIVED' ? 'blue' :
+                      reproStatus.gate.state === 'ABANDONED' || reproStatus.gate.state === 'AUDIT_BROKEN' ? 'red' :
+                      reproStatus.gate.state === 'NEEDS_USER_DECISION' ? 'amber' : 'gray'
+                    }>
+                      {GATE_STATE_TEXTS[reproStatus.gate.state] || reproStatus.gate.state}
+                    </Badge>
+                  ) : null
+                }
+              >
+                <ReproductionProgressCard
+                  statusResponse={reproStatus}
+                  onSelectIncident={onSelectIncident}
+                  hideHeader={true}
+                />
+              </CollapsibleSection>
+
+              {/* 6. Related Files */}
+              <CollapsibleSection
+                id="relatedFiles"
+                title="관련 파일"
+                icon={<FileCode2 className="h-3.5 w-3.5 text-blue-600" />}
+                defaultOpen={false}
+                summary={
+                  <span className="text-[11px] font-medium text-slate-500">
+                    파일 {analysis?.changedFiles.length || 0}개
+                  </span>
+                }
+              >
+                <div className="space-y-2">
+                  <div className="flex items-center justify-end">
+                    <button onClick={() => setSubTab('diff')} className="text-[11px] text-blue-600 hover:underline">
+                      모두 보기 &gt;
+                    </button>
+                  </div>
+                  <div className="space-y-1.5">
+                    {analysis?.changedFiles.map((file) => (
+                      <div
+                        key={file.filePath}
+                        onClick={() => setSubTab('diff')}
+                        className="flex cursor-pointer items-center justify-between rounded-lg border border-slate-100 bg-slate-50/50 p-2 text-xs transition hover:bg-slate-100/60"
+                      >
+                        <div className="flex items-center gap-2 min-w-0">
+                          <FileCode2 className="h-3.5 w-3.5 text-blue-600 shrink-0" />
+                          <span className="mono truncate font-medium text-slate-800">{file.filePath}</span>
+                        </div>
+                        <span className="ml-2 shrink-0 font-medium text-[11px]">
+                          <span className="text-emerald-600">+{file.addedLines}</span>{' '}
+                          <span className="text-rose-600">-{file.removedLines}</span>
+                        </span>
+                      </div>
+                    ))}
+                    {(!analysis?.changedFiles || analysis.changedFiles.length === 0) && (
+                      <div className="text-slate-400 italic text-[11px]">관련 파일이 없습니다.</div>
+                    )}
+                  </div>
+                </div>
+              </CollapsibleSection>
+
+              {/* Coverage Execution Status */}
+              <div className="flex items-center justify-between rounded-xl border border-slate-200 bg-slate-50/70 p-2.5 text-xs text-slate-600">
+                <span className="flex items-center gap-1.5 font-medium">
+                  <Activity className="h-3.5 w-3.5 text-slate-400" />
+                  커버리지 정밀 분석
+                </span>
+                <Badge tone="gray">아직 지원 안 함</Badge>
+              </div>
+
+              {/* Missing Evidence Checklist when UNKNOWN */}
+              {causeVerdict === 'UNKNOWN' && analysis?.missingEvidenceChecklist && analysis.missingEvidenceChecklist.length > 0 && (
+                <div className="rounded-xl border border-rose-200 bg-rose-50/50 p-3 text-xs">
+                  <div className="font-semibold text-rose-800 mb-1.5 flex items-center gap-1">
+                    <AlertCircle className="h-3.5 w-3.5" />
+                    추측 수정 차단: 추가 필요 증거
+                  </div>
+                  <ul className="space-y-1 text-[11px] text-rose-700 list-disc list-inside">
+                    {analysis.missingEvidenceChecklist.map((item, idx) => (
+                      <li key={idx}>{item}</li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+
+              {/* Recovery Proposal Mini Card */}
+              {topProposal && (
                 <div className="rounded-xl border border-blue-200 bg-blue-50/40 p-3.5">
                   <div className="flex items-center justify-between">
                     <span className="text-xs font-semibold text-blue-900">수정안 1 (권장)</span>
@@ -713,8 +816,8 @@ export default function IncidentAnalysisView({
                     상세 보기
                   </Button>
                 </div>
-              </div>
-            )}
+              )}
+            </div>
           </Card>
         </div>
       </div>

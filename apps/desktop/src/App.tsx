@@ -170,11 +170,11 @@ export default function App() {
   }, [searchQuery, incidents, overview, events]);
 
   return (
-    <div className="flex h-full bg-[#f8fafc] text-slate-800">
+    <div className="flex h-screen w-screen overflow-hidden bg-[#f8fafc] text-slate-800">
       {/* 1. Left Sidebar matching reference */}
-      <aside className="flex w-56 shrink-0 flex-col border-r border-slate-200/90 bg-white px-3 py-4 select-none">
+      <aside className="flex h-full w-56 shrink-0 flex-col border-r border-slate-200/90 bg-white px-3 py-4 select-none">
         {/* App Logo */}
-        <div className="mb-6 flex items-center gap-2.5 px-3">
+        <div className="mb-6 flex shrink-0 items-center gap-2.5 px-3">
           <div className="flex h-7 w-7 items-center justify-center rounded-lg bg-blue-600 text-white font-bold text-sm shadow-sm">
             A
           </div>
@@ -182,7 +182,7 @@ export default function App() {
         </div>
 
         {/* Main Navigation (6 items) */}
-        <nav className="space-y-1">
+        <nav className="shrink-0 space-y-1">
           {NAV.map((n) => {
             const active = view === n.id;
             return (
@@ -208,8 +208,8 @@ export default function App() {
         </nav>
 
         {/* Connected Agents Section (4-Dimension Display) */}
-        <div className="mt-6 border-t border-slate-100 pt-3 px-2">
-          <div className="mb-2 flex items-center justify-between">
+        <div className="mt-6 flex flex-1 flex-col min-h-0 border-t border-slate-100 pt-3 px-2">
+          <div className="mb-2 flex shrink-0 items-center justify-between">
             <span className="text-[10px] font-semibold uppercase tracking-wider text-slate-400">
               {lang === 'en' ? 'Connected Agents' : '연결된 에이전트'}
             </span>
@@ -220,7 +220,7 @@ export default function App() {
             )}
           </div>
           {agents.length === 0 ? (
-            <div className="rounded-lg border border-slate-200/60 bg-slate-50/50 p-2 text-center">
+            <div className="shrink-0 rounded-lg border border-slate-200/60 bg-slate-50/50 p-2 text-center">
               <div className="text-[11px] text-slate-500 font-medium">
                 {lang === 'en' ? 'No Agent Connected' : '연결된 에이전트 없음'}
               </div>
@@ -235,7 +235,7 @@ export default function App() {
               </button>
             </div>
           ) : (
-            <div className="space-y-2 text-xs">
+            <div className="flex-1 min-h-0 overflow-y-auto space-y-2 pr-1 text-xs">
               {agents.map((ag) => {
                 const scopes = ag.observationScope && ag.observationScope.length > 0
                   ? ag.observationScope
@@ -315,7 +315,7 @@ export default function App() {
         </div>
 
         {/* MCP Server Status Card at Bottom */}
-        <div className="mt-auto border-t border-slate-100 pt-3 px-1">
+        <div className="mt-auto shrink-0 border-t border-slate-100 pt-3 px-1">
           <div
             onClick={() => setShowConnect(true)}
             className="cursor-pointer rounded-xl border border-slate-200 bg-slate-50/60 p-2.5 transition hover:bg-slate-100/60 shadow-sm"

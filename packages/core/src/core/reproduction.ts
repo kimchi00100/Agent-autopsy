@@ -553,7 +553,7 @@ export function getReproductionGateState(
       attemptsUsed: 0,
       attemptsAllowed: MAX_REPRODUCTION_ATTEMPTS,
       history: incident?.reproductionGate?.history,
-      discrepancyWarning: `Audit log hash chain is broken (${chainCheck.reasonCode}: ${chainCheck.message}). Gate state is set to AUDIT_BROKEN.`,
+      discrepancyWarning: `감사 기록 체인이 깨져 재현 게이트를 멈췄습니다 (${chainCheck.reasonCode}: ${chainCheck.message}). 상태: AUDIT_BROKEN`,
     };
   }
 
@@ -674,10 +674,10 @@ export function getReproductionGateState(
       storedGate.attemptsUsed !== attemptsUsed ||
       storedGate.attemptsAllowed !== allowedAttempts
     ) {
-      discrepancyWarning = `Reproduction gate discrepancy detected: audit calculation (state: ${state}, used: ${attemptsUsed}, allowed: ${allowedAttempts}) does not match incident stored gate (state: ${storedGate.state}, used: ${storedGate.attemptsUsed}, allowed: ${storedGate.attemptsAllowed}). Audit log state takes precedence.`;
+      discrepancyWarning = `재현 게이트 불일치 감지: 감사 기록 계산 값(상태: ${state}, 시도: ${attemptsUsed}, 허용: ${allowedAttempts})과 사건에 저장된 게이트 값(상태: ${storedGate.state}, 시도: ${storedGate.attemptsUsed}, 허용: ${storedGate.attemptsAllowed})이 일치하지 않습니다. 감사 기록 상태가 우선 적용됩니다.`;
     }
   } else if (state !== 'NOT_ATTEMPTED' && incident) {
-    discrepancyWarning = `Reproduction gate discrepancy detected: reproduction_gate_json is missing in database, but audit log indicates state '${state}' with ${attemptsUsed}/${allowedAttempts} attempts. Audit log state takes precedence.`;
+    discrepancyWarning = `재현 게이트 불일치 감지: 데이터베이스에 reproduction_gate_json이 없지만, 감사 기록상 상태는 '${state}'(시도: ${attemptsUsed}/${allowedAttempts}회)입니다. 감사 기록 상태가 우선 적용됩니다.`;
   }
 
   return {

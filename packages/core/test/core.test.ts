@@ -8980,4 +8980,67 @@ console.log(JSON.stringify({
     }
   });
 
+  test('171. B-2 4-4a2: Korean discrepancyWarning in reproduction gate (AUDIT_BROKEN, stored mismatch, missing json)', async () => {
+    const repo = path.join(testRoot, 'korean_discrepancy_test');
+    fs.mkdirSync(repo, { recursive: true });
+    execFileSync('git', ['init', '-b', 'main'], { cwd: repo });
+    execFileSync('git', ['config', 'user.name', 'Tester'], { cwd: repo });
+    execFileSync('git', ['config', 'user.email', 'test@local'], { cwd: repo });
+    fs.writeFileSync(path.join(repo, 'a.txt'), 'base\n');
+    execFileSync('git', ['add', '.'], { cwd: repo });
+    execFileSync('git', ['commit', '-m', 'initial'], { cwd: repo });
+
+    const localDbPath = path.join(testRoot, 'korean_disc.db');
+    const localCore = new CoreManager({ customDbPath: localDbPath });
+    localCore.updateProjectSettings(repo, { testCommand: 'node --test' });
+
+    const inc = await localCore.collectIncidentBundle(repo, 'Test Discrepancy Warnings', 'AssertionError');
+
+    // Create a dummy reproduction test that fails (so attempt is recorded)
+    fs.writeFileSync(path.join(repo, 'test_fail.js'), 'throw new Error("fail");');
+    await localCore.runReproduction(repo, inc.id, 'test_fail.js');
+
+    // Case 2: Stored gate vs audit calculation mismatch
+    localCore.getDatabase().updateIncidentReproductionGate(inc.id, {
+      state: 'REPRODUCED',
+      attemptsUsed: 0,
+      attemptsAllowed: 5,
+      history: [],
+    });
+
+    const gateMismatch = localCore.getReproductionGateState(inc.id);
+    assert.ok(gateMismatch.discrepancyWarning);
+    assert.ok(
+      gateMismatch.discrepancyWarning.includes('재현 게이트 불일치 감지: 감사 기록 계산 값'),
+      `Warning must be in Korean: ${gateMismatch.discrepancyWarning}`
+    );
+    assert.ok(gateMismatch.discrepancyWarning.includes('상태: IN_PROGRESS'));
+    assert.ok(gateMismatch.discrepancyWarning.includes('시도: 1'));
+    assert.ok(gateMismatch.discrepancyWarning.includes('허용: 3'));
+    assert.ok(gateMismatch.discrepancyWarning.includes('감사 기록 상태가 우선 적용됩니다.'));
+
+    // Case 3: reproduction_gate_json missing in database
+    localCore.getDatabase().updateIncidentReproductionGate(inc.id, null);
+    const gateMissingJson = localCore.getReproductionGateState(inc.id);
+    assert.ok(gateMissingJson.discrepancyWarning);
+    assert.ok(
+      gateMissingJson.discrepancyWarning.includes('재현 게이트 불일치 감지: 데이터베이스에 reproduction_gate_json이 없지만'),
+      `Warning must be in Korean: ${gateMissingJson.discrepancyWarning}`
+    );
+    assert.ok(gateMissingJson.discrepancyWarning.includes("'IN_PROGRESS'"));
+    assert.ok(gateMissingJson.discrepancyWarning.includes('시도: 1/3회'));
+    assert.ok(gateMissingJson.discrepancyWarning.includes('감사 기록 상태가 우선 적용됩니다.'));
+
+    // Case 1: Audit log hash chain is broken -> AUDIT_BROKEN
+    (localCore.getDatabase() as any).db.prepare("UPDATE audit_log SET payload_hash = 'tampered' WHERE seq = 1").run();
+    const gateAuditBroken = localCore.getReproductionGateState(inc.id);
+    assert.strictEqual(gateAuditBroken.state, 'AUDIT_BROKEN');
+    assert.ok(gateAuditBroken.discrepancyWarning);
+    assert.ok(
+      gateAuditBroken.discrepancyWarning.includes('감사 기록 체인이 깨져 재현 게이트를 멈췄습니다'),
+      `Warning must be in Korean: ${gateAuditBroken.discrepancyWarning}`
+    );
+    assert.ok(gateAuditBroken.discrepancyWarning.includes('상태: AUDIT_BROKEN'));
+  });
+
 });

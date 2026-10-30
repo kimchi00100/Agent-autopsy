@@ -90,9 +90,11 @@ export function ReproductionEvidenceBadge({ level }: { level: ReproductionEviden
 export function ReproductionEvidenceCard({
   reproductionResult,
   evidenceLevel,
+  hideHeader = false,
 }: {
   reproductionResult?: ReproductionResult | null;
   evidenceLevel?: ReproductionEvidenceLevel;
+  hideHeader?: boolean;
 }) {
   const level = evidenceLevel || (reproductionResult ? (reproductionResult.status === 'REPRODUCED' ? 'REPRODUCED_ONLY' : 'NOT_REPRODUCED') : 'NONE');
 
@@ -109,14 +111,16 @@ export function ReproductionEvidenceCard({
   }
 
   return (
-    <div className="mt-4 rounded-xl border border-indigo-200 bg-white p-3.5 text-xs shadow-sm space-y-3">
-      <div className="flex items-center justify-between border-b border-indigo-100 pb-2">
-        <span className="font-semibold text-slate-800 flex items-center gap-1.5">
-          <ShieldCheck className="h-4 w-4 text-indigo-600" />
-          재현 증거 (Reproduction Evidence)
-        </span>
-        <ReproductionEvidenceBadge level={level} />
-      </div>
+    <div className={hideHeader ? 'space-y-3' : 'mt-4 rounded-xl border border-indigo-200 bg-white p-3.5 text-xs shadow-sm space-y-3'}>
+      {!hideHeader && (
+        <div className="flex items-center justify-between border-b border-indigo-100 pb-2">
+          <span className="font-semibold text-slate-800 flex items-center gap-1.5">
+            <ShieldCheck className="h-4 w-4 text-indigo-600" />
+            재현 증거 (Reproduction Evidence)
+          </span>
+          <ReproductionEvidenceBadge level={level} />
+        </div>
+      )}
 
       <div className="text-[11px] text-slate-500 bg-indigo-50/50 p-2 rounded border border-indigo-100">
         강한 증거는 정상 시점에서는 통과하고 지금은 실패하며(회귀 확인), 기대값만 바꾼 테스트로 실패가 뒤집힌 경우(단언 뒤집기 확인)에만 표시됩니다.
@@ -215,16 +219,18 @@ export function ReproductionEvidenceCard({
 export function ReproductionProgressCard({
   statusResponse,
   onSelectIncident,
+  hideHeader = false,
 }: {
   statusResponse?: IncidentReproductionStatusResponse | null;
   onSelectIncident?: (incidentId: string) => void;
+  hideHeader?: boolean;
 }) {
   if (!statusResponse) return null;
 
   const { gate, lock, otherBlockedIncidents } = statusResponse;
 
   return (
-    <div className="mt-4 rounded-xl border border-slate-200 bg-white p-3.5 text-xs shadow-sm space-y-3">
+    <div className={hideHeader ? 'space-y-3' : 'mt-4 rounded-xl border border-slate-200 bg-white p-3.5 text-xs shadow-sm space-y-3'}>
       {/* Q4 Warning: Other blocked incidents in same project */}
       {otherBlockedIncidents && otherBlockedIncidents.length > 0 && (
         <div className="rounded-lg border border-amber-300 bg-amber-50 p-2.5 text-amber-900 space-y-1.5">
@@ -250,20 +256,22 @@ export function ReproductionProgressCard({
         </div>
       )}
 
-      <div className="flex items-center justify-between border-b border-slate-100 pb-2">
-        <span className="font-semibold text-slate-800 flex items-center gap-1.5">
-          <Clock className="h-4 w-4 text-slate-600" />
-          재현 진행 상태 (Reproduction Gate & Lock)
-        </span>
-        <Badge tone={
-          gate.state === 'REPRODUCED' ? 'green' :
-          gate.state === 'WAIVED' ? 'blue' :
-          gate.state === 'ABANDONED' || gate.state === 'AUDIT_BROKEN' ? 'red' :
-          gate.state === 'NEEDS_USER_DECISION' ? 'amber' : 'gray'
-        }>
-          {GATE_STATE_TEXTS[gate.state] || gate.state}
-        </Badge>
-      </div>
+      {!hideHeader && (
+        <div className="flex items-center justify-between border-b border-slate-100 pb-2">
+          <span className="font-semibold text-slate-800 flex items-center gap-1.5">
+            <Clock className="h-4 w-4 text-slate-600" />
+            재현 진행 상태 (Reproduction Gate & Lock)
+          </span>
+          <Badge tone={
+            gate.state === 'REPRODUCED' ? 'green' :
+            gate.state === 'WAIVED' ? 'blue' :
+            gate.state === 'ABANDONED' || gate.state === 'AUDIT_BROKEN' ? 'red' :
+            gate.state === 'NEEDS_USER_DECISION' ? 'amber' : 'gray'
+          }>
+            {GATE_STATE_TEXTS[gate.state] || gate.state}
+          </Badge>
+        </div>
+      )}
 
       {/* Lock status */}
       <div className="space-y-1 text-[11px]">

@@ -91,3 +91,26 @@ export function relativeTime(iso: string): string {
 export function clock(iso: string): string {
   return new Date(iso).toLocaleTimeString('ko-KR', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
 }
+
+/** ISO 시각 문자열을 한국어 날짜 및 시각(예: 2026. 10. 30. 오후 9:20:59)으로 변환한다. */
+export function formatKoreanDateTime(iso: string): string {
+  try {
+    const d = new Date(iso);
+    if (isNaN(d.getTime())) return iso;
+    return d.toLocaleString('ko-KR');
+  } catch {
+    return iso;
+  }
+}
+
+/**
+ * 근거 문장 안의 긴 절대 경로(예: C:\Users\...\points_repro.js:5)를 파일 이름과 줄 번호(points_repro.js:5)로 축약한다.
+ */
+export function shortenPathInEvidence(text: string): string {
+  if (!text) return text;
+  return text.replace(
+    /(?:[a-zA-Z]:[\\/][^\s:,;'")\]]*[\\/]|(?:\/[^\s:,;'")\]/]+)*\/)([^\s\\/:,;'")\]]+(?::\d+(?::\d+)?)?)/g,
+    '$1'
+  );
+}
+

@@ -8663,4 +8663,321 @@ test('162. B-2 Step 4-4a: GET /api/incidents/:id/reproduction-status authenticat
     }
   });
 
+  test('167. Security S-1: Legacy DB migration is skipped when AUTOPSY_DATA_DIR is specified', async () => {
+    const fakeEnvRoot = path.join(testRoot, 's1_t167_fake_env');
+    const fakeAppData = path.join(fakeEnvRoot, 'AppData', 'Roaming');
+    const fakeUserProfile = path.join(fakeEnvRoot, 'UserProfile');
+    const fakeLocalAppData = path.join(fakeEnvRoot, 'AppData', 'Local');
+    const customDataDir = path.join(fakeEnvRoot, 'custom_data_dir');
+    const legacyDir = path.join(fakeAppData, '.agent-autopsy');
+    fs.mkdirSync(legacyDir, { recursive: true });
+    fs.mkdirSync(fakeUserProfile, { recursive: true });
+    fs.mkdirSync(fakeLocalAppData, { recursive: true });
+    fs.mkdirSync(customDataDir, { recursive: true });
+
+    // Create fake legacy DB with sentinel marker in temporary APPDATA
+    const sqlite3 = await import('node:sqlite');
+    const legacyDbPath = path.join(legacyDir, 'autopsy.db');
+    const legConn = new (sqlite3 as any).DatabaseSync(legacyDbPath);
+    legConn.exec("CREATE TABLE legacy_marker (key TEXT PRIMARY KEY, val TEXT); INSERT INTO legacy_marker VALUES ('LEGACY_SENTINEL', 'OLD_DATA');");
+    legConn.close();
+
+    const currentTestDir = path.dirname(url.fileURLToPath(import.meta.url));
+    const dbModuleUrl = url.pathToFileURL(path.resolve(currentTestDir, '../src/db/database.js')).href;
+    const pathsModuleUrl = url.pathToFileURL(path.resolve(currentTestDir, '../src/utils/paths.js')).href;
+
+    const runnerFile = path.join(fakeEnvRoot, 'runner.mjs');
+    fs.writeFileSync(
+      runnerFile,
+      `
+import { AutopsyDatabase } from '${dbModuleUrl}';
+import { resolveDataDir } from '${pathsModuleUrl}';
+import * as path from 'node:path';
+
+const defaultDb = path.resolve(resolveDataDir(), 'autopsy.db');
+const db = new AutopsyDatabase(defaultDb);
+
+let hasMarker = false;
+try {
+  const row = db.db.prepare("SELECT val FROM legacy_marker WHERE key = 'LEGACY_SENTINEL'").get();
+  if (row) hasMarker = true;
+} catch {}
+
+console.log(JSON.stringify({ status: db.status, hasMarker, resolvedPath: db.resolvedPath }));
+      `.trim()
+    );
+
+    const childEnv: Record<string, string> = {
+      PATH: process.env.PATH || '',
+      SYSTEMROOT: process.env.SYSTEMROOT || '',
+      APPDATA: fakeAppData,
+      USERPROFILE: fakeUserProfile,
+      HOME: fakeUserProfile,
+      LOCALAPPDATA: fakeLocalAppData,
+      AUTOPSY_DATA_DIR: customDataDir,
+    };
+    const out = execFileSync(process.execPath, [runnerFile], { env: childEnv, encoding: 'utf8' });
+    const res = JSON.parse(out.trim());
+
+    assert.strictEqual(res.status, 'READY');
+    assert.strictEqual(res.hasMarker, false);
+  });
+
+  test('168. Security S-1: Legacy DB migration is skipped when customDbPath is not default path', async () => {
+    const fakeEnvRoot = path.join(testRoot, 's1_t168_fake_env');
+    const fakeAppData = path.join(fakeEnvRoot, 'AppData', 'Roaming');
+    const fakeUserProfile = path.join(fakeEnvRoot, 'UserProfile');
+    const fakeLocalAppData = path.join(fakeEnvRoot, 'AppData', 'Local');
+    const legacyDir = path.join(fakeAppData, '.agent-autopsy');
+    fs.mkdirSync(legacyDir, { recursive: true });
+    fs.mkdirSync(fakeUserProfile, { recursive: true });
+    fs.mkdirSync(fakeLocalAppData, { recursive: true });
+
+    // Create fake legacy DB with sentinel marker in temporary APPDATA
+    const sqlite3 = await import('node:sqlite');
+    const legacyDbPath = path.join(legacyDir, 'autopsy.db');
+    const legConn = new (sqlite3 as any).DatabaseSync(legacyDbPath);
+    legConn.exec("CREATE TABLE legacy_marker (key TEXT PRIMARY KEY, val TEXT); INSERT INTO legacy_marker VALUES ('LEGACY_SENTINEL', 'OLD_DATA');");
+    legConn.close();
+
+    const currentTestDir = path.dirname(url.fileURLToPath(import.meta.url));
+    const dbModuleUrl = url.pathToFileURL(path.resolve(currentTestDir, '../src/db/database.js')).href;
+    const customDbPath = path.join(fakeEnvRoot, 'non_standard_dir', 'custom.db').replace(/\\/g, '/');
+
+    const runnerFile = path.join(fakeEnvRoot, 'runner.mjs');
+    fs.writeFileSync(
+      runnerFile,
+      `
+import { AutopsyDatabase } from '${dbModuleUrl}';
+
+const db = new AutopsyDatabase('${customDbPath}');
+
+let hasMarker = false;
+try {
+  const row = db.db.prepare("SELECT val FROM legacy_marker WHERE key = 'LEGACY_SENTINEL'").get();
+  if (row) hasMarker = true;
+} catch {}
+
+console.log(JSON.stringify({ status: db.status, hasMarker, resolvedPath: db.resolvedPath }));
+      `.trim()
+    );
+
+    const childEnv: Record<string, string> = {
+      PATH: process.env.PATH || '',
+      SYSTEMROOT: process.env.SYSTEMROOT || '',
+      APPDATA: fakeAppData,
+      USERPROFILE: fakeUserProfile,
+      HOME: fakeUserProfile,
+      LOCALAPPDATA: fakeLocalAppData,
+    };
+    const out = execFileSync(process.execPath, [runnerFile], { env: childEnv, encoding: 'utf8' });
+    const res = JSON.parse(out.trim());
+
+    assert.strictEqual(res.status, 'READY');
+    assert.strictEqual(res.hasMarker, false);
+  });
+
+  test('169. Security S-1: Legacy DB is migrated when AUTOPSY_DATA_DIR is unset and default path is opened', async () => {
+    const fakeEnvRoot = path.join(testRoot, 's1_t169_fake_env');
+    const fakeAppData = path.join(fakeEnvRoot, 'AppData', 'Roaming');
+    const fakeUserProfile = path.join(fakeEnvRoot, 'UserProfile');
+    const fakeLocalAppData = path.join(fakeEnvRoot, 'AppData', 'Local');
+    const legacyDir = path.join(fakeAppData, '.agent-autopsy');
+    fs.mkdirSync(legacyDir, { recursive: true });
+    fs.mkdirSync(fakeUserProfile, { recursive: true });
+    fs.mkdirSync(fakeLocalAppData, { recursive: true });
+
+    // Create fake legacy DB with sentinel marker in temporary APPDATA
+    const sqlite3 = await import('node:sqlite');
+    const legacyDbPath = path.join(legacyDir, 'autopsy.db');
+    const legConn = new (sqlite3 as any).DatabaseSync(legacyDbPath);
+    legConn.exec("CREATE TABLE legacy_marker (key TEXT PRIMARY KEY, val TEXT); INSERT INTO legacy_marker VALUES ('LEGACY_SENTINEL', 'OLD_DATA');");
+    legConn.close();
+
+    const currentTestDir = path.dirname(url.fileURLToPath(import.meta.url));
+    const dbModuleUrl = url.pathToFileURL(path.resolve(currentTestDir, '../src/db/database.js')).href;
+    const pathsModuleUrl = url.pathToFileURL(path.resolve(currentTestDir, '../src/utils/paths.js')).href;
+
+    const runnerFile = path.join(fakeEnvRoot, 'runner.mjs');
+    fs.writeFileSync(
+      runnerFile,
+      `
+import { AutopsyDatabase } from '${dbModuleUrl}';
+import { resolveDataDir } from '${pathsModuleUrl}';
+import * as path from 'node:path';
+
+const defaultDb = path.resolve(resolveDataDir(), 'autopsy.db');
+const db = new AutopsyDatabase(defaultDb);
+
+let hasMarker = false;
+try {
+  const row = db.db.prepare("SELECT val FROM legacy_marker WHERE key = 'LEGACY_SENTINEL'").get();
+  if (row) hasMarker = true;
+} catch {}
+
+console.log(JSON.stringify({
+  status: db.status,
+  hasMarker,
+  resolvedPath: db.resolvedPath,
+  expectedDir: path.resolve(resolveDataDir())
+}));
+      `.trim()
+    );
+
+    const childEnv: Record<string, string> = {
+      PATH: process.env.PATH || '',
+      SYSTEMROOT: process.env.SYSTEMROOT || '',
+      APPDATA: fakeAppData,
+      USERPROFILE: fakeUserProfile,
+      HOME: fakeUserProfile,
+      LOCALAPPDATA: fakeLocalAppData,
+    };
+    const out = execFileSync(process.execPath, [runnerFile], { env: childEnv, encoding: 'utf8' });
+    const res = JSON.parse(out.trim());
+
+    // Assert that the default data dir is under the fake APPDATA, NOT the real %APPDATA%
+    assert.strictEqual(path.resolve(res.expectedDir).toLowerCase(), path.resolve(fakeAppData, 'AgentAutopsy').toLowerCase());
+    const realAppData = process.env.APPDATA || '';
+    if (realAppData) {
+      assert.notStrictEqual(path.resolve(res.expectedDir).toLowerCase(), path.resolve(realAppData, 'AgentAutopsy').toLowerCase());
+    }
+
+    // Assert that migration happened: status 'MIGRATED', marker row present
+    assert.strictEqual(res.status, 'MIGRATED');
+    assert.strictEqual(res.hasMarker, true);
+  });
+
+  test('170. Security S-1: ApiServer strict Origin verification (hostname, IPv6, file/vscode protocols, null token gate)', async () => {
+    const repo = path.join(testRoot, 's1_api_origin_test');
+    fs.mkdirSync(repo, { recursive: true });
+    execFileSync('git', ['init', '-b', 'main'], { cwd: repo });
+    execFileSync('git', ['config', 'user.name', 'Tester'], { cwd: repo });
+    execFileSync('git', ['config', 'user.email', 'test@local'], { cwd: repo });
+
+    const localCore = new CoreManager({ customDbPath: path.join(repo, 'autopsy.db') });
+    const apiServer = new ApiServer(localCore);
+    const port = await apiServer.start(3930);
+    const token = apiServer.getSessionToken();
+
+    try {
+      // 1. 403 cases: code must be 'ORIGIN_NOT_ALLOWED'
+      // 1-1. Origin: null without token on POST /api/overview
+      const resNullOverview = await fetch(`http://127.0.0.1:${port}/api/overview`, {
+        method: 'POST',
+        headers: { Origin: 'null' },
+      });
+      assert.strictEqual(resNullOverview.status, 403);
+      const jsonNullOverview = await resNullOverview.json();
+      assert.strictEqual(jsonNullOverview.code, 'ORIGIN_NOT_ALLOWED');
+
+      // 1-2. Origin: null without token on GET /api/stream
+      const resNullStream = await fetch(`http://127.0.0.1:${port}/api/stream`, {
+        method: 'GET',
+        headers: { Origin: 'null' },
+      });
+      assert.strictEqual(resNullStream.status, 403);
+      const jsonNullStream = await resNullStream.json();
+      assert.strictEqual(jsonNullStream.code, 'ORIGIN_NOT_ALLOWED');
+
+      // 1-3. Origin: http://localhost.evil.example on POST /api/overview
+      const resEvilLocalhost = await fetch(`http://127.0.0.1:${port}/api/overview`, {
+        method: 'POST',
+        headers: { Origin: 'http://localhost.evil.example' },
+      });
+      assert.strictEqual(resEvilLocalhost.status, 403);
+      const jsonEvilLocalhost = await resEvilLocalhost.json();
+      assert.strictEqual(jsonEvilLocalhost.code, 'ORIGIN_NOT_ALLOWED');
+
+      // 1-4. Origin: http://127.0.0.1.evil.example on POST /api/overview
+      const resEvilIp = await fetch(`http://127.0.0.1:${port}/api/overview`, {
+        method: 'POST',
+        headers: { Origin: 'http://127.0.0.1.evil.example' },
+      });
+      assert.strictEqual(resEvilIp.status, 403);
+      const jsonEvilIp = await resEvilIp.json();
+      assert.strictEqual(jsonEvilIp.code, 'ORIGIN_NOT_ALLOWED');
+
+      // 1-5. Origin: https://evil.example on POST /api/overview
+      const resEvilHttps = await fetch(`http://127.0.0.1:${port}/api/overview`, {
+        method: 'POST',
+        headers: { Origin: 'https://evil.example' },
+      });
+      assert.strictEqual(resEvilHttps.status, 403);
+      const jsonEvilHttps = await resEvilHttps.json();
+      assert.strictEqual(jsonEvilHttps.code, 'ORIGIN_NOT_ALLOWED');
+
+      // 1-6. Origin: unparseable URL on POST /api/overview
+      const resInvalidUrl = await fetch(`http://127.0.0.1:${port}/api/overview`, {
+        method: 'POST',
+        headers: { Origin: ':::not-a-valid-url:::' },
+      });
+      assert.strictEqual(resInvalidUrl.status, 403);
+      const jsonInvalidUrl = await resInvalidUrl.json();
+      assert.strictEqual(jsonInvalidUrl.code, 'ORIGIN_NOT_ALLOWED');
+
+      // 2. Allowed cases:
+      // 2-1. Origin: null WITH valid token on POST /api/overview
+      const resNullToken = await fetch(`http://127.0.0.1:${port}/api/overview`, {
+        method: 'POST',
+        headers: {
+          Origin: 'null',
+          'x-autopsy-token': token,
+        },
+      });
+      assert.strictEqual(resNullToken.status, 200);
+      assert.strictEqual(resNullToken.headers.get('access-control-allow-origin'), 'null');
+
+      // 2-2. Origin: null WITH valid token on GET /api/stream
+      const acStream = new AbortController();
+      const resStreamToken = await fetch(`http://127.0.0.1:${port}/api/stream?token=${encodeURIComponent(token)}`, {
+        method: 'GET',
+        headers: { Origin: 'null' },
+        signal: acStream.signal,
+      });
+      assert.strictEqual(resStreamToken.status, 200);
+      assert.strictEqual(resStreamToken.headers.get('access-control-allow-origin'), 'null');
+      acStream.abort();
+
+      // 2-3. Origin: http://localhost:5173 on POST /api/overview
+      const resLocalhost5173 = await fetch(`http://127.0.0.1:${port}/api/overview`, {
+        method: 'POST',
+        headers: { Origin: 'http://localhost:5173' },
+      });
+      assert.strictEqual(resLocalhost5173.status, 200);
+      assert.strictEqual(resLocalhost5173.headers.get('access-control-allow-origin'), 'http://localhost:5173');
+
+      // 2-4. Origin: http://127.0.0.1:3847 on POST /api/overview
+      const resLoopback3847 = await fetch(`http://127.0.0.1:${port}/api/overview`, {
+        method: 'POST',
+        headers: { Origin: 'http://127.0.0.1:3847' },
+      });
+      assert.strictEqual(resLoopback3847.status, 200);
+      assert.strictEqual(resLoopback3847.headers.get('access-control-allow-origin'), 'http://127.0.0.1:3847');
+
+      // 2-5. No Origin header on POST /api/overview
+      const resNoOrigin = await fetch(`http://127.0.0.1:${port}/api/overview`, {
+        method: 'POST',
+      });
+      assert.strictEqual(resNoOrigin.status, 200);
+      assert.strictEqual(resNoOrigin.headers.get('access-control-allow-origin'), '*');
+
+      // 2-6. Allowed protocols: file:// and vscode-webview://
+      const resFileOrigin = await fetch(`http://127.0.0.1:${port}/api/overview`, {
+        method: 'POST',
+        headers: { Origin: 'file://' },
+      });
+      assert.strictEqual(resFileOrigin.status, 200);
+      assert.strictEqual(resFileOrigin.headers.get('access-control-allow-origin'), 'file://');
+
+      const resVscodeOrigin = await fetch(`http://127.0.0.1:${port}/api/overview`, {
+        method: 'POST',
+        headers: { Origin: 'vscode-webview://vscode-app' },
+      });
+      assert.strictEqual(resVscodeOrigin.status, 200);
+      assert.strictEqual(resVscodeOrigin.headers.get('access-control-allow-origin'), 'vscode-webview://vscode-app');
+    } finally {
+      await apiServer.stop();
+    }
+  });
+
 });

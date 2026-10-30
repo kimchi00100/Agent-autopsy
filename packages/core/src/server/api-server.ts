@@ -66,18 +66,42 @@ export class ApiServer {
           // 2. Strict Origin verification against malicious external websites
           const origin = (req.headers.origin as string) || '';
           if (origin) {
-            const isAllowedOrigin =
-              origin === 'null' ||
-              origin.startsWith('http://127.0.0.1') ||
-              origin.startsWith('http://localhost') ||
-              origin.startsWith('file://') ||
-              origin.startsWith('vscode-webview://');
-            if (!isAllowedOrigin) {
-              res.writeHead(403, { 'Content-Type': 'application/json' });
-              res.end(JSON.stringify({ error: `Forbidden: Origin "${origin}" is not authorized.` }));
-              return;
+            if (origin === 'null') {
+              if (!this.verifySessionToken(req)) {
+                res.writeHead(403, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ code: 'ORIGIN_NOT_ALLOWED', error: 'Forbidden: Origin "null" requires a valid session token (ORIGIN_NOT_ALLOWED).' }));
+                return;
+              }
+              res.setHeader('Access-Control-Allow-Origin', 'null');
+            } else {
+              let parsedUrl: URL;
+              try {
+                parsedUrl = new URL(origin);
+              } catch {
+                res.writeHead(403, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ code: 'ORIGIN_NOT_ALLOWED', error: `Forbidden: Origin "${origin}" is not authorized (ORIGIN_NOT_ALLOWED).` }));
+                return;
+              }
+
+              const isLocalHttp =
+                parsedUrl.protocol === 'http:' &&
+                (parsedUrl.hostname === '127.0.0.1' ||
+                 parsedUrl.hostname === 'localhost' ||
+                 parsedUrl.hostname === '[::1]' ||
+                 parsedUrl.hostname === '::1');
+
+              const isAllowedProtocol =
+                parsedUrl.protocol === 'file:' ||
+                parsedUrl.protocol === 'vscode-webview:';
+
+              if (!isLocalHttp && !isAllowedProtocol) {
+                res.writeHead(403, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ code: 'ORIGIN_NOT_ALLOWED', error: `Forbidden: Origin "${origin}" is not authorized (ORIGIN_NOT_ALLOWED).` }));
+                return;
+              }
+
+              res.setHeader('Access-Control-Allow-Origin', origin);
             }
-            res.setHeader('Access-Control-Allow-Origin', origin);
           } else {
             res.setHeader('Access-Control-Allow-Origin', '*');
           }
@@ -212,7 +236,7 @@ export class ApiServer {
         'Content-Type': 'text/event-stream',
         'Cache-Control': 'no-cache',
         'Connection': 'keep-alive',
-        'Access-Control-Allow-Origin': '*',
+        'Access-Control-Allow-Origin': (req.headers.origin as string) || '*',
       });
       res.write('data: {"type":"connected"}\n\n');
       this.sseClients.add(res);

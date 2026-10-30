@@ -33,7 +33,7 @@ import {
   ProposalIntegrityStatus,
   ProposalIntegrityCode,
 } from '../types.js';
-import { generateDeterministicProjectId, normalizeRepoPath } from '../utils/paths.js';
+import { generateDeterministicProjectId, normalizeRepoPath, resolveDataDir } from '../utils/paths.js';
 import {
   GENESIS_PREV_HASH,
   computeAuditEntryHash,
@@ -64,8 +64,14 @@ export class AutopsyDatabase {
         fs.mkdirSync(dir, { recursive: true });
       }
 
-      // Seamless migration: If target DB does not exist, check legacy ~/.agent-autopsy/autopsy.db
-      if (!fs.existsSync(dbPath)) {
+      // Seamless migration: Only if (a) AUTOPSY_DATA_DIR is not specified, and (b) dbPath is the default autopsy.db
+      const hasAutopsyDataDir = Boolean(process.env.AUTOPSY_DATA_DIR && process.env.AUTOPSY_DATA_DIR.trim());
+      const defaultDbPath = path.resolve(resolveDataDir(), 'autopsy.db');
+      const isDefaultDbPath = process.platform === 'win32'
+        ? path.resolve(dbPath).toLowerCase() === defaultDbPath.toLowerCase()
+        : path.resolve(dbPath) === defaultDbPath;
+
+      if (!hasAutopsyDataDir && isDefaultDbPath && !fs.existsSync(dbPath)) {
         const legacyCandidates = [
           path.resolve(process.env.APPDATA || process.env.HOME || '.', '.agent-autopsy', 'autopsy.db'),
           path.resolve(process.env.USERPROFILE || process.env.HOME || '.', '.agent-autopsy', 'autopsy.db'),

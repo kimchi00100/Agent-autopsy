@@ -9043,4 +9043,376 @@ console.log(JSON.stringify({
     assert.ok(gateAuditBroken.discrepancyWarning.includes('상태: AUDIT_BROKEN'));
   });
 
+
+  test('172. B-2 Step 4-4b: decideReproduction validates reason (empty, whitespace, >500 chars) and preserves audit log and gate state (Case a)', async () => {
+    const repo = path.join(testRoot, 'b2_s44b_t172_reason_validation');
+    fs.mkdirSync(repo, { recursive: true });
+    execFileSync('git', ['init', '-b', 'main'], { cwd: repo });
+    execFileSync('git', ['config', 'user.name', 'Tester'], { cwd: repo });
+    execFileSync('git', ['config', 'user.email', 'test@test.com'], { cwd: repo });
+    fs.writeFileSync(path.join(repo, 'package.json'), JSON.stringify({ type: 'module' }));
+    fs.writeFileSync(path.join(repo, 'fail.js'), 'throw new Error("fail");\n');
+    execFileSync('git', ['add', '.'], { cwd: repo });
+    execFileSync('git', ['commit', '-m', 'init'], { cwd: repo });
+
+    const localCore = new CoreManager({ customDbPath: path.join(repo, 'autopsy.db') });
+    localCore.captureCheckpoint(repo, 'Base');
+    localCore.updateProjectSettings(repo, { testCommand: 'node fail.js' });
+
+    const inc = await localCore.collectIncidentBundle(repo, 'bug 172', 'err');
+
+    await localCore.runReproduction(repo, inc.id, 'fail.js');
+    await localCore.runReproduction(repo, inc.id, 'fail.js');
+    await localCore.runReproduction(repo, inc.id, 'fail.js');
+
+    const gateBefore = localCore.getReproductionGateState(inc.id);
+    assert.strictEqual(gateBefore.state, 'ABANDONED');
+
+    const db = (localCore.getDatabase() as any).db;
+    const auditCountBefore = Number(db.prepare('SELECT count(*) as cnt FROM audit_log').get().cnt);
+
+    // 1. Missing / undefined reason -> REASON_REQUIRED (400)
+    let errMissing: any;
+    try {
+      localCore.decideReproduction(inc.id, 'PROCEED_WITHOUT_REPRODUCTION', repo, undefined as any);
+    } catch (e: any) {
+      errMissing = e;
+    }
+    assert.ok(errMissing);
+    assert.strictEqual(errMissing.code, 'REASON_REQUIRED');
+    assert.strictEqual(errMissing.statusCode, 400);
+
+    let auditCountNow = Number(db.prepare('SELECT count(*) as cnt FROM audit_log').get().cnt);
+    assert.strictEqual(auditCountNow, auditCountBefore);
+    assert.strictEqual(localCore.getReproductionGateState(inc.id).state, 'ABANDONED');
+
+    // 2. Whitespace-only reason -> REASON_REQUIRED (400)
+    let errWhitespace: any;
+    try {
+      localCore.decideReproduction(inc.id, 'ALLOW_MORE_ATTEMPTS', repo, '   \t  \n  ');
+    } catch (e: any) {
+      errWhitespace = e;
+    }
+    assert.ok(errWhitespace);
+    assert.strictEqual(errWhitespace.code, 'REASON_REQUIRED');
+    assert.strictEqual(errWhitespace.statusCode, 400);
+
+    auditCountNow = Number(db.prepare('SELECT count(*) as cnt FROM audit_log').get().cnt);
+    assert.strictEqual(auditCountNow, auditCountBefore);
+    assert.strictEqual(localCore.getReproductionGateState(inc.id).state, 'ABANDONED');
+
+    // 3. > 500 chars -> REASON_TOO_LONG (400)
+    let errTooLong: any;
+    try {
+      localCore.decideReproduction(inc.id, 'PROCEED_WITHOUT_REPRODUCTION', repo, 'A'.repeat(501));
+    } catch (e: any) {
+      errTooLong = e;
+    }
+    assert.ok(errTooLong);
+    assert.strictEqual(errTooLong.code, 'REASON_TOO_LONG');
+    assert.strictEqual(errTooLong.statusCode, 400);
+
+    auditCountNow = Number(db.prepare('SELECT count(*) as cnt FROM audit_log').get().cnt);
+    assert.strictEqual(auditCountNow, auditCountBefore);
+    assert.strictEqual(localCore.getReproductionGateState(inc.id).state, 'ABANDONED');
+  });
+
+  test('173. B-2 Step 4-4b: decideReproduction preserves error order: NOT_ABANDONED and PROJECT_MISMATCH checked before empty reason (Case b)', async () => {
+    const repoA = path.join(testRoot, 'b2_s44b_t173_repoA');
+    const repoB = path.join(testRoot, 'b2_s44b_t173_repoB');
+    fs.mkdirSync(repoA, { recursive: true });
+    fs.mkdirSync(repoB, { recursive: true });
+    execFileSync('git', ['init', '-b', 'main'], { cwd: repoA });
+    execFileSync('git', ['init', '-b', 'main'], { cwd: repoB });
+
+    const localCore = new CoreManager({ customDbPath: path.join(repoA, 'autopsy.db') });
+    const incA = await localCore.collectIncidentBundle(repoA, 'bug 173', 'err');
+
+    // 1. Newly created incident is NOT in ABANDONED / NEEDS_USER_DECISION state.
+    let errNotAbandoned: any;
+    try {
+      localCore.decideReproduction(incA.id, 'PROCEED_WITHOUT_REPRODUCTION', repoA, '');
+    } catch (e: any) {
+      errNotAbandoned = e;
+    }
+    assert.ok(errNotAbandoned);
+    assert.strictEqual(errNotAbandoned.code, 'NOT_ABANDONED');
+    assert.strictEqual(errNotAbandoned.statusCode, 409);
+
+    // 2. Calling with mismatched repoPath and empty reason must throw PROJECT_MISMATCH (403), NOT REASON_REQUIRED.
+    let errMismatch: any;
+    try {
+      localCore.decideReproduction(incA.id, 'PROCEED_WITHOUT_REPRODUCTION', repoB, '');
+    } catch (e: any) {
+      errMismatch = e;
+    }
+    assert.ok(errMismatch);
+    assert.strictEqual(errMismatch.code, 'PROJECT_MISMATCH');
+    assert.strictEqual(errMismatch.statusCode, 403);
+  });
+
+  test('174. B-2 Step 4-4b: PROCEED_WITHOUT_REPRODUCTION and ALLOW_MORE_ATTEMPTS save trimmed reason in user_decisions, reproduction-status returns decisions with recordStatus OK (Case c)', async () => {
+    const repo = path.join(testRoot, 'b2_s44b_t174_save_reasons');
+    fs.mkdirSync(repo, { recursive: true });
+    execFileSync('git', ['init', '-b', 'main'], { cwd: repo });
+    execFileSync('git', ['config', 'user.name', 'Tester'], { cwd: repo });
+    execFileSync('git', ['config', 'user.email', 'test@test.com'], { cwd: repo });
+    fs.writeFileSync(path.join(repo, 'package.json'), JSON.stringify({ type: 'module' }));
+    fs.writeFileSync(path.join(repo, 'fail.js'), 'throw new Error("fail");\n');
+    execFileSync('git', ['add', '.'], { cwd: repo });
+    execFileSync('git', ['commit', '-m', 'init'], { cwd: repo });
+
+    const localCore = new CoreManager({ customDbPath: path.join(repo, 'autopsy.db') });
+    localCore.captureCheckpoint(repo, 'Base');
+    localCore.updateProjectSettings(repo, { testCommand: 'node fail.js' });
+
+    const inc = await localCore.collectIncidentBundle(repo, 'bug 174', 'err');
+    await localCore.runReproduction(repo, inc.id, 'fail.js');
+    await localCore.runReproduction(repo, inc.id, 'fail.js');
+    await localCore.runReproduction(repo, inc.id, 'fail.js');
+
+    assert.strictEqual(localCore.getReproductionGateState(inc.id).state, 'ABANDONED');
+
+    // 1. ALLOW_MORE_ATTEMPTS with whitespace around reason
+    const reason1 = '   재현 환경을 보완하여 3회 추가 시도 진행합니다.   ';
+    localCore.decideReproduction(inc.id, 'ALLOW_MORE_ATTEMPTS', repo, reason1);
+
+    let status = localCore.getIncidentReproductionStatus(inc.id, repo);
+    assert.ok(status.decisions);
+    assert.strictEqual(status.decisions.length, 1);
+    assert.strictEqual(status.decisions[0].kind, 'REPRODUCTION_ATTEMPTS_GRANTED');
+    assert.strictEqual(status.decisions[0].recordStatus, 'OK');
+    assert.strictEqual(status.decisions[0].reason, '재현 환경을 보완하여 3회 추가 시도 진행합니다.');
+
+    // 2. Fail 3 more times to abandon again
+    await localCore.runReproduction(repo, inc.id, 'fail.js');
+    await localCore.runReproduction(repo, inc.id, 'fail.js');
+    await localCore.runReproduction(repo, inc.id, 'fail.js');
+
+    assert.strictEqual(localCore.getReproductionGateState(inc.id).state, 'ABANDONED');
+
+    // 3. PROCEED_WITHOUT_REPRODUCTION with reason
+    const reason2 = 'UI 간헐적 버그로 재현 없이 수정안을 검토합니다.';
+    localCore.decideReproduction(inc.id, 'PROCEED_WITHOUT_REPRODUCTION', repo, reason2);
+
+    status = localCore.getIncidentReproductionStatus(inc.id, repo);
+    assert.strictEqual(status.gate.state, 'WAIVED');
+    assert.ok(status.decisions);
+    assert.strictEqual(status.decisions.length, 2);
+
+    assert.ok(status.decisions[0].auditSeq < status.decisions[1].auditSeq);
+    assert.strictEqual(status.decisions[0].kind, 'REPRODUCTION_ATTEMPTS_GRANTED');
+    assert.strictEqual(status.decisions[0].recordStatus, 'OK');
+    assert.strictEqual(status.decisions[0].reason, '재현 환경을 보완하여 3회 추가 시도 진행합니다.');
+
+    assert.strictEqual(status.decisions[1].kind, 'REPRODUCTION_WAIVED');
+    assert.strictEqual(status.decisions[1].recordStatus, 'OK');
+    assert.strictEqual(status.decisions[1].reason, 'UI 간헐적 버그로 재현 없이 수정안을 검토합니다.');
+
+    const db = (localCore.getDatabase() as any).db;
+    const cryptoMod = await import('node:crypto');
+    const rows = db.prepare('SELECT audit_seq, payload_json FROM user_decisions').all();
+    assert.strictEqual(rows.length, 2);
+    for (const r of rows) {
+      const auditRow = db.prepare('SELECT payload_hash FROM audit_log WHERE seq = ?').get(r.audit_seq);
+      const hash = cryptoMod.createHash('sha256').update(r.payload_json).digest('hex');
+      assert.strictEqual(hash, auditRow.payload_hash);
+    }
+  });
+
+  test('175. B-2 Step 4-4b: Tampering user_decisions in child process results in MISMATCH or NO_RECORD without affecting gate.state (Case d)', async () => {
+    const repo = path.join(testRoot, 'b2_s44b_t175_tampering');
+    fs.mkdirSync(repo, { recursive: true });
+    execFileSync('git', ['init', '-b', 'main'], { cwd: repo });
+    execFileSync('git', ['config', 'user.name', 'Tester'], { cwd: repo });
+    execFileSync('git', ['config', 'user.email', 'test@test.com'], { cwd: repo });
+    fs.writeFileSync(path.join(repo, 'package.json'), JSON.stringify({ type: 'module' }));
+    fs.writeFileSync(path.join(repo, 'calc.js'), 'export function f() { return 1; }\n');
+    execFileSync('git', ['add', '.'], { cwd: repo });
+    execFileSync('git', ['commit', '-m', 'init'], { cwd: repo });
+
+    const dbPath = path.join(repo, 'autopsy.db');
+    const localCore = new CoreManager({ customDbPath: dbPath });
+    localCore.captureCheckpoint(repo, 'Base');
+
+    const inc = await localCore.collectIncidentBundle(repo, 'bug 175', 'err');
+    fs.writeFileSync(path.join(repo, 'fail.js'), 'throw new Error("fail");\n');
+    localCore.updateProjectSettings(repo, { testCommand: 'node fail.js' });
+    await localCore.runReproduction(repo, inc.id, 'fail.js');
+    await localCore.runReproduction(repo, inc.id, 'fail.js');
+    await localCore.runReproduction(repo, inc.id, 'fail.js');
+
+    localCore.decideReproduction(inc.id, 'PROCEED_WITHOUT_REPRODUCTION', repo, '원본 정상 이유');
+    let status = localCore.getIncidentReproductionStatus(inc.id, repo);
+    assert.strictEqual(status.gate.state, 'WAIVED');
+    assert.strictEqual(status.decisions?.[0].recordStatus, 'OK');
+    assert.strictEqual(status.decisions?.[0].reason, '원본 정상 이유');
+
+    const tmpDataDir = path.join(testRoot, 'b2_s44b_t175_data');
+    const tmpCacheDir = path.join(testRoot, 'b2_s44b_t175_cache');
+    fs.mkdirSync(tmpDataDir, { recursive: true });
+    fs.mkdirSync(tmpCacheDir, { recursive: true });
+
+    // 1. Tamper payload_json.reason via separate child process with node:sqlite
+    const tamperScript = "const { DatabaseSync } = require('node:sqlite'); const db = new DatabaseSync(process.argv[1]); const row = db.prepare('SELECT audit_seq, payload_json FROM user_decisions LIMIT 1').get(); const parsed = JSON.parse(row.payload_json); parsed.reason = '조작된 악의적 이유'; db.prepare('UPDATE user_decisions SET payload_json = ? WHERE audit_seq = ?').run(JSON.stringify(parsed), row.audit_seq); db.close();";
+    execFileSync(process.execPath, ['-e', tamperScript, dbPath], {
+      env: { ...process.env, AUTOPSY_DATA_DIR: tmpDataDir, AUTOPSY_CACHE_DIR: tmpCacheDir },
+    });
+
+    status = localCore.getIncidentReproductionStatus(inc.id, repo);
+    assert.strictEqual(status.gate.state, 'WAIVED');
+    assert.strictEqual(status.decisions?.[0].recordStatus, 'MISMATCH');
+    assert.strictEqual(status.decisions?.[0].reason, null);
+
+    // Verify repair proposal can still be proposed and verified (gate is still WAIVED)
+    const proposal = await localCore.proposeAndVerifyRepair(repo, inc.id, 'test fix', [
+      {
+        filePath: 'calc.js',
+        replacements: [{ search: 'return 1;', replace: 'return 2;' }],
+      },
+    ]);
+    assert.ok(proposal);
+
+    // 2. Delete user_decisions row via separate child process
+    const deleteScript = "const { DatabaseSync } = require('node:sqlite'); const db = new DatabaseSync(process.argv[1]); db.prepare('DELETE FROM user_decisions').run(); db.close();";
+    execFileSync(process.execPath, ['-e', deleteScript, dbPath], {
+      env: { ...process.env, AUTOPSY_DATA_DIR: tmpDataDir, AUTOPSY_CACHE_DIR: tmpCacheDir },
+    });
+
+    status = localCore.getIncidentReproductionStatus(inc.id, repo);
+    assert.strictEqual(status.gate.state, 'WAIVED');
+    assert.strictEqual(status.decisions?.[0].recordStatus, 'NO_RECORD');
+    assert.strictEqual(status.decisions?.[0].reason, null);
+  });
+
+  test('176. B-2 Step 4-4b: acknowledgeAuditChain validates reason (empty rejected, valid records in user_decisions, status OK) (Case e)', async () => {
+    const repo = path.join(testRoot, 'b2_s44b_t176_ack');
+    fs.mkdirSync(repo, { recursive: true });
+    execFileSync('git', ['init', '-b', 'main'], { cwd: repo });
+
+    const localCore = new CoreManager({ customDbPath: path.join(repo, 'autopsy.db') });
+    await localCore.collectIncidentBundle(repo, 'bug 176', 'err');
+
+    const db = (localCore.getDatabase() as any).db;
+    db.prepare("UPDATE audit_log SET payload_hash = 'tampered' WHERE seq = 1").run();
+    const brokenCheck = localCore.getDatabase().verifyAuditChain();
+    assert.strictEqual(brokenCheck.valid, false);
+
+    const anchorPath = path.join(path.dirname(localCore.getDatabase().resolvedPath), 'audit_head.json');
+    const anchorContentBefore = fs.existsSync(anchorPath) ? fs.readFileSync(anchorPath, 'utf8') : null;
+
+    // 1. Empty reason -> REASON_REQUIRED (400)
+    let errEmpty: any;
+    try {
+      localCore.acknowledgeAuditChain('');
+    } catch (e: any) {
+      errEmpty = e;
+    }
+    assert.ok(errEmpty);
+    assert.strictEqual(errEmpty.code, 'REASON_REQUIRED');
+    assert.strictEqual(errEmpty.statusCode, 400);
+
+    assert.strictEqual(localCore.getDatabase().verifyAuditChain().valid, false);
+    const anchorContentNow = fs.existsSync(anchorPath) ? fs.readFileSync(anchorPath, 'utf8') : null;
+    assert.strictEqual(anchorContentNow, anchorContentBefore);
+
+    // 2. Whitespace-only reason -> REASON_REQUIRED (400)
+    let errWs: any;
+    try {
+      localCore.acknowledgeAuditChain('    \t   ');
+    } catch (e: any) {
+      errWs = e;
+    }
+    assert.ok(errWs);
+    assert.strictEqual(errWs.code, 'REASON_REQUIRED');
+    assert.strictEqual(errWs.statusCode, 400);
+
+    // 3. >500 chars -> REASON_TOO_LONG (400)
+    let errLong: any;
+    try {
+      localCore.acknowledgeAuditChain('x'.repeat(501));
+    } catch (e: any) {
+      errLong = e;
+    }
+    assert.ok(errLong);
+    assert.strictEqual(errLong.code, 'REASON_TOO_LONG');
+    assert.strictEqual(errLong.statusCode, 400);
+
+    // 4. Valid reason -> succeeds, records in user_decisions, returns acknowledgementRecord OK
+    const ackResult = localCore.acknowledgeAuditChain('   외부 공격에 따른 체인 손상 복구 승인   ');
+    assert.strictEqual(ackResult.valid, true);
+    assert.strictEqual(ackResult.status, 'OK_AFTER_ACKNOWLEDGED_BREAK');
+    assert.ok(ackResult.acknowledgementRecord);
+    assert.strictEqual(ackResult.acknowledgementRecord.kind, 'AUDIT_CHAIN_ACKNOWLEDGED');
+    assert.strictEqual(ackResult.acknowledgementRecord.recordStatus, 'OK');
+    assert.strictEqual(ackResult.acknowledgementRecord.reason, '외부 공격에 따른 체인 손상 복구 승인');
+
+    // Also verify GET /api/audit-chain/status via verifyAuditChain
+    const verifyStatus = localCore.getDatabase().verifyAuditChain();
+    assert.strictEqual(verifyStatus.valid, true);
+    assert.ok(verifyStatus.acknowledgementRecord);
+    assert.strictEqual(verifyStatus.acknowledgementRecord.recordStatus, 'OK');
+    assert.strictEqual(verifyStatus.acknowledgementRecord.reason, '외부 공격에 따른 체인 손상 복구 승인');
+  });
+
+  test('177. B-2 Step 4-4b: API endpoints return 400 REASON_REQUIRED for empty reason (decide and acknowledge) (Case f)', async () => {
+    const repo = path.join(testRoot, 'b2_s44b_t177_api');
+    fs.mkdirSync(repo, { recursive: true });
+    execFileSync('git', ['init', '-b', 'main'], { cwd: repo });
+    execFileSync('git', ['config', 'user.name', 'Tester'], { cwd: repo });
+    execFileSync('git', ['config', 'user.email', 'test@test.com'], { cwd: repo });
+    fs.writeFileSync(path.join(repo, 'package.json'), JSON.stringify({ type: 'module' }));
+    fs.writeFileSync(path.join(repo, 'fail.js'), 'throw new Error("fail");\n');
+    execFileSync('git', ['add', '.'], { cwd: repo });
+    execFileSync('git', ['commit', '-m', 'init'], { cwd: repo });
+
+    const localCore = new CoreManager({ customDbPath: path.join(repo, 'autopsy.db') });
+    localCore.captureCheckpoint(repo, 'Base');
+    localCore.updateProjectSettings(repo, { testCommand: 'node fail.js' });
+
+    const inc = await localCore.collectIncidentBundle(repo, 'bug 177', 'err');
+    await localCore.runReproduction(repo, inc.id, 'fail.js');
+    await localCore.runReproduction(repo, inc.id, 'fail.js');
+    await localCore.runReproduction(repo, inc.id, 'fail.js');
+
+    const apiServer = new ApiServer(localCore);
+    const port = await apiServer.start(3906);
+    const token = apiServer.getSessionToken();
+
+    try {
+      // 1. POST /api/incidents/:id/reproduction-decision with empty reason -> 400 REASON_REQUIRED
+      const resDecideEmpty = await fetch(`http://127.0.0.1:${port}/api/incidents/${inc.id}/reproduction-decision`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Autopsy-Token': token },
+        body: JSON.stringify({
+          decision: 'PROCEED_WITHOUT_REPRODUCTION',
+          repoPath: repo,
+          reason: '   ',
+        }),
+      });
+      assert.strictEqual(resDecideEmpty.status, 400);
+      const jsonDecide = await resDecideEmpty.json();
+      assert.strictEqual(jsonDecide.success, false);
+      assert.strictEqual(jsonDecide.code, 'REASON_REQUIRED');
+
+      // 2. Break audit chain and test POST /api/audit-chain/acknowledge with empty reason -> 400 REASON_REQUIRED
+      const db = (localCore.getDatabase() as any).db;
+      db.prepare("UPDATE audit_log SET payload_hash = 'tampered' WHERE seq = 1").run();
+
+      const resAckEmpty = await fetch(`http://127.0.0.1:${port}/api/audit-chain/acknowledge`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-Autopsy-Token': token },
+        body: JSON.stringify({
+          reason: '',
+        }),
+      });
+      assert.strictEqual(resAckEmpty.status, 400);
+      const jsonAck = await resAckEmpty.json();
+      assert.strictEqual(jsonAck.success, false);
+      assert.strictEqual(jsonAck.code, 'REASON_REQUIRED');
+    } finally {
+      await apiServer.stop();
+    }
+  });
+
 });

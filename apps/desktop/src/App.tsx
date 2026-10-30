@@ -628,6 +628,8 @@ export default function App() {
               onSelectIncident={(id) => setIncidentId(id)}
               onChanged={load}
               notify={notify}
+              checkAuditChain={checkAuditChain}
+              auditChain={auditChain}
             />
           )}
 
@@ -645,7 +647,7 @@ export default function App() {
           )}
 
           {overview && view === 'dashboard' && (
-            <Dashboard overview={overview} auditChain={auditChain} onOpenIncident={(id) => { setIncidentId(id); setView('analysis'); }} />
+            <Dashboard overview={overview} auditChain={auditChain} checkAuditChain={checkAuditChain} onOpenIncident={(id) => { setIncidentId(id); setView('analysis'); }} />
           )}
 
           {overview && view === 'timeline' && (

@@ -1,6 +1,8 @@
+import { useState } from 'react';
 import { Overview, AuditChainVerificationResult } from '../api';
 import { relativeTime, formatKoreanDateTime } from '../diff';
-import { Badge, Card, Empty, PageHeader } from '../ui';
+import { Badge, Card, Empty, PageHeader, Button } from '../ui';
+import { DecisionModal } from '../components/DecisionModal';
 import { CheckCircle2, XCircle, HelpCircle, GitBranch, AlertTriangle, History, ShieldCheck, ShieldAlert } from 'lucide-react';
 
 const AUDIT_BROKEN_REASONS: Record<string, string> = {
@@ -17,11 +19,14 @@ export default function Dashboard({
   overview,
   auditChain,
   onOpenIncident,
+  checkAuditChain,
 }: {
   overview: Overview;
   auditChain?: AuditChainVerificationResult | null;
   onOpenIncident: (incidentId: string) => void;
+  checkAuditChain?: () => Promise<any>;
 }) {
+  const [showAcknowledgeModal, setShowAcknowledgeModal] = useState(false);
   const { stats, health } = overview;
 
   const test =
@@ -212,17 +217,48 @@ export default function Dashboard({
                     <div className="text-amber-800 font-medium">
                       확인 시각: {auditChain.acknowledgedBreak?.acknowledgedAt ? formatKoreanDateTime(auditChain.acknowledgedBreak.acknowledgedAt) : '-'} · 이 시점 이후 기록만 검증합니다
                     </div>
+                    {auditChain.acknowledgementRecord && (
+                      <div className="flex items-start justify-between gap-2 pt-1 border-t border-amber-200/50">
+                        <div className="text-[11px] text-slate-700">
+                          <span className="font-semibold text-slate-800">확인 이유:</span>{' '}
+                          <span>
+                            {auditChain.acknowledgementRecord.recordStatus === 'OK' && auditChain.acknowledgementRecord.reason
+                              ? auditChain.acknowledgementRecord.reason
+                              : '이유를 확인할 수 없습니다'}
+                          </span>
+                        </div>
+                        <div className="shrink-0">
+                          {auditChain.acknowledgementRecord.recordStatus === 'OK' && (
+                            <Badge tone="green">기록 정상</Badge>
+                          )}
+                          {auditChain.acknowledgementRecord.recordStatus === 'MISMATCH' && (
+                            <Badge tone="amber">이유 기록 불일치</Badge>
+                          )}
+                          {auditChain.acknowledgementRecord.recordStatus === 'NO_RECORD' && (
+                            <Badge tone="gray">이유 기록 없음</Badge>
+                          )}
+                        </div>
+                      </div>
+                    )}
                     <div className="text-slate-400">
                       (검증된 기록 {auditChain.totalCount}개)
                     </div>
                   </div>
                 ) : (
-                  <div className="space-y-1 text-rose-600 font-medium">
+                  <div className="space-y-1.5 text-rose-600 font-medium">
                     <div>
                       처음 깨진 위치 seq #{auditChain.brokenSeq}: {AUDIT_BROKEN_REASONS[auditChain.reasonCode || ''] || auditChain.reason || auditChain.message || '체인 불일치'}
                     </div>
                     <div>
                       에이전트 작업이 멈춰 있습니다. 사용자 확인이 필요합니다.
+                    </div>
+                    <div className="pt-1">
+                      <Button
+                        variant="default"
+                        onClick={() => setShowAcknowledgeModal(true)}
+                      >
+                        감사 기록 깨짐 확인
+                      </Button>
                     </div>
                   </div>
                 )
@@ -233,6 +269,24 @@ export default function Dashboard({
           </Card>
         </div>
       </div>
+
+      {showAcknowledgeModal && (
+        <DecisionModal
+          type="AUDIT_CHAIN_ACKNOWLEDGE"
+          brokenInfo={
+            auditChain
+              ? {
+                  brokenSeq: auditChain.brokenSeq,
+                  reasonCode: auditChain.reasonCode,
+                }
+              : undefined
+          }
+          onClose={() => setShowAcknowledgeModal(false)}
+          onSuccess={async () => {
+            if (checkAuditChain) await checkAuditChain();
+          }}
+        />
+      )}
     </div>
   );
 }

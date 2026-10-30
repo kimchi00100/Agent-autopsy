@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react';
-import { api, Incident, IncidentAnalysis, Proposal, TimelineEvent, FlowNode, FlowEdge, IncidentReproductionStatusResponse } from '../api';
+import { api, Incident, IncidentAnalysis, Proposal, TimelineEvent, FlowNode, FlowEdge, IncidentReproductionStatusResponse, AuditChainVerificationResult } from '../api';
 import {
   ReproductionEvidenceCard,
   ReproductionProgressCard,
@@ -39,6 +39,8 @@ interface Props {
   onSelectIncident?: (incidentId: string) => void;
   onChanged: () => void;
   notify: (kind: 'ok' | 'error', msg: string) => void;
+  checkAuditChain?: () => Promise<any>;
+  auditChain?: AuditChainVerificationResult | null;
 }
 
 type SubTab = 'flow' | 'timeline' | 'diff' | 'test' | 'ai' | 'proposals';
@@ -51,6 +53,8 @@ export default function IncidentAnalysisView({
   onSelectIncident,
   onChanged,
   notify,
+  checkAuditChain,
+  auditChain,
 }: Props) {
   const [subTab, setSubTab] = useState<SubTab>('flow');
   const [proposals, setProposals] = useState<Proposal[]>([]);
@@ -728,6 +732,15 @@ export default function IncidentAnalysisView({
               >
                 <ReproductionProgressCard
                   statusResponse={reproStatus}
+                  incidentId={incident.id}
+                  repoPath={repoPath}
+                  onRefresh={() => {
+                    api.reproductionStatus(incident.id, repoPath)
+                      .then(setReproStatus)
+                      .catch(() => {});
+                  }}
+                  checkAuditChain={checkAuditChain}
+                  auditChain={auditChain}
                   onSelectIncident={onSelectIncident}
                   hideHeader={true}
                 />

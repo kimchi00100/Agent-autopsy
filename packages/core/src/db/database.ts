@@ -1,6 +1,7 @@
 import { DatabaseSync } from 'node:sqlite';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import * as crypto from 'node:crypto';
 import {
   Project,
   Checkpoint,
@@ -32,6 +33,7 @@ import {
   AuditHeadAnchor,
   ProposalIntegrityStatus,
   ProposalIntegrityCode,
+  DecisionRecord,
 } from '../types.js';
 import { generateDeterministicProjectId, normalizeRepoPath, resolveDataDir } from '../utils/paths.js';
 import {
@@ -259,6 +261,15 @@ export class AutopsyDatabase {
         entry_hash TEXT NOT NULL
       );
 
+      CREATE TABLE IF NOT EXISTS user_decisions (
+        id TEXT PRIMARY KEY,
+        audit_seq INTEGER NOT NULL UNIQUE,
+        kind TEXT NOT NULL,
+        incident_id TEXT,
+        payload_json TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
+
       CREATE INDEX IF NOT EXISTS idx_events_project ON agent_events(project_id, created_at DESC);
       CREATE INDEX IF NOT EXISTS idx_checkpoints_project ON checkpoints(project_id, created_at DESC);
       CREATE INDEX IF NOT EXISTS idx_incidents_project ON incidents(project_id, created_at DESC);
@@ -267,6 +278,8 @@ export class AutopsyDatabase {
       CREATE INDEX IF NOT EXISTS idx_directives_status ON directives(delivery_status);
       CREATE INDEX IF NOT EXISTS idx_audit_log_kind ON audit_log(kind, created_at DESC);
       CREATE INDEX IF NOT EXISTS idx_audit_log_entity ON audit_log(entity_type, entity_id);
+      CREATE INDEX IF NOT EXISTS idx_user_decisions_incident ON user_decisions(incident_id);
+      CREATE INDEX IF NOT EXISTS idx_user_decisions_kind ON user_decisions(kind);
     `);
   }
 
@@ -363,6 +376,16 @@ export class AutopsyDatabase {
       `ALTER TABLE repair_proposals ADD COLUMN rejection_reason TEXT;`,
       `ALTER TABLE repair_proposals ADD COLUMN row_signature TEXT;`,
       `ALTER TABLE incidents ADD COLUMN row_signature TEXT;`,
+      `CREATE TABLE IF NOT EXISTS user_decisions (
+        id TEXT PRIMARY KEY,
+        audit_seq INTEGER NOT NULL UNIQUE,
+        kind TEXT NOT NULL,
+        incident_id TEXT,
+        payload_json TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );`,
+      `CREATE INDEX IF NOT EXISTS idx_user_decisions_incident ON user_decisions(incident_id);`,
+      `CREATE INDEX IF NOT EXISTS idx_user_decisions_kind ON user_decisions(kind);`,
     ];
 
     for (const sql of migrations) {
@@ -1726,6 +1749,10 @@ export class AutopsyDatabase {
     entityId: string;
     payloadHash: string;
     createdAt?: string;
+    userDecision?: {
+      id?: string;
+      payloadJson: string;
+    };
   }): AuditLogEntry {
     let initializedAnchorEntry: AuditLogEntry | undefined;
     const result = this.runInImmediateTransaction(() => {
@@ -1753,6 +1780,17 @@ export class AutopsyDatabase {
           VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         `)
         .run(seq, createdAt, entry.kind, entry.entityType, entry.entityId, entry.payloadHash, prevHash, entryHash);
+
+      if (entry.userDecision) {
+        const decId = entry.userDecision.id || crypto.randomUUID();
+        const incidentId = entry.entityType === 'INCIDENT' ? entry.entityId : null;
+        this.db
+          .prepare(`
+            INSERT INTO user_decisions (id, audit_seq, kind, incident_id, payload_json, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+          `)
+          .run(decId, seq, entry.kind, incidentId, entry.userDecision.payloadJson, createdAt);
+      }
 
       const loggedEntry: AuditLogEntry = {
         seq,
@@ -1935,6 +1973,12 @@ export class AutopsyDatabase {
    * Otherwise verifies every row from sequence 1 to N.
    */
   public verifyAuditChain(overrideSecret?: string): AuditChainVerificationResult {
+    const res = this.verifyAuditChainInternal(overrideSecret);
+    res.acknowledgementRecord = this.getLatestAuditChainAcknowledgementRecord();
+    return res;
+  }
+
+  private verifyAuditChainInternal(overrideSecret?: string): AuditChainVerificationResult {
     const rows = this.db.prepare('SELECT * FROM audit_log ORDER BY seq ASC').all() as any[];
     const secret = overrideSecret || getInstallationSecretKey();
     const anchorPath = this.getAnchorPath();
@@ -2332,6 +2376,20 @@ export class AutopsyDatabase {
       throw err;
     }
 
+    const trimmedReason = (reason || '').trim();
+    if (!trimmedReason) {
+      const err: any = new Error('[REASON_REQUIRED]: 확인 이유를 입력해야 합니다.');
+      err.code = 'REASON_REQUIRED';
+      err.statusCode = 400;
+      throw err;
+    }
+    if (trimmedReason.length > 500) {
+      const err: any = new Error('[REASON_TOO_LONG]: 확인 이유는 500자를 초과할 수 없습니다.');
+      err.code = 'REASON_TOO_LONG';
+      err.statusCode = 400;
+      throw err;
+    }
+
     let previousAnchorSeq: number | null = null;
     const anchorPath = this.getAnchorPath();
     if (fs.existsSync(anchorPath)) {
@@ -2345,23 +2403,133 @@ export class AutopsyDatabase {
     }
 
     const acknowledgedAt = new Date().toISOString();
+    const payload = {
+      reason: trimmedReason,
+      reasonCode: currentVerification.reasonCode,
+      brokenSeq: currentVerification.brokenSeq,
+      previousAnchorSeq,
+      acknowledgedAt,
+    };
+    const payloadJson = JSON.stringify(payload);
     const ackEntry = this.appendAuditLog({
       kind: 'AUDIT_CHAIN_ACKNOWLEDGED',
       entityType: 'SYSTEM',
       entityId: 'audit_anchor',
-      payloadHash: hashAuditPayload({
-        reason: reason || '',
-        reasonCode: currentVerification.reasonCode,
-        brokenSeq: currentVerification.brokenSeq,
-        previousAnchorSeq,
-        acknowledgedAt,
-      }),
+      payloadHash: hashAuditPayload(payloadJson),
       createdAt: acknowledgedAt,
+      userDecision: { payloadJson },
     });
 
     this.updateAuditHeadAnchor(ackEntry.seq, ackEntry.entryHash, ackEntry.seq, true);
 
     return this.verifyAuditChain(secret);
+  }
+
+  /**
+   * Retrieves decision records for an incident from audit_log cross-checked with user_decisions.
+   * Target kinds: REPRODUCTION_WAIVED, REPRODUCTION_ATTEMPTS_GRANTED in seq ASC order.
+   */
+  public getDecisionRecordsForIncident(incidentId: string): DecisionRecord[] {
+    const rows = this.db
+      .prepare(`
+        SELECT seq, created_at, kind, entity_type, entity_id, payload_hash
+        FROM audit_log
+        WHERE entity_type = 'INCIDENT'
+          AND entity_id = ?
+          AND kind IN ('REPRODUCTION_WAIVED', 'REPRODUCTION_ATTEMPTS_GRANTED')
+        ORDER BY seq ASC
+      `)
+      .all(incidentId) as any[];
+
+    return rows.map((r) => this.crossCheckDecisionRecord(r));
+  }
+
+  /**
+   * Retrieves the most recent AUDIT_CHAIN_ACKNOWLEDGED decision record cross-checked with user_decisions.
+   */
+  public getLatestAuditChainAcknowledgementRecord(): DecisionRecord | null {
+    const row = this.db
+      .prepare(`
+        SELECT seq, created_at, kind, entity_type, entity_id, payload_hash
+        FROM audit_log
+        WHERE kind = 'AUDIT_CHAIN_ACKNOWLEDGED'
+        ORDER BY seq DESC
+        LIMIT 1
+      `)
+      .get() as any | undefined;
+
+    if (!row) return null;
+    return this.crossCheckDecisionRecord(row);
+  }
+
+  /**
+   * Cross-checks an audit_log decision row with user_decisions.
+   */
+  private crossCheckDecisionRecord(auditRow: any): DecisionRecord {
+    const auditSeq = Number(auditRow.seq);
+    const kind = String(auditRow.kind);
+    const decidedAt = String(auditRow.created_at);
+
+    let ud: any;
+    try {
+      ud = this.db
+        .prepare('SELECT id, audit_seq, kind, incident_id, payload_json, created_at FROM user_decisions WHERE audit_seq = ?')
+        .get(auditSeq) as any | undefined;
+    } catch {
+      return {
+        auditSeq,
+        kind,
+        decidedAt,
+        reason: null,
+        recordStatus: 'NO_RECORD',
+      };
+    }
+
+    if (!ud) {
+      return {
+        auditSeq,
+        kind,
+        decidedAt,
+        reason: null,
+        recordStatus: 'NO_RECORD',
+      };
+    }
+
+    const payloadHash = crypto.createHash('sha256').update(ud.payload_json).digest('hex');
+    const hashMatches = payloadHash === String(auditRow.payload_hash);
+    const kindMatches = String(ud.kind) === kind;
+    const targetMatches =
+      auditRow.entity_type === 'INCIDENT'
+        ? String(ud.incident_id) === String(auditRow.entity_id)
+        : (ud.incident_id === null || ud.incident_id === undefined);
+
+    let parsedReason: string | null = null;
+    let jsonValid = false;
+    try {
+      const parsed = JSON.parse(ud.payload_json);
+      if (parsed && typeof parsed.reason === 'string') {
+        parsedReason = parsed.reason;
+        jsonValid = true;
+      }
+    } catch {}
+
+    if (hashMatches && kindMatches && targetMatches && jsonValid) {
+      return {
+        auditSeq,
+        kind,
+        decidedAt,
+        reason: parsedReason,
+        recordStatus: 'OK',
+      };
+    }
+
+    return {
+      auditSeq,
+      kind,
+      decidedAt,
+      reason: null,
+      recordStatus: 'MISMATCH',
+    };
   }
 
   public close(): void {

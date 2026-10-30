@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useState } from 'react';
 import {
   ReproductionEvidenceLevel,
   ReproductionLockAssessmentStatus,
@@ -8,9 +8,11 @@ import {
   ReproductionFailureKind,
   IncidentReproductionStatusResponse,
   ReproductionResult,
+  AuditChainVerificationResult,
 } from '../api';
-import { Badge } from '../ui';
-import { clock } from '../diff';
+import { Badge, Button } from '../ui';
+import { clock, formatKoreanDateTime } from '../diff';
+import { DecisionModal, DecisionModalType } from './DecisionModal';
 import {
   ShieldAlert,
   ShieldCheck,
@@ -229,13 +231,24 @@ export function ReproductionEvidenceCard({
 
 export function ReproductionProgressCard({
   statusResponse,
+  incidentId,
+  repoPath,
+  onRefresh,
+  checkAuditChain,
+  auditChain,
   onSelectIncident,
   hideHeader = false,
 }: {
   statusResponse?: IncidentReproductionStatusResponse | null;
+  incidentId?: string;
+  repoPath?: string;
+  onRefresh?: () => void;
+  checkAuditChain?: () => Promise<any>;
+  auditChain?: AuditChainVerificationResult | null;
   onSelectIncident?: (incidentId: string) => void;
   hideHeader?: boolean;
 }) {
+  const [modalType, setModalType] = useState<DecisionModalType | null>(null);
   if (!statusResponse) return null;
 
   const { gate, lock, otherBlockedIncidents } = statusResponse;
@@ -388,6 +401,100 @@ export function ReproductionProgressCard({
           )}
         </div>
       </div>
+
+      {/* Action buttons based on gate.state */}
+      {(gate.state === 'ABANDONED' || gate.state === 'NEEDS_USER_DECISION') && (
+        <div className="flex items-center gap-2 pt-1">
+          <Button
+            variant="default"
+            onClick={() => setModalType('PROCEED_WITHOUT_REPRODUCTION')}
+          >
+            재현 없이 진행
+          </Button>
+          <Button
+            variant="primary"
+            onClick={() => setModalType('ALLOW_MORE_ATTEMPTS')}
+          >
+            재현 시도 3번 더 허락
+          </Button>
+        </div>
+      )}
+
+      {gate.state === 'AUDIT_BROKEN' && (
+        <div className="flex items-center gap-2 pt-1">
+          <Button
+            variant="default"
+            onClick={() => setModalType('AUDIT_CHAIN_ACKNOWLEDGE')}
+          >
+            감사 기록 깨짐 확인
+          </Button>
+        </div>
+      )}
+
+      {/* User Decision History */}
+      {statusResponse.decisions && statusResponse.decisions.length > 0 && (
+        <div className="space-y-1.5 text-[11px] pt-2 border-t border-slate-100">
+          <div className="font-semibold text-slate-700">사용자 결정 기록</div>
+          <div className="space-y-1.5">
+            {statusResponse.decisions.map((dec) => {
+              const decisionName =
+                dec.kind === 'REPRODUCTION_WAIVED'
+                  ? '재현 없이 진행'
+                  : dec.kind === 'REPRODUCTION_ATTEMPTS_GRANTED'
+                  ? '시도 3번 더 허락'
+                  : dec.kind;
+              const displayReason =
+                dec.recordStatus === 'OK' && dec.reason
+                  ? dec.reason
+                  : '이유를 확인할 수 없습니다';
+              return (
+                <div
+                  key={dec.auditSeq}
+                  className="rounded bg-slate-50 p-2 border border-slate-200/80 flex items-start justify-between gap-2"
+                >
+                  <div className="space-y-0.5 min-w-0">
+                    <div className="flex items-center gap-1.5 font-medium text-slate-800">
+                      <span>{formatKoreanDateTime(dec.decidedAt)}</span>
+                      <span className="text-slate-400">·</span>
+                      <span className="text-blue-700 font-semibold">{decisionName}</span>
+                    </div>
+                    <div className="text-slate-600 text-[11px] break-words whitespace-pre-wrap">
+                      {displayReason}
+                    </div>
+                  </div>
+                  <div className="shrink-0">
+                    {dec.recordStatus === 'OK' && <Badge tone="green">기록 정상</Badge>}
+                    {dec.recordStatus === 'MISMATCH' && <Badge tone="amber">이유 기록 불일치</Badge>}
+                    {dec.recordStatus === 'NO_RECORD' && <Badge tone="gray">이유 기록 없음</Badge>}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+
+      {/* Decision Modal */}
+      {modalType && (
+        <DecisionModal
+          type={modalType}
+          incidentId={incidentId}
+          repoPath={repoPath}
+          brokenInfo={
+            auditChain
+              ? {
+                  brokenSeq: auditChain.brokenSeq,
+                  reasonCode: auditChain.reasonCode,
+                }
+              : undefined
+          }
+          onClose={() => setModalType(null)}
+          onSuccess={async () => {
+            if (onRefresh) onRefresh();
+            if (checkAuditChain) await checkAuditChain();
+          }}
+        />
+      )}
     </div>
   );
 }

@@ -728,32 +728,53 @@ export function decideReproduction(
     throw err;
   }
 
+  const trimmedReason = (reason || '').trim();
+  if (!trimmedReason) {
+    const err: any = new Error('[REASON_REQUIRED]: 결정 이유를 입력해야 합니다.');
+    err.code = 'REASON_REQUIRED';
+    err.statusCode = 400;
+    throw err;
+  }
+  if (trimmedReason.length > 500) {
+    const err: any = new Error('[REASON_TOO_LONG]: 결정 이유는 500자를 초과할 수 없습니다.');
+    err.code = 'REASON_TOO_LONG';
+    err.statusCode = 400;
+    throw err;
+  }
+
   const decidedAt = new Date().toISOString();
   if (decision === 'PROCEED_WITHOUT_REPRODUCTION') {
-    const payload: any = {
+    const payload = {
       incidentId,
       decision,
-      reason: reason || null,
+      reason: trimmedReason,
       decidedAt,
     };
+    const payloadJson = JSON.stringify(payload);
     ctx.db.appendAuditLog({
       kind: 'REPRODUCTION_WAIVED',
       entityType: 'INCIDENT',
       entityId: incidentId,
-      payloadHash: hashAuditPayload(payload),
+      payloadHash: hashAuditPayload(payloadJson),
+      createdAt: decidedAt,
+      userDecision: { payloadJson },
     });
   } else if (decision === 'ALLOW_MORE_ATTEMPTS') {
+    const payload = {
+      incidentId,
+      decision,
+      additionalAttempts: ADDITIONAL_ATTEMPTS_PER_GRANT,
+      reason: trimmedReason,
+      decidedAt,
+    };
+    const payloadJson = JSON.stringify(payload);
     ctx.db.appendAuditLog({
       kind: 'REPRODUCTION_ATTEMPTS_GRANTED',
       entityType: 'INCIDENT',
       entityId: incidentId,
-      payloadHash: hashAuditPayload({
-        incidentId,
-        decision,
-        additionalAttempts: ADDITIONAL_ATTEMPTS_PER_GRANT,
-        reason: reason || null,
-        decidedAt,
-      }),
+      payloadHash: hashAuditPayload(payloadJson),
+      createdAt: decidedAt,
+      userDecision: { payloadJson },
     });
   } else {
     const err: any = new Error(`[INVALID_DECISION]: Unsupported reproduction decision "${decision}".`);
@@ -2116,6 +2137,7 @@ export function getIncidentReproductionStatus(
     lock,
     evidence,
     otherBlockedIncidents,
+    decisions: ctx.db.getDecisionRecordsForIncident(incidentId),
   };
 }
 

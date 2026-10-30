@@ -336,12 +336,21 @@ export interface BlockedIncidentSummary {
   state: string;
 }
 
+export interface DecisionRecord {
+  auditSeq: number;
+  kind: string;
+  decidedAt: string;
+  reason: string | null;
+  recordStatus: 'OK' | 'MISMATCH' | 'NO_RECORD';
+}
+
 export interface IncidentReproductionStatusResponse {
   success: boolean;
   gate: ReproductionGateInfo;
   lock: IncidentReproductionLockStatus;
   evidence: IncidentReproductionEvidence;
   otherBlockedIncidents: BlockedIncidentSummary[];
+  decisions?: DecisionRecord[];
 }
 
 export type Severity = 'HIGH' | 'MEDIUM' | 'LOW' | 'UNASSESSED';
@@ -489,6 +498,7 @@ export interface AuditChainVerificationResult {
     trustedFromSeq: number;
     acknowledgedAt: string;
   };
+  acknowledgementRecord?: DecisionRecord | null;
 }
 
 export interface ApprovalFingerprint {
@@ -795,7 +805,14 @@ async function request<T>(url: string, init?: RequestInit): Promise<T> {
   const fullUrl = resolveFullUrl(url);
   const res = await fetch(fullUrl, { ...init, headers });
   const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error((data as any).error || `요청 실패 (${res.status})`);
+  if (!res.ok) {
+    const message = (data as any).error || `요청 실패 (${res.status})`;
+    const err: any = new Error(message);
+    if ((data as any).code) err.code = (data as any).code;
+    err.status = res.status;
+    err.statusCode = res.status;
+    throw err;
+  }
   return data as T;
 }
 
@@ -900,6 +917,21 @@ export const api = {
   reproductionStatus: (incidentId: string, repoPath?: string) =>
     request<IncidentReproductionStatusResponse>(
       `/api/incidents/${incidentId}/reproduction-status${repoPath ? `?repoPath=${encodeURIComponent(repoPath)}` : ''}`
+    ),
+  decideReproduction: (
+    incidentId: string,
+    decision: 'PROCEED_WITHOUT_REPRODUCTION' | 'ALLOW_MORE_ATTEMPTS',
+    repoPath: string,
+    reason: string
+  ) =>
+    request<{ success: boolean; result: any }>(
+      `/api/incidents/${incidentId}/reproduction-decision`,
+      post({ decision, repoPath, reason })
+    ),
+  acknowledgeAuditChain: (reason: string) =>
+    request<{ success: boolean; result: AuditChainVerificationResult }>(
+      '/api/audit-chain/acknowledge',
+      post({ reason })
     ),
   subscribeStream: (onEvent: (event: any) => void): (() => void) => {
     try {

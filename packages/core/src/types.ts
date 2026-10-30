@@ -255,12 +255,21 @@ export interface BlockedIncidentSummary {
   state: ReproductionGateState;
 }
 
+export interface DecisionRecord {
+  auditSeq: number;
+  kind: string;
+  decidedAt: string;
+  reason: string | null;
+  recordStatus: 'OK' | 'MISMATCH' | 'NO_RECORD';
+}
+
 export interface IncidentReproductionStatusResponse {
   success: boolean;
   gate: ReproductionGateInfo;
   lock: IncidentReproductionLockStatus;
   evidence: IncidentReproductionEvidence;
   otherBlockedIncidents: BlockedIncidentSummary[];
+  decisions?: DecisionRecord[];
 }
 
 export interface RunReproductionOptions {
@@ -874,6 +883,7 @@ export interface AuditChainVerificationResult {
     trustedFromSeq: number;
     acknowledgedAt: string;
   };
+  acknowledgementRecord?: DecisionRecord | null;
 }
 
 export interface AuditHeadAnchor {

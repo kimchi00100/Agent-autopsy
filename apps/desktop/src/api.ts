@@ -276,6 +276,74 @@ export interface ReproductionResult {
   assertFlip?: AssertFlipResult;
 }
 
+export type ReproductionGateState =
+  | 'NOT_ATTEMPTED'
+  | 'IN_PROGRESS'
+  | 'REPRODUCED'
+  | 'ABANDONED'
+  | 'WAIVED'
+  | 'AUDIT_BROKEN'
+  | 'NEEDS_USER_DECISION';
+
+export interface ReproductionGateAttempt {
+  attemptedAt: string;
+  status: ReproductionStatus;
+  failureKind?: ReproductionFailureKind | null;
+  testFilePath: string;
+}
+
+export interface ReproductionGateInfo {
+  state: ReproductionGateState;
+  attemptsUsed: number;
+  attemptsAllowed: number;
+  history?: ReproductionGateAttempt[];
+  discrepancyWarning?: string;
+}
+
+export type ReproductionLockAssessmentStatus =
+  | 'OK'
+  | 'MODIFIED_ON_DISK'
+  | 'SIGNATURE_INVALID'
+  | 'REMOVED'
+  | 'NONE';
+
+export type ReproductionEvidenceLevel =
+  | 'STRONG'
+  | 'PARTIAL'
+  | 'REPRODUCED_ONLY'
+  | 'NOT_REPRODUCED'
+  | 'WAIVED'
+  | 'NONE';
+
+export interface IncidentReproductionLockStatus {
+  present: boolean;
+  testFilePath?: string;
+  preFlipFilePath?: string;
+  lockedAt?: string;
+  status: ReproductionLockAssessmentStatus;
+}
+
+export interface IncidentReproductionEvidence {
+  level: ReproductionEvidenceLevel;
+  reproductionStatus?: string;
+  baselineVerdict?: string;
+  assertFlipVerdict?: string;
+}
+
+export interface BlockedIncidentSummary {
+  id: string;
+  title: string;
+  state: string;
+}
+
+export interface IncidentReproductionStatusResponse {
+  success: boolean;
+  gate: ReproductionGateInfo;
+  lock: IncidentReproductionLockStatus;
+  evidence: IncidentReproductionEvidence;
+  otherBlockedIncidents: BlockedIncidentSummary[];
+}
+
 export type Severity = 'HIGH' | 'MEDIUM' | 'LOW' | 'UNASSESSED';
 
 export type IntentSource = 'USER_QUOTE' | 'AI_INFERRED' | 'MISSING';
@@ -400,14 +468,27 @@ export interface ProposalIntegrityResult {
   code?: ProposalIntegrityCode;
 }
 
+export type AuditChainBrokenReasonCode =
+  | 'VALUE_MODIFIED'
+  | 'ORDER_OR_DELETION'
+  | 'KEY_MISMATCH'
+  | 'TRUNCATED'
+  | 'HEAD_MISMATCH'
+  | 'HEAD_ANCHOR_INVALID'
+  | 'HEAD_ANCHOR_MISSING';
+
 export interface AuditChainVerificationResult {
   valid: boolean;
-  status: 'OK' | 'BROKEN';
+  status: 'OK' | 'BROKEN' | 'OK_AFTER_ACKNOWLEDGED_BREAK';
   totalCount: number;
   brokenSeq?: number;
-  reason?: '값 변경' | '항목 삭제/순서 변경' | '키 불일치';
-  reasonCode?: 'VALUE_MODIFIED' | 'ORDER_OR_DELETION' | 'KEY_MISMATCH';
+  reason?: string;
+  reasonCode?: AuditChainBrokenReasonCode;
   message: string;
+  acknowledgedBreak?: {
+    trustedFromSeq: number;
+    acknowledgedAt: string;
+  };
 }
 
 export interface ApprovalFingerprint {
@@ -815,6 +896,10 @@ export const api = {
     request<{ success: boolean; result: ProposalIntegrityResult }>(
       `/api/proposals/${proposalId}/integrity`,
       post({ repoPath })
+    ),
+  reproductionStatus: (incidentId: string, repoPath?: string) =>
+    request<IncidentReproductionStatusResponse>(
+      `/api/incidents/${incidentId}/reproduction-status${repoPath ? `?repoPath=${encodeURIComponent(repoPath)}` : ''}`
     ),
   subscribeStream: (onEvent: (event: any) => void): (() => void) => {
     try {

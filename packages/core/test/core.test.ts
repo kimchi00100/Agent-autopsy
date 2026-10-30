@@ -8311,4 +8311,356 @@ db.close();
     assert.ok(proposal);
     assert.strictEqual(proposal.verificationStatus, 'VERIFIED_PASS');
   });
+
+test('162. B-2 Step 4-4a: GET /api/incidents/:id/reproduction-status authentication and project mismatch', async () => {
+    const repoA = path.join(testRoot, 'b2_s44a_t162_repoA');
+    const repoB = path.join(testRoot, 'b2_s44a_t162_repoB');
+    fs.mkdirSync(repoA, { recursive: true });
+    fs.mkdirSync(repoB, { recursive: true });
+    execFileSync('git', ['init', '-b', 'main'], { cwd: repoA });
+    execFileSync('git', ['init', '-b', 'main'], { cwd: repoB });
+
+    const localCore = new CoreManager({ customDbPath: path.join(repoA, 'autopsy.db') });
+    const incA = await localCore.collectIncidentBundle(repoA, 'bug in repo A', 'error');
+
+    const apiServer = new ApiServer(localCore);
+    const port = await apiServer.start(3905);
+    const token = apiServer.getSessionToken();
+
+    try {
+      // 1. Without token -> 401
+      const resNoToken = await fetch(`http://127.0.0.1:${port}/api/incidents/${incA.id}/reproduction-status`);
+      assert.strictEqual(resNoToken.status, 401);
+      const jsonNoToken = await resNoToken.json();
+      assert.ok(jsonNoToken.error && jsonNoToken.error.includes('Unauthorized'));
+
+      // 2. Non-existent incident -> 404
+      const res404 = await fetch(`http://127.0.0.1:${port}/api/incidents/non-existent-id/reproduction-status`, {
+        headers: { 'x-autopsy-token': token },
+      });
+      assert.strictEqual(res404.status, 404);
+
+      // 3. PROJECT_MISMATCH (repoB) -> 403
+      const resMismatch = await fetch(`http://127.0.0.1:${port}/api/incidents/${incA.id}/reproduction-status?repoPath=${encodeURIComponent(repoB)}`, {
+        headers: { 'x-autopsy-token': token },
+      });
+      assert.strictEqual(resMismatch.status, 403);
+      const jsonMismatch = await resMismatch.json();
+      assert.ok(jsonMismatch.error && jsonMismatch.error.includes('PROJECT_MISMATCH'));
+
+      // 4. Valid token and matching repo -> 200
+      const resOk = await fetch(`http://127.0.0.1:${port}/api/incidents/${incA.id}/reproduction-status?repoPath=${encodeURIComponent(repoA)}`, {
+        headers: { 'x-autopsy-token': token },
+      });
+      assert.strictEqual(resOk.status, 200);
+      const jsonOk = await resOk.json();
+      assert.strictEqual(jsonOk.success, true);
+      assert.strictEqual(jsonOk.gate.state, 'NOT_ATTEMPTED');
+      assert.strictEqual(jsonOk.lock.present, false);
+      assert.strictEqual(jsonOk.lock.status, 'NONE');
+      assert.strictEqual(jsonOk.evidence.level, 'NONE');
+      assert.deepStrictEqual(jsonOk.otherBlockedIncidents, []);
+    } finally {
+      await apiServer.stop();
+    }
+  });
+
+  test('163. B-2 Step 4-4a: Reproduction evidence level covers all 6 states according to rules', async () => {
+    const repo = path.join(testRoot, 'b2_s44a_t163_evidence_levels');
+    fs.mkdirSync(repo, { recursive: true });
+    execFileSync('git', ['init', '-b', 'main'], { cwd: repo });
+    execFileSync('git', ['config', 'user.name', 'Tester'], { cwd: repo });
+    execFileSync('git', ['config', 'user.email', 'test@local'], { cwd: repo });
+
+    fs.writeFileSync(path.join(repo, 'package.json'), JSON.stringify({ type: 'module' }));
+    fs.writeFileSync(path.join(repo, 'calc.js'), 'export function add(a, b) { return a + b + 1; }\n');
+    execFileSync('git', ['add', '.'], { cwd: repo });
+    execFileSync('git', ['commit', '-m', 'initial'], { cwd: repo });
+
+    const localCore = new CoreManager({ customDbPath: path.join(repo, 'autopsy.db') });
+    localCore.captureCheckpoint(repo, 'Base');
+    localCore.updateProjectSettings(repo, { testCommand: 'node --test' });
+
+    // 1. Level 'NONE' - initial incident without reproduction
+    const incNone = await localCore.collectIncidentBundle(repo, 'inc none', 'err');
+    const statusNone = localCore.getIncidentReproductionStatus(incNone.id, repo);
+    assert.strictEqual(statusNone.evidence.level, 'NONE');
+
+    // 2. Level 'WAIVED' - gate state WAIVED takes precedence after abandon & waive
+    const incWaived = await localCore.collectIncidentBundle(repo, 'inc waived', 'err');
+    fs.writeFileSync(path.join(repo, 'test_fail_w.js'), 'import test from "node:test";\ntest("fail", () => {\n  throw new Error("f");\n});\n');
+    await localCore.runReproduction(repo, incWaived.id, 'test_fail_w.js');
+    await localCore.runReproduction(repo, incWaived.id, 'test_fail_w.js');
+    await localCore.runReproduction(repo, incWaived.id, 'test_fail_w.js');
+    assert.strictEqual(localCore.getReproductionGateState(incWaived.id).state, 'ABANDONED');
+    localCore.decideReproduction(incWaived.id, 'PROCEED_WITHOUT_REPRODUCTION', repo, 'skip repro');
+    const statusWaived = localCore.getIncidentReproductionStatus(incWaived.id, repo);
+    assert.strictEqual(statusWaived.gate.state, 'WAIVED');
+    assert.strictEqual(statusWaived.evidence.level, 'WAIVED');
+
+    // 3. Level 'NOT_REPRODUCED' - reproduction ran but status is NOT_REPRODUCED
+    const incNotRepro = await localCore.collectIncidentBundle(repo, 'inc not repro', 'err');
+    fs.writeFileSync(path.join(repo, 'test_pass.js'), 'import test from "node:test";\ntest("p", () => {});\n');
+    await localCore.runReproduction(repo, incNotRepro.id, 'test_pass.js');
+    const statusNotRepro = localCore.getIncidentReproductionStatus(incNotRepro.id, repo);
+    assert.strictEqual(statusNotRepro.evidence.reproductionStatus, 'NOT_REPRODUCED');
+    assert.strictEqual(statusNotRepro.evidence.level, 'NOT_REPRODUCED');
+
+    // 4. Level 'STRONG' - REPRODUCED + REGRESSION_CONFIRMED + FLIP_CONFIRMED
+    const incStrong = await localCore.collectIncidentBundle(repo, 'inc strong', 'err');
+    fs.writeFileSync(
+      path.join(repo, 'test_repro.js'),
+      'import test from "node:test";\nimport assert from "node:assert";\nimport { add } from "./calc.js";\n\ntest("repro", () => {\n  assert.strictEqual(add(1, 2), 3);\n});\n'
+    );
+    fs.writeFileSync(
+      path.join(repo, 'test_pre_flip.js'),
+      'import test from "node:test";\nimport assert from "node:assert";\nimport { add } from "./calc.js";\n\ntest("repro", () => {\n  assert.strictEqual(add(1, 2), 4);\n});\n'
+    );
+    // Good baseline commit where add was a + b
+    fs.writeFileSync(path.join(repo, 'calc.js'), 'export function add(a, b) { return a + b; }\n');
+    execFileSync('git', ['add', '.'], { cwd: repo });
+    execFileSync('git', ['commit', '-m', 'good add'], { cwd: repo });
+    const cpGood = localCore.captureCheckpoint(repo, 'Good baseline');
+    // Revert calc to buggy
+    fs.writeFileSync(path.join(repo, 'calc.js'), 'export function add(a, b) { return a + b + 1; }\n');
+
+    await localCore.runReproduction(repo, incStrong.id, 'test_repro.js', {
+      baselineCheckpointId: cpGood.id,
+      preFlipTestFilePath: 'test_pre_flip.js',
+    });
+    const statusStrong = localCore.getIncidentReproductionStatus(incStrong.id, repo);
+    assert.strictEqual(statusStrong.evidence.reproductionStatus, 'REPRODUCED');
+    assert.strictEqual(statusStrong.evidence.baselineVerdict, 'REGRESSION_CONFIRMED');
+    assert.strictEqual(statusStrong.evidence.assertFlipVerdict, 'FLIP_CONFIRMED');
+    assert.strictEqual(statusStrong.evidence.level, 'STRONG');
+
+    // 5. Level 'PARTIAL' - REPRODUCED + either (baseline regression, no preFlip)
+    const incPartial = await localCore.collectIncidentBundle(repo, 'inc partial', 'err');
+    await localCore.runReproduction(repo, incPartial.id, 'test_repro.js', {
+      baselineCheckpointId: cpGood.id,
+    });
+    const statusPartial = localCore.getIncidentReproductionStatus(incPartial.id, repo);
+    assert.strictEqual(statusPartial.evidence.reproductionStatus, 'REPRODUCED');
+    assert.strictEqual(statusPartial.evidence.baselineVerdict, 'REGRESSION_CONFIRMED');
+    assert.strictEqual(statusPartial.evidence.assertFlipVerdict, 'NOT_PROVIDED');
+    assert.strictEqual(statusPartial.evidence.level, 'PARTIAL');
+
+    // 6. Level 'REPRODUCED_ONLY' - REPRODUCED + neither
+    // Commit current buggy calc.js and checkpoint so treeIdentical is true -> NO_BASELINE
+    execFileSync('git', ['add', '.'], { cwd: repo });
+    execFileSync('git', ['commit', '-m', 'buggy baseline commit'], { cwd: repo });
+    localCore.captureCheckpoint(repo, 'Buggy baseline checkpoint');
+
+    const incReproOnly = await localCore.collectIncidentBundle(repo, 'inc repro only', 'err');
+    await localCore.runReproduction(repo, incReproOnly.id, 'test_repro.js');
+    const statusReproOnly = localCore.getIncidentReproductionStatus(incReproOnly.id, repo);
+    assert.strictEqual(statusReproOnly.evidence.reproductionStatus, 'REPRODUCED');
+    assert.strictEqual(statusReproOnly.evidence.baselineVerdict, 'PRE_EXISTING');
+    assert.strictEqual(statusReproOnly.evidence.assertFlipVerdict, 'NOT_PROVIDED');
+    assert.strictEqual(statusReproOnly.evidence.level, 'REPRODUCED_ONLY');
+  });
+
+  test('164. B-2 Step 4-4a: lock.status covers OK, MODIFIED_ON_DISK, SIGNATURE_INVALID, REMOVED, NONE', async () => {
+    const repo = path.join(testRoot, 'b2_s44a_t164_lock_statuses');
+    fs.mkdirSync(repo, { recursive: true });
+    execFileSync('git', ['init', '-b', 'main'], { cwd: repo });
+    execFileSync('git', ['config', 'user.name', 'Tester'], { cwd: repo });
+    execFileSync('git', ['config', 'user.email', 'test@local'], { cwd: repo });
+
+    fs.writeFileSync(path.join(repo, 'package.json'), JSON.stringify({ type: 'module' }));
+    fs.writeFileSync(path.join(repo, 'calc.js'), 'export function add(a, b) { return a - b; }\n');
+    execFileSync('git', ['add', '.'], { cwd: repo });
+    execFileSync('git', ['commit', '-m', 'initial'], { cwd: repo });
+
+    const localCore = new CoreManager({ customDbPath: path.join(repo, 'autopsy.db') });
+    localCore.captureCheckpoint(repo, 'Base');
+    localCore.updateProjectSettings(repo, { testCommand: 'node --test' });
+
+    // 1. Status 'NONE': incident without reproduction lock
+    const incNone = await localCore.collectIncidentBundle(repo, 'no lock', 'err');
+    const statusNone = localCore.getIncidentReproductionStatus(incNone.id, repo);
+    assert.strictEqual(statusNone.lock.present, false);
+    assert.strictEqual(statusNone.lock.status, 'NONE');
+
+    // Create incident with locked reproduction test
+    const incLock = await localCore.collectIncidentBundle(repo, 'with lock', 'err');
+    const reproFilePath = 'test_lock.js';
+    fs.writeFileSync(
+      path.join(repo, reproFilePath),
+      'import test from "node:test";\nimport assert from "node:assert";\nimport { add } from "./calc.js";\n\ntest("lock", () => {\n  assert.strictEqual(add(1, 2), 3);\n});\n'
+    );
+    await localCore.runReproduction(repo, incLock.id, reproFilePath);
+
+    // 2. Status 'OK': untouched locked file and valid signature
+    const statusOk = localCore.getIncidentReproductionStatus(incLock.id, repo);
+    assert.strictEqual(statusOk.lock.present, true);
+    assert.strictEqual(statusOk.lock.status, 'OK');
+
+    // 3. Status 'MODIFIED_ON_DISK': file modified on disk
+    const originalContent = fs.readFileSync(path.join(repo, reproFilePath), 'utf8');
+    fs.appendFileSync(path.join(repo, reproFilePath), '// disk modification\n');
+    const statusDiskMod = localCore.getIncidentReproductionStatus(incLock.id, repo);
+    assert.strictEqual(statusDiskMod.lock.present, true);
+    assert.strictEqual(statusDiskMod.lock.status, 'MODIFIED_ON_DISK');
+
+    // Revert file on disk
+    fs.writeFileSync(path.join(repo, reproFilePath), originalContent);
+
+    // 4. Status 'SIGNATURE_INVALID': reproduction_lock_json tampered in database
+    const dbPath = path.join(repo, 'autopsy.db');
+    const sqlite3 = await import('node:sqlite');
+    const dbConn = new (sqlite3 as any).DatabaseSync(dbPath);
+    const row = dbConn.prepare('SELECT reproduction_lock_json FROM incidents WHERE id = ?').get(incLock.id);
+    const lockObj = JSON.parse(row.reproduction_lock_json);
+    lockObj.signature = 'tampered-signature-value';
+    dbConn.prepare('UPDATE incidents SET reproduction_lock_json = ? WHERE id = ?').run(JSON.stringify(lockObj), incLock.id);
+
+    const statusSigInvalid = localCore.getIncidentReproductionStatus(incLock.id, repo);
+    assert.strictEqual(statusSigInvalid.lock.present, true);
+    assert.strictEqual(statusSigInvalid.lock.status, 'SIGNATURE_INVALID');
+
+    // 5. Status 'REMOVED': reproduction_lock_json set to NULL
+    dbConn.prepare('UPDATE incidents SET reproduction_lock_json = NULL WHERE id = ?').run(incLock.id);
+    const statusRemoved = localCore.getIncidentReproductionStatus(incLock.id, repo);
+    assert.strictEqual(statusRemoved.lock.present, false);
+    assert.strictEqual(statusRemoved.lock.status, 'REMOVED');
+
+    dbConn.close();
+  });
+
+  test('165. B-2 Step 4-4a: otherBlockedIncidents lists ABANDONED and NEEDS_USER_DECISION incidents in same project', async () => {
+    const repo = path.join(testRoot, 'b2_s44a_t165_other_blocked');
+    fs.mkdirSync(repo, { recursive: true });
+    execFileSync('git', ['init', '-b', 'main'], { cwd: repo });
+    execFileSync('git', ['config', 'user.name', 'Tester'], { cwd: repo });
+    execFileSync('git', ['config', 'user.email', 'test@local'], { cwd: repo });
+
+    fs.writeFileSync(path.join(repo, 'package.json'), JSON.stringify({ type: 'module' }));
+    fs.writeFileSync(path.join(repo, 'calc.js'), 'export function add(a, b) { return a - b; }\n');
+    execFileSync('git', ['add', '.'], { cwd: repo });
+    execFileSync('git', ['commit', '-m', 'initial'], { cwd: repo });
+
+    const localCore = new CoreManager({ customDbPath: path.join(repo, 'autopsy.db') });
+    localCore.captureCheckpoint(repo, 'Base');
+    localCore.updateProjectSettings(repo, { testCommand: 'node --test' });
+
+    // Incident 2: NEEDS_USER_DECISION (registered before an acknowledged break)
+    const inc2 = await localCore.collectIncidentBundle(repo, 'Blocked Bug 2 (Needs Decision)', 'err');
+
+    // Break chain and acknowledge break at seq higher than inc2's INCIDENT_REGISTERED
+    const dbPath = path.join(repo, 'autopsy.db');
+    const sqlite3 = await import('node:sqlite');
+    const dbConn = new (sqlite3 as any).DatabaseSync(dbPath);
+    const last = dbConn.prepare('SELECT seq, entry_hash FROM audit_log ORDER BY seq DESC LIMIT 1').get();
+    const breakSeq = Number(last.seq) + 1;
+    dbConn.prepare(`
+      INSERT INTO audit_log (seq, created_at, kind, entity_type, entity_id, payload_hash, prev_hash, entry_hash)
+      VALUES (?, ?, 'TAMPERED_EVENT', 'INCIDENT', ?, 'fake_payload', ?, 'fake_entry_hash_0000000000000000000000000000000000000000')
+    `).run(breakSeq, new Date().toISOString(), inc2.id, String(last.entry_hash));
+    dbConn.close();
+
+    // Now chain is broken; acknowledge break
+    localCore.acknowledgeAuditChain('Acknowledged broken chain in test 165');
+    assert.strictEqual(localCore.getReproductionGateState(inc2.id).state, 'NEEDS_USER_DECISION');
+
+    // Incident 1: Abandoned after 3 failed reproduction attempts (registered in trusted range after acknowledged break)
+    const inc1 = await localCore.collectIncidentBundle(repo, 'Blocked Bug 1 (Abandoned)', 'err');
+    fs.writeFileSync(
+      path.join(repo, 'test_fail.js'),
+      'import test from "node:test";\ntest("fail", () => {\n  throw new Error("intentional fail");\n});\n'
+    );
+    await localCore.runReproduction(repo, inc1.id, 'test_fail.js');
+    await localCore.runReproduction(repo, inc1.id, 'test_fail.js');
+    await localCore.runReproduction(repo, inc1.id, 'test_fail.js');
+    assert.strictEqual(localCore.getReproductionGateState(inc1.id).state, 'ABANDONED');
+
+    // Incident 3: Target incident (active)
+    const inc3 = await localCore.collectIncidentBundle(repo, 'Active Target Bug', 'err');
+
+    // Query reproduction status for inc3
+    const status3 = localCore.getIncidentReproductionStatus(inc3.id, repo);
+    assert.strictEqual(status3.gate.state, 'NOT_ATTEMPTED');
+
+    // otherBlockedIncidents should contain inc1 and inc2, but NOT inc3
+    assert.strictEqual(status3.otherBlockedIncidents.length, 2);
+    const inc1InBlocked = status3.otherBlockedIncidents.find((b) => b.id === inc1.id);
+    const inc2InBlocked = status3.otherBlockedIncidents.find((b) => b.id === inc2.id);
+    const inc3InBlocked = status3.otherBlockedIncidents.find((b) => b.id === inc3.id);
+
+    assert.ok(inc1InBlocked, 'inc1 must be in otherBlockedIncidents');
+    assert.strictEqual(inc1InBlocked.state, 'ABANDONED');
+    assert.ok(inc2InBlocked, 'inc2 must be in otherBlockedIncidents');
+    assert.strictEqual(inc2InBlocked.state, 'NEEDS_USER_DECISION');
+    assert.strictEqual(inc3InBlocked, undefined, 'inc3 itself must not be in otherBlockedIncidents');
+  });
+
+  test('166. B-2 Step 4-4a: GET /api/incidents/:id/reproduction-status does NOT mutate incident row, proposal row, or reproduction lock', async () => {
+    const repo = path.join(testRoot, 'b2_s44a_t166_readonly');
+    fs.mkdirSync(repo, { recursive: true });
+    execFileSync('git', ['init', '-b', 'main'], { cwd: repo });
+    execFileSync('git', ['config', 'user.name', 'Tester'], { cwd: repo });
+    execFileSync('git', ['config', 'user.email', 'test@local'], { cwd: repo });
+
+    fs.writeFileSync(path.join(repo, 'package.json'), JSON.stringify({ type: 'module' }));
+    fs.writeFileSync(path.join(repo, 'calc.js'), 'export function add(a, b) { return a - b; }\n');
+    execFileSync('git', ['add', '.'], { cwd: repo });
+    execFileSync('git', ['commit', '-m', 'initial'], { cwd: repo });
+
+    const localCore = new CoreManager({ customDbPath: path.join(repo, 'autopsy.db') });
+    localCore.captureCheckpoint(repo, 'Base');
+    localCore.updateProjectSettings(repo, { testCommand: 'node --test' });
+
+    const inc = await localCore.collectIncidentBundle(repo, 'readonly test bug', 'err');
+    fs.writeFileSync(
+      path.join(repo, 'test_repro.js'),
+      'import test from "node:test";\nimport assert from "node:assert";\nimport { add } from "./calc.js";\n\ntest("repro", () => {\n  assert.strictEqual(add(1, 2), 3);\n});\n'
+    );
+    await localCore.runReproduction(repo, inc.id, 'test_repro.js');
+
+    // Create a repair proposal
+    await localCore.proposeAndVerifyRepair(repo, inc.id, 'fix calc', [
+      {
+        filePath: 'calc.js',
+        replacements: [{ search: 'return a - b;', replace: 'return a + b;' }],
+      },
+    ]);
+
+    const dbPath = path.join(repo, 'autopsy.db');
+    const sqlite3 = await import('node:sqlite');
+    const dbConn = new (sqlite3 as any).DatabaseSync(dbPath);
+
+    const incBefore = dbConn.prepare('SELECT * FROM incidents WHERE id = ?').get(inc.id);
+    const lockBefore = incBefore.reproduction_lock_json;
+    const proposalsBefore = dbConn.prepare('SELECT * FROM repair_proposals WHERE incident_id = ?').all(inc.id);
+    const auditCountBefore = dbConn.prepare('SELECT COUNT(*) as cnt FROM audit_log').get().cnt;
+
+    // Start API server and call GET /api/incidents/:id/reproduction-status
+    const apiServer = new ApiServer(localCore);
+    const port = await apiServer.start(3909);
+    const token = apiServer.getSessionToken();
+
+    try {
+      const res = await fetch(`http://127.0.0.1:${port}/api/incidents/${inc.id}/reproduction-status?repoPath=${encodeURIComponent(repo)}`, {
+        headers: { 'x-autopsy-token': token },
+      });
+      assert.strictEqual(res.status, 200);
+      const json = await res.json();
+      assert.strictEqual(json.success, true);
+      assert.strictEqual(json.lock.status, 'OK');
+
+      const incAfter = dbConn.prepare('SELECT * FROM incidents WHERE id = ?').get(inc.id);
+      const lockAfter = incAfter.reproduction_lock_json;
+      const proposalsAfter = dbConn.prepare('SELECT * FROM repair_proposals WHERE incident_id = ?').all(inc.id);
+      const auditCountAfter = dbConn.prepare('SELECT COUNT(*) as cnt FROM audit_log').get().cnt;
+
+      assert.deepStrictEqual(incBefore, incAfter, 'Incidents row must be unchanged after GET reproduction-status');
+      assert.strictEqual(lockBefore, lockAfter, 'Reproduction lock JSON must be unchanged');
+      assert.deepStrictEqual(proposalsBefore, proposalsAfter, 'Repair proposals must be unchanged');
+      assert.strictEqual(auditCountBefore, auditCountAfter, 'Audit log count must remain unchanged for existing incident');
+    } finally {
+      await apiServer.stop();
+      dbConn.close();
+    }
+  });
+
 });

@@ -774,6 +774,36 @@ export class ApiServer {
       return;
     }
 
+    // GET /api/incidents/:incidentId/reproduction-status
+    const reproStatusMatch = pathname.match(/^\/api\/incidents\/([^\/]+)\/reproduction-status$/);
+    if (req.method === 'GET' && reproStatusMatch) {
+      if (!this.verifySessionToken(req)) {
+        res.writeHead(401, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Unauthorized: Valid X-Autopsy-Token is required.' }));
+        return;
+      }
+      const incidentId = reproStatusMatch[1];
+      const incident = db.getIncident(incidentId);
+      if (!incident) {
+        res.writeHead(404, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: `Incident "${incidentId}" not found.` }));
+        return;
+      }
+      const repoPath = url.searchParams.get('repoPath') || undefined;
+      if (repoPath) {
+        const callingProject = this.coreManager.ensureProject(repoPath);
+        if (incident.projectId !== callingProject.id) {
+          res.writeHead(403, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ code: 'PROJECT_MISMATCH', error: 'Forbidden: PROJECT_MISMATCH' }));
+          return;
+        }
+      }
+      const statusResult = this.coreManager.getIncidentReproductionStatus(incidentId, repoPath);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(statusResult));
+      return;
+    }
+
     // POST /api/directives/:directiveId/acknowledge
     const ackDirMatch = pathname.match(/^\/api\/directives\/([^\/]+)\/acknowledge$/);
     if (req.method === 'POST' && ackDirMatch) {

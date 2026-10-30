@@ -219,6 +219,50 @@ export type ReproductionLockStatus =
   | 'LOCK_REMOVED'
   | 'UNLOCKED';
 
+export type ReproductionLockAssessmentStatus =
+  | 'OK'
+  | 'MODIFIED_ON_DISK'
+  | 'SIGNATURE_INVALID'
+  | 'REMOVED'
+  | 'NONE';
+
+export type ReproductionEvidenceLevel =
+  | 'STRONG'
+  | 'PARTIAL'
+  | 'REPRODUCED_ONLY'
+  | 'NOT_REPRODUCED'
+  | 'WAIVED'
+  | 'NONE';
+
+export interface IncidentReproductionLockStatus {
+  present: boolean;
+  testFilePath?: string;
+  preFlipFilePath?: string;
+  lockedAt?: string;
+  status: ReproductionLockAssessmentStatus;
+}
+
+export interface IncidentReproductionEvidence {
+  level: ReproductionEvidenceLevel;
+  reproductionStatus?: string;
+  baselineVerdict?: string;
+  assertFlipVerdict?: string;
+}
+
+export interface BlockedIncidentSummary {
+  id: string;
+  title: string;
+  state: ReproductionGateState;
+}
+
+export interface IncidentReproductionStatusResponse {
+  success: boolean;
+  gate: ReproductionGateInfo;
+  lock: IncidentReproductionLockStatus;
+  evidence: IncidentReproductionEvidence;
+  otherBlockedIncidents: BlockedIncidentSummary[];
+}
+
 export interface RunReproductionOptions {
   baselineCheckpointId?: string;
   preFlipTestFilePath?: string;

@@ -24,6 +24,13 @@ import {
   ReproductionGateAttempt,
   ReproductionGateInfo,
   AuditHeadAnchor,
+  ReproductionLockAssessmentStatus,
+  ReproductionEvidenceLevel,
+  IncidentReproductionLockStatus,
+  IncidentReproductionEvidence,
+  BlockedIncidentSummary,
+  IncidentReproductionStatusResponse,
+  AuditChainVerificationResult,
 } from '../types.js';
 import { parseStackFrames, analyzeIncident } from '../analysis/analyzer.js';
 import {
@@ -531,11 +538,15 @@ async function executeTestRuns(
   return { runs, lastEval, lastTestResult, durationNote };
 }
 
-export function getReproductionGateState(ctx: CoreContext, incidentId: string): ReproductionGateInfo {
+export function getReproductionGateState(
+  ctx: CoreContext,
+  incidentId: string,
+  cachedChainCheck?: AuditChainVerificationResult
+): ReproductionGateInfo {
   const incident = ctx.db.getIncident(incidentId);
 
-  // 1. Verify audit chain first
-  const chainCheck = ctx.db.verifyAuditChain();
+  // 1. Verify audit chain first (reuse cached verification result if provided)
+  const chainCheck = cachedChainCheck || ctx.db.verifyAuditChain();
   if (!chainCheck.valid) {
     return {
       state: 'AUDIT_BROKEN',
@@ -1976,6 +1987,137 @@ export async function runReproduction(
       failedLocation,
     };
   }
+
+/**
+ * Assesses the reproduction test lock status of an incident without modifying state.
+ * Returns status: 'OK' | 'MODIFIED_ON_DISK' | 'SIGNATURE_INVALID' | 'REMOVED' | 'NONE'.
+ */
+export function assessIncidentLockStatus(
+  ctx: CoreContext,
+  projectRoot: string,
+  incident: Incident,
+  trustedFromSeq?: number
+): { status: ReproductionLockAssessmentStatus; lock?: ReproductionLock } {
+  if (incident.reproductionLock) {
+    const lock = incident.reproductionLock;
+    const secret = getInstallationSecretKey();
+
+    if (!verifyReproductionLockSignature(secret, lock)) {
+      return { status: 'SIGNATURE_INVALID', lock };
+    }
+
+    const hostLockedTestFile = path.resolve(projectRoot, lock.testFilePath);
+    let diskContentHash = '';
+    if (fs.existsSync(hostLockedTestFile)) {
+      diskContentHash = computeNormalizedContentHash(fs.readFileSync(hostLockedTestFile, 'utf8'));
+    }
+    if (diskContentHash !== lock.contentHash) {
+      return { status: 'MODIFIED_ON_DISK', lock };
+    }
+
+    return { status: 'OK', lock };
+  } else {
+    const minSeq = trustedFromSeq ?? (ctx.db.verifyAuditChain().acknowledgedBreak?.trustedFromSeq ?? 1);
+    if (ctx.db.hasIncidentReproductionLockAudit(incident.id, minSeq)) {
+      return { status: 'REMOVED' };
+    }
+    return { status: 'NONE' };
+  }
+}
+
+/**
+ * Computes complete reproduction status for an incident for UI display and status querying.
+ * Performs audit chain verification once per request and shares it across otherBlockedIncidents.
+ */
+export function getIncidentReproductionStatus(
+  ctx: CoreContext,
+  incidentId: string,
+  repoPath?: string
+): IncidentReproductionStatusResponse {
+  const incident = ctx.db.getIncident(incidentId);
+  if (!incident) {
+    const err: any = new Error(`Incident with ID "${incidentId}" not found.`);
+    err.code = 'INCIDENT_NOT_FOUND';
+    err.statusCode = 404;
+    throw err;
+  }
+
+  // 1. Single audit chain verification for this request
+  const chainCheck = ctx.db.verifyAuditChain();
+  const trustedFromSeq = chainCheck.acknowledgedBreak?.trustedFromSeq ?? 1;
+
+  // 2. Gate state for this incident
+  const gate = getReproductionGateState(ctx, incidentId, chainCheck);
+
+  // 3. Project resolution for lock checking
+  const project = repoPath ? ctx.ensureProject(repoPath) : ctx.db.getProject(incident.projectId);
+  const projectRoot = project?.rootPath || process.cwd();
+
+  // 4. Lock assessment
+  const lockAssessment = assessIncidentLockStatus(ctx, projectRoot, incident, trustedFromSeq);
+  const lock: IncidentReproductionLockStatus = {
+    present: !!incident.reproductionLock,
+    testFilePath: incident.reproductionLock?.testFilePath,
+    preFlipFilePath: incident.reproductionLock?.preFlipFilePath,
+    lockedAt: incident.reproductionLock?.lockedAt,
+    status: lockAssessment.status,
+  };
+
+  // 5. Evidence level calculation
+  const repro = incident.reproductionResult;
+  const reproductionStatus = repro?.status;
+  const baselineVerdict = repro?.baselineComparison?.verdict;
+  const assertFlipVerdict = repro?.assertFlip?.verdict;
+
+  let level: ReproductionEvidenceLevel;
+  if (gate.state === 'WAIVED') {
+    level = 'WAIVED';
+  } else if (!repro) {
+    level = 'NONE';
+  } else if (reproductionStatus !== 'REPRODUCED') {
+    level = 'NOT_REPRODUCED';
+  } else {
+    const isRegression = baselineVerdict === 'REGRESSION_CONFIRMED';
+    const isFlip = assertFlipVerdict === 'FLIP_CONFIRMED';
+    if (isRegression && isFlip) {
+      level = 'STRONG';
+    } else if (isRegression || isFlip) {
+      level = 'PARTIAL';
+    } else {
+      level = 'REPRODUCED_ONLY';
+    }
+  }
+
+  const evidence: IncidentReproductionEvidence = {
+    level,
+    reproductionStatus,
+    baselineVerdict,
+    assertFlipVerdict,
+  };
+
+  // 6. otherBlockedIncidents: other incidents in same project with state ABANDONED or NEEDS_USER_DECISION
+  const otherBlockedIncidents: BlockedIncidentSummary[] = [];
+  const projectIncidents = ctx.db.listIncidents(incident.projectId, 100);
+  for (const other of projectIncidents) {
+    if (other.id === incidentId) continue;
+    const otherGate = getReproductionGateState(ctx, other.id, chainCheck);
+    if (otherGate.state === 'ABANDONED' || otherGate.state === 'NEEDS_USER_DECISION') {
+      otherBlockedIncidents.push({
+        id: other.id,
+        title: other.title || other.id,
+        state: otherGate.state,
+      });
+    }
+  }
+
+  return {
+    success: true,
+    gate,
+    lock,
+    evidence,
+    otherBlockedIncidents,
+  };
+}
 
   /**
    * Returns structured next_action for an incident based on missing intents.

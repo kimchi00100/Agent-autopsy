@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react';
-import { api, Incident, IncidentAnalysis, Proposal, TimelineEvent, FlowNode, FlowEdge } from '../api';
+import { api, Incident, IncidentAnalysis, Proposal, TimelineEvent, FlowNode, FlowEdge, IncidentReproductionStatusResponse } from '../api';
+import { ReproductionEvidenceCard, ReproductionProgressCard } from '../components/ReproductionEvidence';
 import IncidentFlowGraph from './IncidentFlowGraph';
 import { Badge, Button, Card, CodeBlock, UnifiedDiff } from '../ui';
 import { parseSideBySide, relativeTime, clock } from '../diff';
@@ -24,6 +25,7 @@ interface Props {
   analysis: IncidentAnalysis | null;
   repoPath: string;
   onOpenRepairCenter: (incidentId: string) => void;
+  onSelectIncident?: (incidentId: string) => void;
   onChanged: () => void;
   notify: (kind: 'ok' | 'error', msg: string) => void;
 }
@@ -35,6 +37,7 @@ export default function IncidentAnalysisView({
   analysis,
   repoPath,
   onOpenRepairCenter,
+  onSelectIncident,
   onChanged,
   notify,
 }: Props) {
@@ -43,6 +46,22 @@ export default function IncidentAnalysisView({
   const [timelineEvents, setTimelineEvents] = useState<TimelineEvent[]>([]);
   const [selectedItem, setSelectedItem] = useState<{ type: 'node' | 'edge'; data: FlowNode | FlowEdge } | null>(null);
   const [busy, setBusy] = useState(false);
+  const [reproStatus, setReproStatus] = useState<IncidentReproductionStatusResponse | null>(null);
+
+  useEffect(() => {
+    api.reproductionStatus(incident.id, repoPath)
+      .then(setReproStatus)
+      .catch(() => setReproStatus(null));
+
+    const unsub = api.subscribeStream((event) => {
+      if (event?.type === 'db_sync' || event?.incidentId === incident.id || event?.refs?.incidentId === incident.id) {
+        api.reproductionStatus(incident.id, repoPath)
+          .then(setReproStatus)
+          .catch(() => {});
+      }
+    });
+    return unsub;
+  }, [incident.id, repoPath]);
 
   useEffect(() => {
     api.proposals(incident.id).then((r) => setProposals(r.proposals));
@@ -565,6 +584,17 @@ export default function IncidentAnalysisView({
                 )}
               </div>
             )}
+
+            {/* Coverage Execution Status */}
+            <ReproductionEvidenceCard
+              reproductionResult={incident.reproductionResult}
+              evidenceLevel={reproStatus?.evidence?.level}
+            />
+
+            <ReproductionProgressCard
+              statusResponse={reproStatus}
+              onSelectIncident={onSelectIncident}
+            />
 
             {/* Coverage Execution Status */}
             <div className="mt-4 flex items-center justify-between rounded-xl border border-slate-200 bg-slate-50/70 p-2.5 text-xs text-slate-600">

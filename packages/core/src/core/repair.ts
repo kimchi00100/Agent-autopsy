@@ -2,7 +2,7 @@ import * as path from 'node:path';
 import * as fs from 'node:fs';
 import * as crypto from 'node:crypto';
 import { CoreContext } from './context.js';
-import { getReproductionGateState } from './reproduction.js';
+import { getReproductionGateState, assessIncidentLockStatus } from './reproduction.js';
 import { sendWindowsToast } from '../notifications/toast.js';
 import { isSamePathUnderRepo, validateRepoRelativeFilePath } from '../utils/paths.js';
 import {
@@ -100,29 +100,73 @@ import {
 
     // Check reproduction test lock before preparing patch:
     // (c) signature validity, (a) proposal modification, (b) disk modification, and lock deletion detection
-    if (incident.reproductionLock) {
-      const lock = incident.reproductionLock;
-      const secret = getInstallationSecretKey();
+    const chainCheck = ctx.db.verifyAuditChain();
+    const trustedFromSeq = chainCheck.acknowledgedBreak?.trustedFromSeq ?? 1;
+    const lockAssessment = assessIncidentLockStatus(ctx, project.rootPath, incident, trustedFromSeq);
 
-      // (c) Lock signature verification
-      if (!verifyReproductionLockSignature(secret, lock)) {
-        ctx.db.appendAuditLog({
-          kind: 'REPAIR_REJECTED',
-          entityType: 'INCIDENT',
-          entityId: incidentId,
-          payloadHash: hashAuditPayload({ error: 'LOCK_SIGNATURE_INVALID', lock }),
-        });
-        const err: any = new Error('[LOCK_SIGNATURE_INVALID]: 재현 테스트 잠금의 서명이 올바르지 않습니다 (잠금 변조 의심).');
-        err.code = 'LOCK_SIGNATURE_INVALID';
-        err.next_action = {
-          actor: 'USER',
-          action: 'INVESTIGATE_TAMPER',
-          agent_should: '재현 테스트 잠금 서명 불일치가 감지되었습니다. 잠금 데이터를 확인하거나 재현 테스트를 다시 실행하세요.',
-          forbidden: ['원본 파일 직접 수정', 'DB 직접 수정'],
-        };
-        throw err;
+    if (lockAssessment.status === 'SIGNATURE_INVALID') {
+      const lock = incident.reproductionLock!;
+      ctx.db.appendAuditLog({
+        kind: 'REPAIR_REJECTED',
+        entityType: 'INCIDENT',
+        entityId: incidentId,
+        payloadHash: hashAuditPayload({ error: 'LOCK_SIGNATURE_INVALID', lock }),
+      });
+      const err: any = new Error('[LOCK_SIGNATURE_INVALID]: 재현 테스트 잠금의 서명이 올바르지 않습니다 (잠금 변조 의심).');
+      err.code = 'LOCK_SIGNATURE_INVALID';
+      err.next_action = {
+        actor: 'USER',
+        action: 'INVESTIGATE_TAMPER',
+        agent_should: '재현 테스트 잠금 서명 불일치가 감지되었습니다. 잠금 데이터를 확인하거나 재현 테스트를 다시 실행하세요.',
+        forbidden: ['원본 파일 직접 수정', 'DB 직접 수정'],
+      };
+      throw err;
+    }
+
+    if (lockAssessment.status === 'MODIFIED_ON_DISK') {
+      const lock = incident.reproductionLock!;
+      const hostLockedTestFile = path.resolve(project.rootPath, lock.testFilePath);
+      let diskContentHash = '';
+      if (fs.existsSync(hostLockedTestFile)) {
+        diskContentHash = computeNormalizedContentHash(fs.readFileSync(hostLockedTestFile, 'utf8'));
       }
+      ctx.db.appendAuditLog({
+        kind: 'REPAIR_REJECTED',
+        entityType: 'INCIDENT',
+        entityId: incidentId,
+        payloadHash: hashAuditPayload({ error: 'LOCKED_TEST_MODIFIED', lock, diskContentHash }),
+      });
+      const err: any = new Error('[LOCKED_TEST_MODIFIED]: 잠금된 재현 테스트 파일이 디스크에서 변경되었습니다. 잠금 당시 내용으로 복원하거나 잠금을 갱신하세요.');
+      err.code = 'LOCKED_TEST_MODIFIED';
+      err.next_action = {
+        actor: 'AGENT',
+        action: 'RESTORE_OR_REPLACE_LOCK',
+        agent_should: '잠금된 테스트 파일을 원래대로 복원하거나, 의도된 변경인 경우 run_reproduction(replace_lock=true)으로 잠금을 갱신하세요.',
+        forbidden: ['원본 파일 직접 수정', 'DB 직접 수정'],
+      };
+      throw err;
+    }
 
+    if (lockAssessment.status === 'REMOVED') {
+      ctx.db.appendAuditLog({
+        kind: 'REPAIR_REJECTED',
+        entityType: 'INCIDENT',
+        entityId: incidentId,
+        payloadHash: hashAuditPayload({ error: 'LOCK_REMOVED' }),
+      });
+      const err: any = new Error('[LOCK_REMOVED]: 과거에 생성된 재현 테스트 잠금이 외부에서 삭제되었습니다 (잠금 삭제 변조 의심). 재현 테스트를 다시 실행하세요.');
+      err.code = 'LOCK_REMOVED';
+      err.next_action = {
+        actor: 'AGENT',
+        action: 'REPRODUCE_FIRST',
+        agent_should: '잠금된 재현 테스트 기록이 임의로 삭제되었습니다. run_reproduction으로 재현 테스트를 다시 실행하여 잠금을 새로 생성하세요.',
+        forbidden: ['원본 파일 직접 수정', 'DB 직접 수정'],
+      };
+      throw err;
+    }
+
+    if (incident.reproductionLock && lockAssessment.status === 'OK') {
+      const lock = incident.reproductionLock;
       // Normalize lock paths as well to ensure consistent canonical comparison
       let normLockTestPath = lock.testFilePath;
       try {
@@ -175,51 +219,6 @@ import {
           actor: 'AGENT',
           action: 'REMOVE_TEST_CHANGES_FROM_REPAIR',
           agent_should: '수정안에서 재현 테스트 파일 수정을 제거하고, 실제 대상 소스 코드만 수정하도록 패치를 변경하세요.',
-          forbidden: ['원본 파일 직접 수정', 'DB 직접 수정'],
-        };
-        throw err;
-      }
-
-      // (b) Check if locked test file was modified on disk
-      const hostLockedTestFile = path.resolve(project.rootPath, lock.testFilePath);
-      let diskContentHash = '';
-      if (fs.existsSync(hostLockedTestFile)) {
-        diskContentHash = computeNormalizedContentHash(fs.readFileSync(hostLockedTestFile, 'utf8'));
-      }
-      if (diskContentHash !== lock.contentHash) {
-        ctx.db.appendAuditLog({
-          kind: 'REPAIR_REJECTED',
-          entityType: 'INCIDENT',
-          entityId: incidentId,
-          payloadHash: hashAuditPayload({ error: 'LOCKED_TEST_MODIFIED', lock, diskContentHash }),
-        });
-        const err: any = new Error('[LOCKED_TEST_MODIFIED]: 잠금된 재현 테스트 파일이 디스크에서 변경되었습니다. 잠금 당시 내용으로 복원하거나 잠금을 갱신하세요.');
-        err.code = 'LOCKED_TEST_MODIFIED';
-        err.next_action = {
-          actor: 'AGENT',
-          action: 'RESTORE_OR_REPLACE_LOCK',
-          agent_should: '잠금된 테스트 파일을 원래대로 복원하거나, 의도된 변경인 경우 run_reproduction(replace_lock=true)으로 잠금을 갱신하세요.',
-          forbidden: ['원본 파일 직접 수정', 'DB 직접 수정'],
-        };
-        throw err;
-      }
-    } else {
-      const chainCheck = ctx.db.verifyAuditChain();
-      const trustedFromSeq = chainCheck.acknowledgedBreak?.trustedFromSeq ?? 1;
-      if (ctx.db.hasIncidentReproductionLockAudit(incidentId, trustedFromSeq)) {
-        // P5: DB reproduction_lock_json is NULL/empty, but audit_log in trusted range has REPRODUCTION_LOCKED or REPRODUCTION_LOCK_REPLACED
-        ctx.db.appendAuditLog({
-          kind: 'REPAIR_REJECTED',
-          entityType: 'INCIDENT',
-          entityId: incidentId,
-          payloadHash: hashAuditPayload({ error: 'LOCK_REMOVED' }),
-        });
-        const err: any = new Error('[LOCK_REMOVED]: 과거에 생성된 재현 테스트 잠금이 외부에서 삭제되었습니다 (잠금 삭제 변조 의심). 재현 테스트를 다시 실행하세요.');
-        err.code = 'LOCK_REMOVED';
-        err.next_action = {
-          actor: 'AGENT',
-          action: 'REPRODUCE_FIRST',
-          agent_should: '잠금된 재현 테스트 기록이 임의로 삭제되었습니다. run_reproduction으로 재현 테스트를 다시 실행하여 잠금을 새로 생성하세요.',
           forbidden: ['원본 파일 직접 수정', 'DB 직접 수정'],
         };
         throw err;

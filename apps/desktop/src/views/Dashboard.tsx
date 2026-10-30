@@ -3,6 +3,16 @@ import { relativeTime } from '../diff';
 import { Badge, Card, Empty, PageHeader } from '../ui';
 import { CheckCircle2, XCircle, HelpCircle, GitBranch, AlertTriangle, History, ShieldCheck, ShieldAlert } from 'lucide-react';
 
+const AUDIT_BROKEN_REASONS: Record<string, string> = {
+  TRUNCATED: '기록 끝부분이 삭제됨',
+  VALUE_MODIFIED: '기록 내용이 바뀜',
+  ORDER_OR_DELETION: '기록 중간이 삭제되거나 순서가 바뀜',
+  HEAD_ANCHOR_MISSING: '기준점 파일이 삭제됨',
+  HEAD_ANCHOR_INVALID: '기준점 파일이 위조됨',
+  HEAD_MISMATCH: '기준점과 기록이 맞지 않음',
+  KEY_MISMATCH: '다른 설치의 서명 키',
+};
+
 export default function Dashboard({
   overview,
   auditChain,
@@ -169,8 +179,10 @@ export default function Dashboard({
             <div className="flex items-center justify-between">
               <div className="flex items-center gap-2">
                 {auditChain ? (
-                  auditChain.valid ? (
+                  auditChain.status === 'OK' ? (
                     <ShieldCheck className="h-4 w-4 text-emerald-600" />
+                  ) : auditChain.status === 'OK_AFTER_ACKNOWLEDGED_BREAK' ? (
+                    <ShieldCheck className="h-4 w-4 text-amber-600" />
                   ) : (
                     <ShieldAlert className="h-4 w-4 text-rose-600" />
                   )
@@ -180,8 +192,10 @@ export default function Dashboard({
                 <span className="text-xs font-semibold text-slate-900">감사 기록 해시 체인</span>
               </div>
               {auditChain ? (
-                auditChain.valid ? (
+                auditChain.status === 'OK' ? (
                   <Badge tone="green">정상 확인됨</Badge>
+                ) : auditChain.status === 'OK_AFTER_ACKNOWLEDGED_BREAK' ? (
+                  <Badge tone="amber">깨짐 확인 후 정상</Badge>
                 ) : (
                   <Badge tone="red">손상 의심</Badge>
                 )
@@ -191,12 +205,26 @@ export default function Dashboard({
             </div>
             <div className="mt-2 text-[11px] text-slate-500">
               {auditChain ? (
-                auditChain.valid ? (
+                auditChain.status === 'OK' ? (
                   <span>기록 {auditChain.totalCount}개 항목 무결성 확인됨</span>
+                ) : auditChain.status === 'OK_AFTER_ACKNOWLEDGED_BREAK' ? (
+                  <div className="space-y-1">
+                    <div className="text-amber-800 font-medium">
+                      확인 시각: {auditChain.acknowledgedBreak?.acknowledgedAt || '-'} · 이 시점 이후 기록만 검증합니다
+                    </div>
+                    <div className="text-slate-400">
+                      (검증된 기록 {auditChain.totalCount}개)
+                    </div>
+                  </div>
                 ) : (
-                  <span className="text-rose-600 font-medium">
-                    처음 깨진 위치 seq #{auditChain.brokenSeq} ({auditChain.reason || auditChain.message || '체인 불일치'})
-                  </span>
+                  <div className="space-y-1 text-rose-600 font-medium">
+                    <div>
+                      처음 깨진 위치 seq #{auditChain.brokenSeq}: {AUDIT_BROKEN_REASONS[auditChain.reasonCode || ''] || auditChain.reason || auditChain.message || '체인 불일치'}
+                    </div>
+                    <div>
+                      에이전트 작업이 멈춰 있습니다. 사용자 확인이 필요합니다.
+                    </div>
+                  </div>
                 )
               ) : (
                 <span>감사 기록 체인 상태를 확인하고 있습니다...</span>

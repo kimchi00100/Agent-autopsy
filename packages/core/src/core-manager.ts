@@ -27,7 +27,7 @@ import {
   acknowledgeDirective,
 } from './core/directives.js';
 import { evaluateOrchestrationDecision, createReviewChallenge, submitOrchestrationReview } from './core/orchestration.js';
-import { runReproduction, getReproductionGateState, decideReproduction } from './core/reproduction.js';
+import { runReproduction, getReproductionGateState, decideReproduction, getIncidentReproductionStatus } from './core/reproduction.js';
 import { searchHistory, getIncidentAttempts, getChangesSinceGoodCheckpoint } from './core/history.js';
 import { captureCheckpoint, rollbackToCheckpoint } from './core/checkpoint.js';
 import { packChangeScope, PackagedChangeScope, PackChangeScopeOptions } from './localization/context-packer.js';
@@ -123,6 +123,7 @@ import {
   AuditChainVerificationResult,
   ProposalIntegrityResult,
   ReproductionGateInfo,
+  IncidentReproductionStatusResponse,
 } from './types.js';
 import { analyzeIncident, IncidentAnalysis, parseUnifiedDiff, parseStackFrames } from './analysis/analyzer.js';
 
@@ -546,6 +547,10 @@ export class CoreManager {
     reason?: string
   ): ReproductionGateInfo {
     return decideReproduction(this.ctx, incidentId, decision, repoPath, reason);
+  }
+
+  public getIncidentReproductionStatus(incidentId: string, repoPath?: string): IncidentReproductionStatusResponse {
+    return getIncidentReproductionStatus(this.ctx, incidentId, repoPath);
   }
 
 

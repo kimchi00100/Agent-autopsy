@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
-import { api, Checkpoint, Incident, Proposal, Directive, AuditChainVerificationResult, ProposalIntegrityResult } from '../api';
+import { api, Checkpoint, Incident, Proposal, Directive, AuditChainVerificationResult, ProposalIntegrityResult, IncidentReproductionStatusResponse } from '../api';
+import { ReproductionEvidenceBadge, LOCK_STATUS_TEXTS } from '../components/ReproductionEvidence';
 import { parseSideBySide, relativeTime } from '../diff';
 import { Badge, Button, Card, CodeBlock, Empty, PageHeader } from '../ui';
 import {
@@ -114,6 +115,26 @@ export default function Repair({
   const [rejectFeedback, setRejectFeedback] = useState('');
   const [copiedId, setCopiedId] = useState<string | null>(null);
   const [integrityResult, setIntegrityResult] = useState<ProposalIntegrityResult | null>(null);
+  const [reproStatus, setReproStatus] = useState<IncidentReproductionStatusResponse | null>(null);
+
+  useEffect(() => {
+    if (!incidentId) {
+      setReproStatus(null);
+      return;
+    }
+    api.reproductionStatus(incidentId, repoPath)
+      .then(setReproStatus)
+      .catch(() => setReproStatus(null));
+
+    const unsub = api.subscribeStream((event) => {
+      if (event?.type === 'db_sync' || event?.incidentId === incidentId || event?.refs?.incidentId === incidentId) {
+        api.reproductionStatus(incidentId, repoPath)
+          .then(setReproStatus)
+          .catch(() => {});
+      }
+    });
+    return unsub;
+  }, [incidentId, repoPath]);
 
   useEffect(() => {
     if (!proposalId) {
@@ -933,7 +954,19 @@ export default function Repair({
                 </span>
               )}
             </div>
-            <div className="flex gap-2">
+            <div className="flex items-center gap-3">
+              {reproStatus && (
+                <div className="flex items-center gap-2">
+                  <ReproductionEvidenceBadge level={reproStatus.evidence.level} />
+                  {reproStatus.lock.present && reproStatus.lock.status !== 'OK' && (
+                    <span className="font-semibold text-rose-600 flex items-center gap-1 text-xs">
+                      <ShieldAlert className="h-4 w-4 shrink-0" />
+                      재현 테스트 잠금 이상: {LOCK_STATUS_TEXTS[reproStatus.lock.status]}
+                    </span>
+                  )}
+                </div>
+              )}
+              <div className="flex gap-2">
               <Button
                 variant="ghost"
                 disabled={busy || finished}
@@ -966,7 +999,8 @@ export default function Repair({
             </div>
           </div>
         </div>
-      )}
+      </div>
+    )}
 
       {/* Reject with Feedback Modal */}
       {rejectModalOpen && (

@@ -625,6 +625,7 @@ export default function App() {
               analysis={analysis?.analysis || null}
               repoPath={repoPath}
               onOpenRepairCenter={() => setView('repair')}
+              onSelectIncident={(id) => setIncidentId(id)}
               onChanged={load}
               notify={notify}
             />

@@ -958,7 +958,7 @@ export default function Repair({
               {reproStatus && (
                 <div className="flex items-center gap-2">
                   <ReproductionEvidenceBadge level={reproStatus.evidence.level} />
-                  {reproStatus.lock.present && reproStatus.lock.status !== 'OK' && (
+                  {reproStatus.lock.status !== 'OK' && reproStatus.lock.status !== 'NONE' && (
                     <span className="font-semibold text-rose-600 flex items-center gap-1 text-xs">
                       <ShieldAlert className="h-4 w-4 shrink-0" />
                       재현 테스트 잠금 이상: {LOCK_STATUS_TEXTS[reproStatus.lock.status]}

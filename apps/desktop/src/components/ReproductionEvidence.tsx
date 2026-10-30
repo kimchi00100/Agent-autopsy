@@ -141,7 +141,7 @@ export function ReproductionEvidenceCard({
             )}
             {baseline.runs?.baseline && baseline.runs.baseline.length > 0 && (
               <div className="text-slate-500">
-                3회 실행 결과: 통과 {baselinePass}회 / 실패 {baselineFail}회 (총 {baseline.runs.baseline.length}회)
+                실행 결과: 통과 {baselinePass}회 / 실패 {baselineFail}회 (총 {baseline.runs.baseline.length}회)
               </div>
             )}
           </div>
@@ -271,32 +271,40 @@ export function ReproductionProgressCard({
           <Lock className="h-3.5 w-3.5 text-slate-500" />
           재현 테스트 잠금 (Reproduction Lock)
         </div>
-        {lock.present ? (
+        {lock.status === 'NONE' ? (
+          <div className="text-slate-400 italic bg-slate-50 p-1.5 rounded">
+            재현 테스트 잠금 없음
+          </div>
+        ) : (
           <div className="rounded bg-slate-50 p-2 border border-slate-200/80 space-y-1">
-            <div className="text-slate-800">
-              <span className="font-medium">재현 테스트 잠김:</span>{' '}
-              <span className="font-mono text-[10px]">{lock.testFilePath}</span>{' '}
-              {lock.lockedAt && <span className="text-slate-500">({clock(lock.lockedAt)})</span>}
-            </div>
+            {lock.testFilePath && (
+              <div className="text-slate-800">
+                <span className="font-medium">재현 테스트 잠김:</span>{' '}
+                <span className="font-mono text-[10px]">{lock.testFilePath}</span>{' '}
+                {lock.lockedAt && <span className="text-slate-500">({clock(lock.lockedAt)})</span>}
+              </div>
+            )}
             {lock.preFlipFilePath && (
               <div className="text-slate-600">
                 <span className="font-medium">단언 뒤집기 전 파일:</span>{' '}
                 <span className="font-mono text-[10px]">{lock.preFlipFilePath}</span>
               </div>
             )}
-            <div className="text-slate-500 text-[10px]">
-              수정안은 이 파일을 바꿀 수 없습니다.
-            </div>
+            {lock.testFilePath && (
+              <div className="text-slate-500 text-[10px]">
+                수정안은 이 파일을 바꿀 수 없습니다.
+              </div>
+            )}
             {lock.status !== 'OK' && (
               <div className="mt-1 flex items-center gap-1 rounded bg-rose-50 p-1.5 text-rose-700 border border-rose-200 font-medium">
                 <ShieldAlert className="h-3.5 w-3.5 shrink-0 text-rose-600" />
-                <span>잠금 이상 경고: {LOCK_STATUS_TEXTS[lock.status]}</span>
+                {lock.status === 'REMOVED' ? (
+                  <span>재현 테스트 잠금이 바깥에서 삭제되었습니다. 감사 기록에는 잠금이 남아 있습니다.</span>
+                ) : (
+                  <span>잠금 이상 경고: {LOCK_STATUS_TEXTS[lock.status]}</span>
+                )}
               </div>
             )}
-          </div>
-        ) : (
-          <div className="text-slate-400 italic bg-slate-50 p-1.5 rounded">
-            재현 테스트 잠금 없음
           </div>
         )}
       </div>

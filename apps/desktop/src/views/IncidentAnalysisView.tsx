@@ -585,7 +585,7 @@ export default function IncidentAnalysisView({
               </div>
             )}
 
-            {/* Coverage Execution Status */}
+            {/* Reproduction Evidence */}
             <ReproductionEvidenceCard
               reproductionResult={incident.reproductionResult}
               evidenceLevel={reproStatus?.evidence?.level}

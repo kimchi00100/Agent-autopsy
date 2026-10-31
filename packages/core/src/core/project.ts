@@ -917,7 +917,7 @@ import {
       } else {
         agentsMdAction = 'APPEND';
         agentsMdDiffPreview = '+ \n\n# --- Agent Autopsy SOP Rules (하단 안전 추가) ---\n' + getAgentsMdTemplate();
-        conflictNotes.push('기존 커스텀 AGENTS.md 규칙을 100% 보존하며 하단에 필수 수칙이 안전 병합됩니다.');
+        conflictNotes.push('기존 AGENTS.md 내용은 그대로 두고, 필수 수칙을 파일 끝에 덧붙입니다.');
       }
     } else {
       agentsMdAction = 'CREATE';

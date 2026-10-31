@@ -413,7 +413,7 @@ export default function CodeCompare({
                 desc={
                   lang === 'en'
                     ? 'The working directory has no diff against this baseline.'
-                    : '현재 작업 트리가 해당 기준 스냅샷과 완벽하게 일치합니다.'
+                    : '현재 작업 트리가 해당 기준 스냅샷과 일치합니다.'
                 }
               />
             </Card>

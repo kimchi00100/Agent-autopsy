@@ -169,9 +169,9 @@ export default function SettingsView({
   
                   <div className="grid grid-cols-3 gap-3">
                     {[
-                      { id: 'antigravity', name: 'Google Antigravity', model: 'Gemini 2.5 / 3.8', note: 'Deepmind 네이티브 서브에이전트 상속 (추가 키 불필요)' },
-                      { id: 'claude-code', name: 'Claude Code', model: 'Claude 3.7 / Opus', note: 'Anthropic 호스트 네이티브 환경' },
-                      { id: 'codex', name: 'Codex CLI', model: 'GPT-5 / 6.1 Sol', note: 'OpenAI 호스트 네이티브 환경' },
+                      { id: 'antigravity', name: 'Google Antigravity', model: '호스트에서 고른 모델', note: '같은 호스트의 서브에이전트로 독립 검토 (추가 키 불필요)' },
+                      { id: 'claude-code', name: 'Claude Code', model: '호스트에서 고른 모델', note: '같은 호스트의 서브에이전트로 독립 검토 (추가 키 불필요)' },
+                      { id: 'codex', name: 'Codex CLI', model: '호스트에서 고른 모델', note: '같은 호스트의 서브에이전트로 독립 검토 (추가 키 불필요)' },
                     ].map((env) => (
                       <div
                         key={env.id}
@@ -193,7 +193,7 @@ export default function SettingsView({
                   </div>
   
                   <div className="rounded-lg bg-slate-50 border border-slate-200/80 p-3 text-[11px] text-slate-600 leading-relaxed">
-                    💡 <strong>단일 메인 모델 아키텍처:</strong> 사용자가 선택한 호스트 환경의 메인 AI가 문제를 개발하고, 내부 오케스트레이션 검증 시에도 동일 호스트의 네이티브 서브에이전트(<code>Model=&apos;inherit&apos;</code>)를 활용하여 별도의 추가 API 키 설정 없이도 완벽한 독립 검증을 수행합니다.
+                    💡 <strong>단일 메인 모델 아키텍처:</strong> 사용자가 선택한 호스트 환경의 메인 AI가 문제를 분석하고 수정안을 만듭니다. 독립 검토가 필요할 때도 같은 호스트의 서브에이전트(<code>Model=&apos;inherit&apos;</code>)를 쓰므로 추가 API 키가 필요 없습니다. 모델은 각 호스트에서 고릅니다.
                   </div>
                 </Card>
   
